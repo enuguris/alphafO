@@ -8,7 +8,7 @@ from loguru import logger
 
 from app.config import settings
 from app.database import init_db
-from app.api.v1 import signals, trades, backtest, portfolio, data, settings as settings_router
+from app.api.v1 import signals, trades, backtest, portfolio, data, settings as settings_router, chat
 from app.api.websocket import router as ws_router
 
 
@@ -42,6 +42,7 @@ app.include_router(backtest.router, prefix="/api/v1/backtest", tags=["Backtest"]
 app.include_router(portfolio.router, prefix="/api/v1/portfolio", tags=["Portfolio"])
 app.include_router(data.router, prefix="/api/v1/data", tags=["Market Data"])
 app.include_router(settings_router.router, prefix="/api/v1/settings", tags=["Settings"])
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
 app.include_router(ws_router)
 
 

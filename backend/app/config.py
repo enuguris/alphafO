@@ -48,5 +48,8 @@ class Settings(BaseSettings):
     nse_data_dir: str = "./data/nse"
     initial_capital: float = 500_000.0         # ₹5,00,000
 
+    # AI Chat
+    anthropic_api_key: str = ""
+
 
 settings = Settings()

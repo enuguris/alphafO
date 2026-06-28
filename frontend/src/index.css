@@ -2,6 +2,221 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  @apply bg-gray-950 text-gray-100 font-sans;
+/* ── TradingView-inspired design tokens ─────────────────────────── */
+:root {
+  --bg:        #131722;
+  --bg2:       #1e222d;
+  --bg3:       #2a2e39;
+  --border:    #2a2e39;
+  --border2:   #363a45;
+  --txt:       #d1d4dc;
+  --txt2:      #787b86;
+  --txt3:      #434651;
+  --up:        #26a69a;
+  --dn:        #ef5350;
+  --blue:      #2962ff;
+  --blue2:     #1565c0;
+  --purple:    #7b61ff;
+  --orange:    #ff9800;
+  --yellow:    #f5c518;
 }
+
+body {
+  background: var(--bg);
+  color: var(--txt);
+  font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Monospace numbers */
+.mono { font-family: 'Courier New', 'Roboto Mono', monospace; }
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--bg2); }
+::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border2); }
+
+/* Up/Down colors */
+.up   { color: var(--up); }
+.dn   { color: var(--dn); }
+.muted { color: var(--txt2); }
+
+/* Table styles */
+.tv-table { width: 100%; border-collapse: collapse; }
+.tv-table th {
+  padding: 6px 10px;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--txt2);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  user-select: none;
+  cursor: pointer;
+  background: var(--bg2);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.tv-table th:first-child { text-align: left; }
+.tv-table th:hover { color: var(--txt); background: var(--bg3); }
+.tv-table td {
+  padding: 5px 10px;
+  text-align: right;
+  border-bottom: 1px solid rgba(42,46,57,0.5);
+  white-space: nowrap;
+  font-size: 12px;
+}
+.tv-table td:first-child { text-align: left; }
+.tv-table tr:hover td { background: rgba(42,46,57,0.5); cursor: pointer; }
+.tv-table tr.selected td { background: rgba(41,98,255,0.1); }
+
+/* Card */
+.tv-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+/* Panel header */
+.panel-hdr {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--txt2);
+  background: var(--bg2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Tab bar */
+.tab-bar { display: flex; border-bottom: 1px solid var(--border); background: var(--bg2); }
+.tab-btn {
+  padding: 9px 16px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--txt2);
+  border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.tab-btn:hover { color: var(--txt); background: rgba(255,255,255,0.03); }
+.tab-btn.active { color: var(--txt); border-bottom-color: var(--blue); }
+
+/* Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.6;
+}
+.badge-up   { background: rgba(38,166,154,0.15); color: var(--up); }
+.badge-dn   { background: rgba(239,83,80,0.15);  color: var(--dn); }
+.badge-blue { background: rgba(41,98,255,0.15);  color: var(--blue); }
+.badge-mute { background: var(--bg3); color: var(--txt2); }
+
+/* Input */
+.tv-input {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  color: var(--txt);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.tv-input:focus { border-color: var(--blue); }
+.tv-input::placeholder { color: var(--txt3); }
+
+/* Select */
+.tv-select {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  color: var(--txt);
+  border-radius: 4px;
+  padding: 5px 24px 5px 10px;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23787b86'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+.tv-select:focus { border-color: var(--blue); }
+
+/* Button */
+.tv-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: none;
+  white-space: nowrap;
+}
+.tv-btn-primary { background: var(--blue); color: #fff; }
+.tv-btn-primary:hover { background: var(--blue2); }
+.tv-btn-ghost { background: transparent; color: var(--txt2); border: 1px solid var(--border2); }
+.tv-btn-ghost:hover { color: var(--txt); border-color: var(--txt2); }
+.tv-btn-up { background: rgba(38,166,154,0.15); color: var(--up); border: 1px solid rgba(38,166,154,0.3); }
+.tv-btn-up:hover { background: rgba(38,166,154,0.25); }
+.tv-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Progress bar */
+.progress-track { height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+.progress-fill  { height: 100%; border-radius: 2px; transition: width 0.6s ease; }
+
+/* Confidence arc / bar */
+.conf-bar { height: 2px; background: var(--bg3); border-radius: 1px; overflow: hidden; margin-top: 4px; }
+
+/* Animations */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fadeUp 0.18s ease-out; }
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+.live-dot { animation: pulseDot 1.6s ease-in-out infinite; }
+
+/* Skeleton */
+@keyframes shimmer {
+  from { background-position: -400px 0; }
+  to   { background-position: 400px 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--bg2) 25%, var(--bg3) 50%, var(--bg2) 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 3px;
+}
+
+/* Chat bubble */
+.chat-user { background: rgba(41,98,255,0.12); border: 1px solid rgba(41,98,255,0.2); }
+.chat-ai   { background: var(--bg3); border: 1px solid var(--border2); }
+
+/* Divider */
+.divider { height: 1px; background: var(--border); }
+
+/* Scrollable content */
+.scroll-y { overflow-y: auto; }

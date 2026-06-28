@@ -5,9 +5,11 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    host: '0.0.0.0',
+    watch: { usePolling: true, interval: 300 },
     proxy: {
-      '/api': 'http://localhost:8000',
-      '/ws': { target: 'ws://localhost:8000', ws: true },
+      '/api': 'http://backend:8000',
+      '/ws': { target: 'ws://backend:8000', ws: true },
     },
   },
 })
