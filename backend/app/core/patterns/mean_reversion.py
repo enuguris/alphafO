@@ -31,15 +31,20 @@ class MeanReversionPattern(AbstractPattern):
         if current_width > threshold:
             return signals  # not in a squeeze
 
-        # Detect direction from OI if available
+        # Detect direction from OI if available, fall back to price momentum
         oi_direction = None
         if "oi" in df.columns:
             oi_chg = df["oi"].diff().iloc[-1]
             price_chg = df["close"].diff().iloc[-1]
-            if oi_chg > 0 and price_chg > 0:
+            if pd.notna(oi_chg) and oi_chg > 0 and price_chg > 0:
                 oi_direction = "long"
-            elif oi_chg > 0 and price_chg < 0:
+            elif pd.notna(oi_chg) and oi_chg > 0 and price_chg < 0:
                 oi_direction = "short"
+
+        if oi_direction is None:
+            # Fallback: use 5-day price momentum direction
+            momentum = df["close"].iloc[-1] - df["close"].iloc[-6]
+            oi_direction = "long" if momentum > 0 else "short"
 
         entry = df["close"].iloc[-1]
         atr = self._atr(df)
@@ -49,12 +54,10 @@ class MeanReversionPattern(AbstractPattern):
             target = entry + 2 * current_width * entry
             stop = midband
             direction = "long"
-        elif oi_direction == "short":
+        else:
             target = entry - 2 * current_width * entry
             stop = midband
             direction = "short"
-        else:
-            return signals  # need OI confirmation for direction
 
         exp_ret = abs(target - entry) / entry * 100
 

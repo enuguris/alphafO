@@ -28,8 +28,8 @@ class VWAPOIPattern(AbstractPattern):
         if not (prev["close"] < prev["vwap"] and curr["close"] > curr["vwap"]):
             return signals
 
-        # OI rising = new money confirming move
-        if "oi" in df.columns:
+        # OI rising = new money confirming move (skip check if OI data not available)
+        if "oi" in df.columns and not pd.isna(df["oi"].iloc[-1]) and not pd.isna(df["oi"].iloc[-2]):
             oi_rising = df["oi"].iloc[-1] > df["oi"].iloc[-2]
             if not oi_rising:
                 return signals

@@ -44,5 +44,61 @@ class KiteAdapter:
         kite = self._get_kite()
         return kite.quote(instruments)
 
+    def get_options_chain(self, underlying: str = "NIFTY") -> pd.DataFrame:
+        """
+        Fetch a simplified options chain for the nearest expiry.
+        Returns DataFrame with columns: strike, ce_ltp, pe_ltp, ce_oi, pe_oi, iv
+        """
+        kite = self._get_kite()
+        instruments = pd.DataFrame(kite.instruments("NFO"))
+
+        prefix = "NIFTY" if underlying.upper() == "NIFTY" else underlying.upper()
+        opts = instruments[
+            (instruments["name"] == prefix) &
+            (instruments["instrument_type"].isin(["CE", "PE"]))
+        ].copy()
+
+        if opts.empty:
+            return pd.DataFrame()
+
+        # Pick nearest expiry
+        opts["expiry"] = pd.to_datetime(opts["expiry"])
+        nearest_expiry = opts["expiry"].min()
+        opts = opts[opts["expiry"] == nearest_expiry]
+
+        # Fetch quotes in batches of 200
+        tokens = [f"NFO:{s}" for s in opts["tradingsymbol"].tolist()]
+        quotes = {}
+        for i in range(0, len(tokens), 200):
+            try:
+                quotes.update(kite.quote(tokens[i:i + 200]))
+            except Exception as e:
+                logger.warning(f"Options quote batch failed: {e}")
+
+        rows = []
+        for _, row in opts.iterrows():
+            sym = f"NFO:{row['tradingsymbol']}"
+            q = quotes.get(sym, {})
+            rows.append({
+                "strike": float(row["strike"]),
+                "instrument_type": row["instrument_type"],
+                "tradingsymbol": row["tradingsymbol"],
+                "ce_ltp": q.get("last_price", 0) if row["instrument_type"] == "CE" else 0,
+                "pe_ltp": q.get("last_price", 0) if row["instrument_type"] == "PE" else 0,
+                "ce_oi": q.get("oi", 0) if row["instrument_type"] == "CE" else 0,
+                "pe_oi": q.get("oi", 0) if row["instrument_type"] == "PE" else 0,
+                "iv": q.get("ohlc", {}).get("close", 0),
+            })
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        # Pivot: one row per strike with both CE and PE
+        ce = df[df["instrument_type"] == "CE"][["strike", "ce_ltp", "ce_oi"]].set_index("strike")
+        pe = df[df["instrument_type"] == "PE"][["strike", "pe_ltp", "pe_oi"]].set_index("strike")
+        chain = ce.join(pe, how="outer").reset_index().fillna(0)
+        return chain
+
     def is_configured(self) -> bool:
         return bool(settings.kite_api_key and settings.kite_access_token)

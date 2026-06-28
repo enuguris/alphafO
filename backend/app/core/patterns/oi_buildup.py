@@ -21,12 +21,18 @@ class OIBuildupPattern(AbstractPattern):
         current = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # OI change
-        if prev["oi"] == 0:
-            return signals
-        oi_chg_pct = (current["oi"] - prev["oi"]) / prev["oi"]
-        if abs(oi_chg_pct) < self.OI_INCREASE_THRESHOLD:
-            return signals
+        # OI change — use volume surge as proxy when OI is not available
+        oi_available = "oi" in df.columns and pd.notna(current["oi"]) and pd.notna(prev["oi"]) and prev["oi"] > 0
+        if oi_available:
+            oi_chg_pct = (current["oi"] - prev["oi"]) / prev["oi"]
+            if abs(oi_chg_pct) < self.OI_INCREASE_THRESHOLD:
+                return signals
+        else:
+            # Volume proxy: require 1.5x average volume as confirmation
+            avg_vol = df["volume"].iloc[-10:-1].mean()
+            if avg_vol == 0 or current["volume"] < 1.5 * avg_vol:
+                return signals
+            oi_chg_pct = 1.0  # treat as positive confirmation
 
         # Resistance/support
         lookback = df.iloc[-(self.BREAKOUT_LOOKBACK + 1):-1]
@@ -36,7 +42,7 @@ class OIBuildupPattern(AbstractPattern):
         atr = self._atr(df)
         entry = current["close"]
 
-        # Bullish breakout: price closes above resistance with rising OI
+        # Bullish breakout: price closes above resistance with rising OI/volume
         if current["close"] > resistance and oi_chg_pct > 0:
             stop = resistance - 0.5 * atr  # stop just below broken resistance (now support)
             target = entry + 3.0 * atr
