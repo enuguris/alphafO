@@ -1,19 +1,20 @@
 import { useState } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchBacktests, runBacktest } from '../api/client'
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
 
 const PATTERNS = [
-  { key: 'gap_fill',       label: 'Gap Fill',       icon: '⇥', gradient: 'from-violet-600 to-purple-700' },
-  { key: 'pcr_divergence', label: 'PCR Divergence', icon: '⇌', gradient: 'from-blue-600 to-cyan-700' },
-  { key: 'mean_reversion', label: 'Mean Reversion', icon: '⟳', gradient: 'from-cyan-600 to-teal-700' },
-  { key: 'oi_buildup',     label: 'OI Buildup',     icon: '↑', gradient: 'from-amber-600 to-orange-700' },
-  { key: 'vwap_oi',        label: 'VWAP + OI',      icon: '⊛', gradient: 'from-teal-600 to-green-700' },
-  { key: 'iv_crush',       label: 'IV Crush',       icon: '⤓', gradient: 'from-pink-600 to-rose-700' },
-  { key: 'max_pain',       label: 'Max Pain',       icon: '◎', gradient: 'from-orange-600 to-red-700' },
-  { key: 'expiry_week',    label: 'Expiry Week',    icon: '⏰', gradient: 'from-rose-600 to-pink-700' },
+  { key: 'gap_fill',       label: 'Gap Fill',       color: '#7b61ff' },
+  { key: 'pcr_divergence', label: 'PCR Divergence', color: '#2962ff' },
+  { key: 'mean_reversion', label: 'Mean Reversion', color: '#00bcd4' },
+  { key: 'oi_buildup',     label: 'OI Buildup',     color: '#ff9800' },
+  { key: 'vwap_oi',        label: 'VWAP + OI',      color: '#26a69a' },
+  { key: 'iv_crush',       label: 'IV Crush',       color: '#e91e63' },
+  { key: 'max_pain',       label: 'Max Pain',       color: '#ff5722' },
+  { key: 'expiry_week',    label: 'Expiry Week',    color: '#9c27b0' },
 ]
 
-const INSTRUMENT_GROUPS = [
+const GROUPS = [
   { label: 'Indices',  items: ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'] },
   { label: 'Banking',  items: ['HDFCBANK', 'ICICIBANK', 'AXISBANK', 'SBIN', 'KOTAKBANK'] },
   { label: 'IT',       items: ['TCS', 'INFY', 'WIPRO', 'HCLTECH', 'TECHM'] },
@@ -22,7 +23,15 @@ const INSTRUMENT_GROUPS = [
   { label: 'Pharma',   items: ['SUNPHARMA', 'DRREDDY', 'CIPLA', 'DIVISLAB'] },
 ]
 
+const fmtINR = (n?: number | null) =>
+  n == null ? '—' : `₹${n.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`
+
+const fmtPct = (n?: number | null) =>
+  n == null ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
+
 export default function Backtest() {
+  const qc = useQueryClient()
+  const [group, setGroup] = useState('Indices')
   const [form, setForm] = useState({
     underlying: 'NIFTY',
     start_date: '2023-01-01',
@@ -30,167 +39,290 @@ export default function Backtest() {
     patterns:   PATTERNS.map(p => p.key),
     name:       'My Backtest',
   })
-  const [selectedGroup, setSelectedGroup] = useState('Indices')
+  const [selected, setSelected] = useState<any>(null)
 
   const { data } = useQuery({ queryKey: ['backtests'], queryFn: fetchBacktests })
-  const mutation = useMutation({ mutationFn: runBacktest })
+  const mutation = useMutation({
+    mutationFn: runBacktest,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['backtests'] }),
+  })
 
   const togglePattern = (k: string) =>
-    setForm(f => ({ ...f, patterns: f.patterns.includes(k) ? f.patterns.filter(x => x !== k) : [...f.patterns, k] }))
+    setForm(f => ({
+      ...f,
+      patterns: f.patterns.includes(k) ? f.patterns.filter(x => x !== k) : [...f.patterns, k],
+    }))
 
-  const currentGroup = INSTRUMENT_GROUPS.find(g => g.label === selectedGroup)
   const results: any[] = data?.results ?? []
+  const currentGroup   = GROUPS.find(g => g.label === group)
+
+  const equityCurve = selected?.equity_curve?.map((v: number, i: number) => ({ i, v })) ?? []
 
   return (
-    <div className="px-6 py-6 max-w-7xl mx-auto space-y-6">
-      {/* Header */}
-      <div className="rounded-2xl overflow-hidden relative px-6 py-5" style={{
-        background: 'linear-gradient(135deg, #0d1b3e 0%, #1a0533 100%)',
-        border: '1px solid rgba(56,189,248,0.2)',
-      }}>
-        <div className="absolute top-0 right-0 w-48 h-48 rounded-full opacity-15 pointer-events-none"
-          style={{ background: 'radial-gradient(circle, #0ea5e9 0%, transparent 70%)', transform: 'translate(20%, -30%)' }} />
-        <h1 className="text-2xl font-black text-white mb-1">🔬 Backtesting</h1>
-        <p className="text-xs text-slate-400">Run historical simulations across instruments and pattern combinations</p>
-      </div>
+    <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
 
-      {/* Config card */}
-      <div className="rounded-2xl p-px" style={{ background: 'linear-gradient(135deg, rgba(56,189,248,0.3), rgba(139,92,246,0.2))' }}>
-        <div className="bg-[#0f0f1e] rounded-2xl p-6 space-y-6">
-          <h2 className="text-sm font-bold text-white">Configure Run</h2>
+      {/* ── Left: Config ─────────────────────────────────── */}
+      <div style={{ width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--border)', overflow: 'hidden' }}>
+        <div className="panel-hdr">Configure Backtest</div>
+        <div className="scroll-y" style={{ flex: 1, padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
 
-          {/* Row 1: name + dates */}
-          <div className="grid grid-cols-3 gap-4">
+          {/* Strategy name */}
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Strategy Name</div>
+            <input
+              className="tv-input"
+              value={form.name}
+              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="e.g. NIFTY momentum"
+            />
+          </div>
+
+          {/* Instrument */}
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Instrument</div>
+            {/* Group chips */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
+              {GROUPS.map(g => (
+                <button
+                  key={g.label}
+                  className="tv-btn"
+                  onClick={() => { setGroup(g.label); setForm(f => ({ ...f, underlying: g.items[0] })) }}
+                  style={{
+                    padding: '2px 8px', fontSize: 10,
+                    background: group === g.label ? 'rgba(41,98,255,0.15)' : 'transparent',
+                    color: group === g.label ? 'var(--blue)' : 'var(--txt2)',
+                    border: `1px solid ${group === g.label ? 'rgba(41,98,255,0.35)' : 'transparent'}`,
+                  }}
+                >
+                  {g.label}
+                </button>
+              ))}
+            </div>
+            <select
+              className="tv-select"
+              style={{ width: '100%' }}
+              value={form.underlying}
+              onChange={e => setForm(f => ({ ...f, underlying: e.target.value }))}
+            >
+              {currentGroup?.items.map(sym => (
+                <option key={sym} value={sym}>{sym}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Date range */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
             {[
-              { label: 'Strategy Name', key: 'name', type: 'text', placeholder: 'e.g. NIFTY momentum' },
-              { label: 'Start Date',    key: 'start_date', type: 'date', placeholder: '' },
-              { label: 'End Date',      key: 'end_date',   type: 'date', placeholder: '' },
-            ].map(({ label, key, type, placeholder }) => (
+              { label: 'Start Date', key: 'start_date' },
+              { label: 'End Date',   key: 'end_date' },
+            ].map(({ label, key }) => (
               <div key={key}>
-                <label className="text-xs text-slate-400 block mb-1.5 font-medium">{label}</label>
+                <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</div>
                 <input
-                  type={type}
-                  placeholder={placeholder}
+                  type="date"
+                  className="tv-input"
                   value={(form as any)[key]}
                   onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
-                  className="w-full bg-white/[0.04] border border-white/[0.08] text-white rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-500/60 hover:border-white/20 transition-colors"
                 />
               </div>
             ))}
           </div>
 
-          {/* Instrument pickers */}
+          {/* Patterns */}
           <div>
-            <label className="text-xs text-slate-400 block mb-2 font-medium">Instrument</label>
-            <div className="flex gap-3 flex-wrap">
-              <select
-                value={selectedGroup}
-                onChange={e => {
-                  setSelectedGroup(e.target.value)
-                  const grp = INSTRUMENT_GROUPS.find(g => g.label === e.target.value)
-                  if (grp) setForm(f => ({ ...f, underlying: grp.items[0] }))
-                }}
-                className="bg-white/[0.04] border border-white/[0.08] text-white text-sm rounded-xl px-3 py-2.5 outline-none cursor-pointer focus:border-blue-500/60 hover:border-white/20 transition-colors"
-              >
-                {INSTRUMENT_GROUPS.map(g => <option key={g.label} value={g.label}>{g.label}</option>)}
-              </select>
-              <select
-                value={form.underlying}
-                onChange={e => setForm(f => ({ ...f, underlying: e.target.value }))}
-                className="bg-white/[0.04] border border-white/[0.08] text-white text-sm rounded-xl px-3 py-2.5 outline-none cursor-pointer focus:border-blue-500/60 hover:border-white/20 transition-colors"
-              >
-                {currentGroup?.items.map(sym => <option key={sym} value={sym}>{sym}</option>)}
-              </select>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Patterns</div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="tv-btn tv-btn-ghost" style={{ padding: '2px 7px', fontSize: 10 }}
+                  onClick={() => setForm(f => ({ ...f, patterns: PATTERNS.map(p => p.key) }))}>All</button>
+                <button className="tv-btn tv-btn-ghost" style={{ padding: '2px 7px', fontSize: 10 }}
+                  onClick={() => setForm(f => ({ ...f, patterns: [] }))}>None</button>
+              </div>
             </div>
-          </div>
-
-          {/* Pattern toggles */}
-          <div>
-            <div className="flex items-center gap-2 mb-2">
-              <label className="text-xs text-slate-400 font-medium">Patterns</label>
-              <span className="text-xs text-blue-400 bg-blue-500/10 border border-blue-500/20 px-2 py-0.5 rounded-full">
-                {form.patterns.length}/{PATTERNS.length} selected
-              </span>
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              {PATTERNS.map(({ key, label, icon, gradient }) => {
-                const active = form.patterns.includes(key)
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {PATTERNS.map(({ key, label, color }) => {
+                const on = form.patterns.includes(key)
                 return (
                   <button
                     key={key}
                     onClick={() => togglePattern(key)}
-                    className={`flex items-center gap-2 px-3 py-2.5 rounded-xl border text-sm transition-all ${
-                      active
-                        ? 'border-purple-500/40 text-white'
-                        : 'border-white/[0.06] text-slate-500 hover:text-slate-300 hover:border-white/20'
-                    }`}
-                    style={active ? { background: 'linear-gradient(135deg, rgba(124,58,237,0.2), rgba(37,99,235,0.15))' } : {}}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '6px 8px', borderRadius: 4, cursor: 'pointer',
+                      background: on ? `${color}14` : 'transparent',
+                      border: `1px solid ${on ? `${color}44` : 'var(--border)'}`,
+                      transition: 'all 0.12s', textAlign: 'left',
+                    }}
                   >
-                    <span className={`w-6 h-6 rounded-lg bg-gradient-to-br ${gradient} flex items-center justify-center text-xs flex-shrink-0`}>
-                      {icon}
-                    </span>
-                    <span className="text-xs truncate">{label}</span>
+                    <div style={{ width: 8, height: 8, borderRadius: 2, background: on ? color : 'var(--border2)', flexShrink: 0, transition: 'background 0.12s' }} />
+                    <span style={{ fontSize: 12, color: on ? 'var(--txt)' : 'var(--txt2)', fontWeight: on ? 600 : 400 }}>{label}</span>
                   </button>
                 )
               })}
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
-            <button
-              onClick={() => mutation.mutate(form)}
-              disabled={mutation.isPending || form.patterns.length === 0}
-              className="font-bold text-white px-6 py-2.5 rounded-xl text-sm shadow-lg disabled:opacity-50 transition-all"
-              style={{ background: 'linear-gradient(135deg, #7c3aed, #2563eb)' }}
-            >
-              {mutation.isPending ? '⏳ Running…' : '🚀 Run Backtest'}
-            </button>
-            {mutation.isSuccess && <span className="text-emerald-400 text-sm">✅ Queued successfully</span>}
-            {mutation.isError  && <span className="text-red-400 text-sm">❌ Failed to queue</span>}
-          </div>
+          {/* Run button */}
+          <button
+            className="tv-btn tv-btn-primary"
+            style={{ width: '100%', justifyContent: 'center', padding: '9px 0' }}
+            disabled={mutation.isPending || form.patterns.length === 0}
+            onClick={() => mutation.mutate(form)}
+          >
+            {mutation.isPending ? '⏳ Running…' : '▶ Run Backtest'}
+          </button>
+
+          {mutation.isError && (
+            <div style={{ fontSize: 11, color: 'var(--dn)', padding: '8px 10px', background: 'rgba(239,83,80,0.08)', borderRadius: 4, border: '1px solid rgba(239,83,80,0.2)' }}>
+              Failed to run backtest. Check backend logs.
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Results */}
-      <div className="rounded-2xl overflow-hidden border border-white/[0.07] bg-[#0f0f1e]">
-        <div className="px-5 py-4 border-b border-white/[0.06] flex items-center gap-2">
-          <span className="text-sm font-bold text-white">Results</span>
-          {results.length > 0 && (
-            <span className="text-xs text-slate-500 bg-white/[0.04] px-2 py-0.5 rounded-full">{results.length} runs</span>
-          )}
-        </div>
-        {results.length === 0 ? (
-          <div className="text-center py-14">
-            <div className="text-4xl mb-3">📊</div>
-            <p className="text-slate-500">No backtest runs yet. Configure and run above.</p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-white/[0.05]">
-                  {['Name', 'Underlying', 'Return', 'Sharpe', 'Max DD', 'Win Rate', 'Trades'].map(h => (
-                    <th key={h} className="px-4 py-3 text-left text-[11px] text-slate-500 font-semibold uppercase tracking-wide">{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {results.map((r: any) => (
-                  <tr key={r.id} className="border-t border-white/[0.04] hover:bg-white/[0.02] transition-colors">
-                    <td className="px-4 py-3 text-white font-medium text-xs">{r.name}</td>
-                    <td className="px-4 py-3 text-slate-400 text-xs">{r.underlying}</td>
-                    <td className={`px-4 py-3 font-mono text-xs font-bold ${r.total_return_pct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {r.total_return_pct >= 0 ? '+' : ''}{r.total_return_pct?.toFixed(1)}%
-                    </td>
-                    <td className="px-4 py-3 font-mono text-xs text-slate-300">{r.sharpe_ratio?.toFixed(2)}</td>
-                    <td className="px-4 py-3 font-mono text-xs text-red-400">{r.max_drawdown_pct?.toFixed(1)}%</td>
-                    <td className="px-4 py-3 font-mono text-xs text-amber-400">{r.win_rate?.toFixed(1)}%</td>
-                    <td className="px-4 py-3 font-mono text-xs text-slate-400">{r.total_trades}</td>
-                  </tr>
+      {/* ── Right: Results ────────────────────────────────── */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+
+        {selected ? (
+          /* Detail view */
+          <>
+            <div className="toolbar">
+              <button className="tv-btn tv-btn-ghost" style={{ fontSize: 11 }} onClick={() => setSelected(null)}>← Back</button>
+              <span style={{ fontWeight: 700, color: 'var(--txt)' }}>{selected.name}</span>
+              <span style={{ color: 'var(--txt2)', fontSize: 11 }}>{selected.underlying}</span>
+              <span className="badge badge-mute">{selected.start_date} – {selected.end_date}</span>
+            </div>
+
+            <div className="scroll-y" style={{ flex: 1, padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {/* Stat row */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8 }}>
+                {[
+                  { label: 'Total Return',  val: fmtPct(selected.total_return_pct),  color: (selected.total_return_pct ?? 0) >= 0 ? 'var(--up)' : 'var(--dn)' },
+                  { label: 'Win Rate',      val: `${((selected.win_rate ?? 0) * 100).toFixed(1)}%`, color: (selected.win_rate ?? 0) >= 0.55 ? 'var(--up)' : 'var(--orange)' },
+                  { label: 'Max Drawdown',  val: `${(selected.max_drawdown_pct ?? 0).toFixed(1)}%`,  color: 'var(--dn)' },
+                  { label: 'Sharpe',        val: (selected.sharpe_ratio ?? 0).toFixed(2),             color: 'var(--txt)' },
+                  { label: 'Total Trades',  val: String(selected.total_trades ?? 0),                  color: 'var(--txt)' },
+                ].map(({ label, val, color }) => (
+                  <div key={label} className="tv-card" style={{ padding: '10px 12px' }}>
+                    <div style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>{label}</div>
+                    <div className="mono" style={{ fontSize: 15, fontWeight: 700, color }}>{val}</div>
+                  </div>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </div>
+
+              {/* Equity curve */}
+              {equityCurve.length > 1 && (
+                <div className="tv-card" style={{ padding: 14 }}>
+                  <div className="section-title">Equity Curve</div>
+                  <ResponsiveContainer width="100%" height={140}>
+                    <LineChart data={equityCurve} margin={{ top: 4, right: 0, bottom: 0, left: 0 }}>
+                      <XAxis dataKey="i" hide />
+                      <YAxis hide domain={['auto', 'auto']} />
+                      <ReferenceLine y={100} stroke="var(--border2)" strokeDasharray="3 3" />
+                      <Tooltip contentStyle={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11 }}
+                        formatter={(v: number) => [`${v.toFixed(1)}`, 'Index']} />
+                      <Line type="monotone" dataKey="v" stroke="var(--blue)" strokeWidth={1.5} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+
+              {/* Pattern breakdown */}
+              {selected.pattern_breakdown && (
+                <div className="tv-card" style={{ overflow: 'hidden' }}>
+                  <div className="panel-hdr">Pattern Breakdown</div>
+                  <table className="tv-table">
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left' }}>Pattern</th>
+                        <th>Trades</th>
+                        <th>Win Rate</th>
+                        <th>Avg Return</th>
+                        <th>Net P&L</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(selected.pattern_breakdown).map(([key, v]: any) => (
+                        <tr key={key}>
+                          <td style={{ textAlign: 'left' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <div style={{ width: 6, height: 6, borderRadius: 1, background: PATTERNS.find(p => p.key === key)?.color ?? 'var(--txt3)' }} />
+                              <span style={{ color: 'var(--txt)' }}>{key.replace(/_/g, ' ')}</span>
+                            </div>
+                          </td>
+                          <td className="mono">{v.trades ?? '—'}</td>
+                          <td className={`mono ${(v.win_rate ?? 0) >= 0.5 ? 'up' : 'dn'}`}>{v.win_rate != null ? `${(v.win_rate * 100).toFixed(1)}%` : '—'}</td>
+                          <td className={`mono ${(v.avg_return ?? 0) >= 0 ? 'up' : 'dn'}`}>{v.avg_return != null ? fmtPct(v.avg_return) : '—'}</td>
+                          <td className={`mono ${(v.net_pnl ?? 0) >= 0 ? 'up' : 'dn'}`}>{v.net_pnl != null ? fmtINR(v.net_pnl) : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </>
+        ) : (
+          /* List view */
+          <>
+            <div className="panel-hdr">
+              Backtest Results
+              {results.length > 0 && <span className="badge badge-blue">{results.length}</span>}
+            </div>
+
+            {mutation.isPending && (
+              <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {[1, 2].map(i => <div key={i} className="skeleton" style={{ height: 56 }} />)}
+              </div>
+            )}
+
+            {!mutation.isPending && results.length === 0 && (
+              <div style={{ textAlign: 'center', padding: '48px 24px' }}>
+                <div style={{ fontSize: 32, marginBottom: 12, opacity: 0.25 }}>◉</div>
+                <p style={{ color: 'var(--txt2)', marginBottom: 4 }}>No backtests yet</p>
+                <p style={{ color: 'var(--txt3)', fontSize: 11 }}>Configure a run on the left and click ▶ Run Backtest</p>
+              </div>
+            )}
+
+            {results.length > 0 && (
+              <div className="scroll-y" style={{ flex: 1 }}>
+                <table className="tv-table">
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: 'left' }}>Name</th>
+                      <th style={{ textAlign: 'left' }}>Instrument</th>
+                      <th>Period</th>
+                      <th>Return</th>
+                      <th>Win Rate</th>
+                      <th>Max DD</th>
+                      <th>Sharpe</th>
+                      <th>Trades</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map((r: any) => (
+                      <tr key={r.id} onClick={() => setSelected(r)}>
+                        <td style={{ textAlign: 'left', fontWeight: 700, color: 'var(--txt)' }}>{r.name}</td>
+                        <td style={{ textAlign: 'left' }}>
+                          <span className="badge badge-mute">{r.underlying}</span>
+                        </td>
+                        <td className="muted" style={{ fontSize: 11 }}>{r.start_date?.slice(0,7)} – {r.end_date?.slice(0,7)}</td>
+                        <td className={`mono ${(r.total_return_pct ?? 0) >= 0 ? 'up' : 'dn'}`} style={{ fontWeight: 600 }}>
+                          {fmtPct(r.total_return_pct)}
+                        </td>
+                        <td className={`mono ${(r.win_rate ?? 0) >= 0.55 ? 'up' : 'dn'}`}>
+                          {r.win_rate != null ? `${(r.win_rate * 100).toFixed(1)}%` : '—'}
+                        </td>
+                        <td className="mono dn">{r.max_drawdown_pct != null ? `${r.max_drawdown_pct.toFixed(1)}%` : '—'}</td>
+                        <td className="mono">{r.sharpe_ratio?.toFixed(2) ?? '—'}</td>
+                        <td className="mono muted">{r.total_trades ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
