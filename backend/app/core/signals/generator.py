@@ -22,10 +22,16 @@ class SignalGenerator:
         options_chain: pd.DataFrame | None = None,
         underlying: str = "",
         pattern_filter: list[str] | None = None,
+        context: dict | None = None,
     ) -> list[PatternSignal]:
         """
         Run all (or filtered) patterns and return valid signals sorted by confidence.
+
+        Args:
+            context: optional dict with keys like "iv_rank" and "regime" that patterns
+                     can use to adjust confidence scores.
         """
+        context = context or {}
         patterns = self.registry.all()
         if pattern_filter:
             patterns = [p for p in patterns if p.name in pattern_filter]
@@ -33,7 +39,7 @@ class SignalGenerator:
         all_signals: list[PatternSignal] = []
         for pattern in patterns:
             try:
-                signals = pattern.detect(ohlcv, options_chain=options_chain, underlying=underlying)
+                signals = pattern.detect(ohlcv, options_chain=options_chain, underlying=underlying, context=context)
                 for s in signals:
                     if self._is_valid(s):
                         all_signals.append(s)

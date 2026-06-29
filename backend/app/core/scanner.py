@@ -97,6 +97,67 @@ def synthetic_ohlcv(underlying: str, timeframe: Timeframe = "daily") -> pd.DataF
     })
 
 
+_KITE_INTERVAL: dict[str, str] = {
+    "15m": "15minute", "1h": "60minute", "4h": "60minute", "daily": "day"
+}
+_KITE_DAYS: dict[str, int] = {
+    "15m": 10, "1h": 60, "4h": 60, "daily": 365
+}
+
+
+async def _fetch_ohlcv(underlying: str, timeframe: Timeframe) -> pd.DataFrame:
+    """
+    Fetch OHLCV from Kite when configured; fall back to synthetic data.
+    Kite 4h is approximated by resampling 60min candles.
+    """
+    try:
+        from app.core.data.kite_adapter import KiteAdapter
+        from datetime import date, timedelta
+
+        adapter = KiteAdapter()
+        if not adapter.is_configured():
+            raise ValueError("Kite not configured")
+
+        from_date = date.today() - timedelta(days=_KITE_DAYS[timeframe])
+        to_date   = date.today()
+        interval  = _KITE_INTERVAL[timeframe]
+
+        # We need the NSE instrument token — fetch instruments list
+        kite = adapter._get_kite()
+        instruments_df = adapter.get_instruments("NSE")
+        row = instruments_df[instruments_df["tradingsymbol"] == underlying.upper()]
+        if row.empty:
+            raise ValueError(f"Token not found for {underlying}")
+
+        token = int(row.iloc[0]["instrument_token"])
+        df = adapter.get_historical(token, from_date, to_date, interval)
+
+        if df.empty:
+            raise ValueError("Empty response from Kite")
+
+        # Resample 60min → 4h when needed
+        if timeframe == "4h":
+            df = df.set_index("timestamp").resample("4h").agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna().reset_index()
+
+        # Add synthetic IV column (Kite historical doesn't include IV)
+        if "iv" not in df.columns:
+            import numpy as np
+            rng = np.random.default_rng(abs(hash(underlying)) % (2**31))
+            df["iv"] = np.round(rng.uniform(12, 28, len(df)), 2)
+        if "oi" not in df.columns:
+            df["oi"] = 0.0
+
+        logger.info(f"[scanner] Using REAL Kite data for {underlying}/{timeframe}: {len(df)} bars")
+        return df
+
+    except Exception as e:
+        logger.debug(f"[scanner] Kite OHLCV unavailable for {underlying}/{timeframe}: {e} — using synthetic")
+        return synthetic_ohlcv(underlying, timeframe)
+
+
 async def scan_instrument(
     underlying: str,
     timeframe: Timeframe = "daily",
@@ -107,9 +168,15 @@ async def scan_instrument(
     Returns list of signal dicts ready for DB persistence and WebSocket broadcast.
     """
     try:
-        # 1. Data
-        ohlcv = synthetic_ohlcv(underlying, timeframe)
-        spot = float(ohlcv["close"].iloc[-1])
+        # 1. Data — use real Kite OHLCV when configured, else synthetic
+        ohlcv = await _fetch_ohlcv(underlying, timeframe)
+        # Spot: prefer live tick over OHLCV last close
+        try:
+            from app.core.data.kite_ticker import ticker_service
+            snap = ticker_service.get_snapshot()
+            spot = snap[underlying.upper()]["ltp"] if underlying.upper() in snap else float(ohlcv["close"].iloc[-1])
+        except Exception:
+            spot = float(ohlcv["close"].iloc[-1])
 
         # 2. Regime
         try:
@@ -203,7 +270,11 @@ async def scan_instrument(
                 "timeframe":          timeframe,
                 "option_type":        opt.get("option_type"),
                 "strike":             opt.get("strike"),
-                "expiry_date_str":    opt.get("expiry_date_str"),
+                "expiry_date_str":    opt.get("expiry_date_str") or opt.get("expiry", {}).get("short"),
+                "expiry_date_iso":    opt.get("expiry_date") or opt.get("expiry", {}).get("date"),
+                "expiry_display":     opt.get("expiry_display") or opt.get("expiry", {}).get("display"),
+                "expiry_dte":         opt.get("expiry_dte") or opt.get("expiry", {}).get("dte"),
+                "expiry_series":      opt.get("expiry_series") or opt.get("expiry", {}).get("series"),
                 "option_strategy":    opt.get("strategy"),
                 "lot_size":           opt.get("lot_size") or LOT_SIZES.get(underlying, 50),
                 "delta":              greeks_data.get("delta"),

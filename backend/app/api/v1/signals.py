@@ -31,10 +31,9 @@ def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
     - Last 10 rows have tight range (BB squeeze → mean_reversion)
     - OI and price trend consistently for the last 5 rows (oi_buildup, vwap_oi)
     """
+    from app.core.instruments import BASE_PRICES
     rng = np.random.default_rng(abs(hash(underlying)) % (2**31))
-    base = {"NIFTY": 24300, "BANKNIFTY": 52700, "FINNIFTY": 23400,
-            "MIDCPNIFTY": 12640, "HDFCBANK": 1840, "ICICIBANK": 1375,
-            "RELIANCE": 2970, "TATAMOTORS": 978, "INFY": 1920}.get(underlying, 1500)
+    base = BASE_PRICES.get(underlying.upper(), 1500)
 
     # Body: normal random walk for first (rows-10) candles
     body_len = rows - 10
@@ -143,7 +142,12 @@ async def scan_all(
             explanation=s.get("explanation", ""), trading_style=s.get("trading_style", "intraday"),
             status=SignalStatus.ACTIVE, created_at=datetime.utcnow(), valid_until=valid_until,
             option_type=s.get("option_type"), strike=s.get("strike"),
-            expiry_date_str=s.get("expiry_date_str"), option_strategy=s.get("option_strategy"),
+            expiry_date_str=s.get("expiry_date_str"),
+            expiry_date_iso=s.get("expiry_date_iso"),
+            expiry_display=s.get("expiry_display"),
+            expiry_dte=s.get("expiry_dte"),
+            expiry_series=s.get("expiry_series"),
+            option_strategy=s.get("option_strategy"),
             lot_size=s.get("lot_size"), delta=s.get("delta"), gamma=s.get("gamma"),
             theta=s.get("theta"), vega=s.get("vega"), iv_at_signal=s.get("iv_at_signal"),
             iv_rank=s.get("iv_rank"), regime_trend=s.get("regime_trend"),
@@ -372,7 +376,11 @@ async def run_signals(
             # Options fields
             option_type         = opt.get("option_type"),
             strike              = opt.get("strike"),
-            expiry_date_str     = opt.get("expiry_date_str"),
+            expiry_date_str     = opt.get("expiry_date_str") or opt.get("expiry", {}).get("short"),
+            expiry_date_iso     = opt.get("expiry_date") or opt.get("expiry", {}).get("date"),
+            expiry_display      = opt.get("expiry_display") or opt.get("expiry", {}).get("display"),
+            expiry_dte          = opt.get("expiry_dte") or opt.get("expiry", {}).get("dte"),
+            expiry_series       = opt.get("expiry_series") or opt.get("expiry", {}).get("series"),
             option_strategy     = opt.get("strategy"),
             lot_size            = opt.get("lot_size"),
             delta               = greeks_data.get("delta"),

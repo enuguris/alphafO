@@ -35,9 +35,14 @@ class Settings(BaseSettings):
 
     # Risk Parameters
     max_capital_risk_per_trade: float = 0.01   # 1%
-    max_portfolio_heat: float = 0.03            # 3%
-    daily_loss_limit: float = 0.02             # 2%
+    max_risk_per_trade: float = 1.0            # % of capital per trade
+    max_portfolio_heat: float = 3.0            # % max deployed capital
+    max_daily_loss_pct: float = 2.0            # % daily loss triggers halt
+    daily_loss_limit: float = 0.02             # fractional form (legacy)
     weekly_loss_limit: float = 0.03            # 3%
+
+    # Capital
+    paper_capital: float = 500_000.0           # ₹5,00,000
 
     # Paper Trading Promotion Thresholds
     paper_min_trades: int = 60
@@ -46,7 +51,7 @@ class Settings(BaseSettings):
 
     # Data
     nse_data_dir: str = "./data/nse"
-    initial_capital: float = 500_000.0         # ₹5,00,000
+    initial_capital: float = 500_000.0         # ₹5,00,000 (legacy alias)
 
     # AI Chat
     anthropic_api_key: str = ""

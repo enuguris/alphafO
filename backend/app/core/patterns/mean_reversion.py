@@ -12,7 +12,7 @@ class MeanReversionPattern(AbstractPattern):
 
     SQUEEZE_PERCENTILE = 20  # BB width in bottom 20% of last 30 days = squeeze
 
-    def detect(self, ohlcv: pd.DataFrame, options_chain=None, underlying: str = "") -> list[PatternSignal]:
+    def detect(self, ohlcv: pd.DataFrame, options_chain=None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
         signals = []
         if not self.validate_data(ohlcv):
             return signals
@@ -64,12 +64,25 @@ class MeanReversionPattern(AbstractPattern):
             instrument=f"{underlying}_FUT",
             direction=direction, entry_price=entry, target_price=target, stop_loss=stop,
             expected_return_pct=round(exp_ret, 2),
-            confidence_score=0.68,
+            confidence_score=self._regime_adj(0.68, context),
             explanation=self._explain(underlying, current_width, threshold, direction),
             trading_style="positional",
             metadata={"bb_width": round(current_width, 4), "squeeze_threshold": round(threshold, 4)},
         ))
         return signals
+
+    def _regime_adj(self, score: float, context: dict) -> float:
+        iv_rank = context.get("iv_rank", None)
+        regime = context.get("regime", {})
+        suitable = regime.get("suitable_patterns", [])
+        # mean_reversion benefits from low IV (potential to buy options cheap)
+        if iv_rank is not None and iv_rank < 0.3:
+            score = min(1.0, score * 1.1)
+        if suitable:
+            if self.name in suitable:
+                return min(1.0, score * 1.2)
+            return score * 0.85
+        return score
 
     def _atr(self, df: pd.DataFrame, period: int = 14) -> float:
         tr = pd.concat([df["high"] - df["low"],

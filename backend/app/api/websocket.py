@@ -76,29 +76,15 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# In-memory live price state (simulated ticks)
-_live_prices: dict[str, float] = {sym: float(price) for sym, price in BASE_PRICES.items()}
 
-
-def _tick_prices() -> dict[str, dict]:
-    """Simulate realistic NSE price ticks with momentum."""
-    global _live_prices
-    ticks = {}
-    for inst in ALL_INSTRUMENTS:
-        sym = inst["sym"]
-        prev = _live_prices.get(sym, inst["base_price"])
-        # Small random walk: ±0.05% per second
-        drift = random.gauss(0, prev * 0.0005)
-        new_price = round(prev + drift, 2)
-        _live_prices[sym] = new_price
-        chg_pct = round((new_price - inst["base_price"]) / inst["base_price"] * 100, 2)
-        ticks[sym] = {
-            "ltp": new_price,
-            "chg": chg_pct,
-            "bid": round(new_price * 0.9999, 2),
-            "ask": round(new_price * 1.0001, 2),
-        }
-    return ticks
+def _get_price_snapshot() -> dict[str, dict]:
+    """Pull latest prices from the ticker service (live or simulated)."""
+    try:
+        from app.core.data.kite_ticker import ticker_service
+        return ticker_service.get_snapshot()
+    except Exception:
+        # Ultra-safe fallback: static base prices with zero change
+        return {sym: {"ltp": float(p), "chg": 0.0} for sym, p in BASE_PRICES.items()}
 
 
 @router.websocket("/ws/signals")
@@ -139,13 +125,27 @@ async def signals_ws(websocket: WebSocket):
 
 @router.websocket("/ws/prices")
 async def prices_ws(websocket: WebSocket):
-    """Stream live price ticks for all F&O instruments."""
+    """Stream price ticks — sourced from KiteTickerService (live or simulated)."""
     await manager.connect_prices(websocket)
     try:
         while True:
-            ticks = _tick_prices()
-            await websocket.send_json({"type": "price_tick", "ts": datetime.utcnow().isoformat(), "ticks": ticks})
-            await asyncio.sleep(1)  # 1 tick per second
+            snapshot = _get_price_snapshot()
+            # Enrich with bid/ask spread (±0.01%)
+            ticks = {
+                sym: {
+                    "ltp": data["ltp"],
+                    "chg": data["chg"],
+                    "bid": round(data["ltp"] * 0.9999, 2),
+                    "ask": round(data["ltp"] * 1.0001, 2),
+                }
+                for sym, data in snapshot.items()
+            }
+            await websocket.send_json({
+                "type": "price_tick",
+                "ts": datetime.utcnow().isoformat(),
+                "ticks": ticks,
+            })
+            await asyncio.sleep(1)
     except WebSocketDisconnect:
         manager.disconnect_prices(websocket)
     except Exception as e:

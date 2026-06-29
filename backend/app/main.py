@@ -42,7 +42,18 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting AlphaFO v{settings.app_version} — mode: {settings.app_mode}")
     await init_db()
     await _load_kite_credentials_from_db()
+
+    # Start tick data service (real via Kite Ticker, or simulated fallback)
+    from app.core.data.kite_ticker import ticker_service, ensure_stream_groups
+    ensure_stream_groups()
+    ticker_service.start()
+
+    # Reset daily risk counters
+    from app.core.risk.gate import reset_daily_pnl
+    reset_daily_pnl()
+
     yield
+    ticker_service.stop()
     logger.info("AlphaFO shutting down")
 
 

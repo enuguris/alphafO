@@ -13,7 +13,7 @@ class ExpiryWeekPattern(AbstractPattern):
     OTM_DELTA_TARGET = 0.2    # sell ~0.2 delta options
     TARGET_PREMIUM_PCT = 0.6  # collect 60% of premium
 
-    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "") -> list[PatternSignal]:
+    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
         signals = []
         if options_chain is None or options_chain.empty:
             return signals
@@ -54,12 +54,21 @@ class ExpiryWeekPattern(AbstractPattern):
             target_price=target,
             stop_loss=total_premium * 1.5,
             expected_return_pct=round(total_premium * self.TARGET_PREMIUM_PCT / current_price * 100, 2),
-            confidence_score=0.72,
+            confidence_score=self._regime_adj(0.72, context),
             explanation=self._explain(underlying, call_strike, put_strike, ce_premium, pe_premium, total_premium),
             trading_style="intraday",
             metadata={"call_strike": call_strike, "put_strike": put_strike, "total_premium": total_premium},
         ))
         return signals
+
+    def _regime_adj(self, score: float, context: dict) -> float:
+        regime = context.get("regime", {})
+        suitable = regime.get("suitable_patterns", [])
+        if suitable:
+            if self.name in suitable:
+                return min(1.0, score * 1.2)
+            return score * 0.85
+        return score
 
     def _explain(self, underlying, cs, ps, ce, pe, total):
         return (

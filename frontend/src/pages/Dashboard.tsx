@@ -110,14 +110,31 @@ function SignalRow({ s }: { s: any }) {
           ))}
         </div>
 
-        {/* Option contract */}
+        {/* Option contract + expiry */}
         {s.strike && (
-          <div style={{ textAlign: 'right', minWidth: 80 }}>
+          <div style={{ textAlign: 'right', minWidth: 110 }}>
             <div style={{ fontSize: 10, color: 'var(--txt3)' }}>Contract</div>
             <div className="mono" style={{ fontSize: 11, fontWeight: 700, color: s.option_type === 'CE' ? 'var(--dn)' : 'var(--up)' }}>
               {s.strike?.toLocaleString('en-IN')} {s.option_type}
             </div>
             <div style={{ fontSize: 9, color: 'var(--txt3)' }}>{s.option_strategy?.toUpperCase()}</div>
+            {/* Expiry date — full date + DTE */}
+            {s.expiry_display && (
+              <div style={{ marginTop: 3, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1 }}>
+                <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--blue)', whiteSpace: 'nowrap' }}>
+                  {s.expiry_display}
+                </div>
+                <div style={{
+                  fontSize: 9, padding: '0 4px', borderRadius: 2,
+                  background: (s.expiry_dte ?? 99) <= 2
+                    ? 'rgba(239,83,80,0.15)' : 'rgba(41,98,255,0.12)',
+                  color: (s.expiry_dte ?? 99) <= 2 ? 'var(--dn)' : 'var(--txt2)',
+                  fontWeight: 700,
+                }}>
+                  {s.expiry_series === 'weekly' ? 'WK' : 'MO'} · {s.expiry_dte}d
+                </div>
+              </div>
+            )}
           </div>
         )}
 

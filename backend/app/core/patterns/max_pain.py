@@ -12,7 +12,7 @@ class MaxPainPattern(AbstractPattern):
 
     DEVIATION_TRIGGER_PCT = 1.5   # trigger when spot deviates >1.5% from max pain
 
-    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "") -> list[PatternSignal]:
+    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
         signals = []
         if options_chain is None or options_chain.empty or not self.validate_data(ohlcv):
             return signals
@@ -46,12 +46,21 @@ class MaxPainPattern(AbstractPattern):
             instrument=f"{underlying}_FUT",
             direction=direction, entry_price=entry, target_price=target, stop_loss=stop,
             expected_return_pct=round(exp_return, 2),
-            confidence_score=min(1.0, 0.55 + abs(deviation_pct) / 10),
+            confidence_score=self._regime_adj(min(1.0, 0.55 + abs(deviation_pct) / 10), context),
             explanation=self._explain(underlying, current_price, max_pain_strike, deviation_pct, direction),
             trading_style="intraday",
             metadata={"max_pain_strike": max_pain_strike, "deviation_pct": round(deviation_pct, 2)},
         ))
         return signals
+
+    def _regime_adj(self, score: float, context: dict) -> float:
+        regime = context.get("regime", {})
+        suitable = regime.get("suitable_patterns", [])
+        if suitable:
+            if self.name in suitable:
+                return min(1.0, score * 1.2)
+            return score * 0.85
+        return score
 
     def _calculate_max_pain(self, chain: pd.DataFrame) -> float | None:
         """Max pain = strike where total option premium expiring worthless is maximized."""

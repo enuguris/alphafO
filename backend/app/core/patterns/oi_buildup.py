@@ -12,7 +12,7 @@ class OIBuildupPattern(AbstractPattern):
     OI_INCREASE_THRESHOLD = 0.15   # 15% OI increase in one session
     BREAKOUT_LOOKBACK = 20         # periods for support/resistance calculation
 
-    def detect(self, ohlcv: pd.DataFrame, options_chain=None, underlying: str = "") -> list[PatternSignal]:
+    def detect(self, ohlcv: pd.DataFrame, options_chain=None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
         signals = []
         if not self.validate_data(ohlcv) or "oi" not in ohlcv.columns:
             return signals
@@ -46,7 +46,7 @@ class OIBuildupPattern(AbstractPattern):
                 instrument=f"{underlying}_FUT",
                 direction="long", entry_price=entry, target_price=target, stop_loss=stop,
                 expected_return_pct=round((target - entry) / entry * 100, 2),
-                confidence_score=min(1.0, 0.6 + oi_chg_pct),
+                confidence_score=self._regime_adj(min(1.0, 0.6 + oi_chg_pct), context),
                 explanation=self._explain(underlying, "bullish", resistance, oi_chg_pct),
                 trading_style="positional",
                 metadata={"oi_chg_pct": round(oi_chg_pct * 100, 1), "resistance": resistance},
@@ -62,13 +62,22 @@ class OIBuildupPattern(AbstractPattern):
                 instrument=f"{underlying}_FUT",
                 direction="short", entry_price=entry, target_price=target, stop_loss=stop,
                 expected_return_pct=round((entry - target) / entry * 100, 2),
-                confidence_score=min(1.0, 0.6 + oi_chg_pct),
+                confidence_score=self._regime_adj(min(1.0, 0.6 + oi_chg_pct), context),
                 explanation=self._explain(underlying, "bearish", support, oi_chg_pct),
                 trading_style="positional",
                 metadata={"oi_chg_pct": round(oi_chg_pct * 100, 1), "support": support},
             ))
 
         return signals
+
+    def _regime_adj(self, score: float, context: dict) -> float:
+        regime = context.get("regime", {})
+        suitable = regime.get("suitable_patterns", [])
+        if suitable:
+            if self.name in suitable:
+                return min(1.0, score * 1.2)
+            return score * 0.85
+        return score
 
     def _atr(self, df: pd.DataFrame, period: int = 14) -> float:
         tr = pd.concat([df["high"] - df["low"],

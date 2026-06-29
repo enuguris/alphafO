@@ -48,6 +48,7 @@ class AbstractPattern(ABC):
         ohlcv: pd.DataFrame,
         options_chain: Optional[pd.DataFrame] = None,
         underlying: str = "",
+        context: dict = {},
     ) -> list[PatternSignal]:
         """
         Analyse data and return list of signals (empty if no pattern found).

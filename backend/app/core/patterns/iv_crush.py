@@ -13,7 +13,7 @@ class IVCrushPattern(AbstractPattern):
     IV_ELEVATION_THRESHOLD = 1.3   # IV must be 30% above 20-day average
     DAYS_BEFORE_EVENT = 5
 
-    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "") -> list[PatternSignal]:
+    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
         signals = []
         if options_chain is None or options_chain.empty or "iv" not in ohlcv.columns:
             return signals
@@ -53,12 +53,25 @@ class IVCrushPattern(AbstractPattern):
             target_price=target_premium,
             stop_loss=total_premium * 1.5,   # exit if premium doubles
             expected_return_pct=round((total_premium - target_premium) / current_price * 100, 2),
-            confidence_score=min(1.0, 0.5 + (iv_ratio - 1.3) * 0.5),
+            confidence_score=self._regime_adj(min(1.0, 0.5 + (iv_ratio - 1.3) * 0.5), context),
             explanation=self._explain(underlying, current_iv, avg_iv, iv_ratio, atm_strike, total_premium, breakeven_up, breakeven_down),
             trading_style="positional",
             metadata={"iv_ratio": round(iv_ratio, 2), "atm_strike": atm_strike, "total_premium": total_premium},
         ))
         return signals
+
+    def _regime_adj(self, score: float, context: dict) -> float:
+        iv_rank = context.get("iv_rank", None)
+        regime = context.get("regime", {})
+        suitable = regime.get("suitable_patterns", [])
+        # iv_crush benefits from high IV rank
+        if iv_rank is not None and iv_rank > 0.7:
+            score = min(1.0, score * 1.1)
+        if suitable:
+            if self.name in suitable:
+                return min(1.0, score * 1.2)
+            return score * 0.85
+        return score
 
     def _explain(self, underlying, curr_iv, avg_iv, ratio, strike, premium, be_up, be_dn):
         return (

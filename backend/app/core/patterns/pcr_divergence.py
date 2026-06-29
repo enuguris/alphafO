@@ -14,7 +14,7 @@ class PCRDivergencePattern(AbstractPattern):
     PCR_BEARISH_THRESHOLD = 0.7   # PCR below this = too many calls = bearish contrarian
     PRICE_DIVERGENCE_PCT = 0.5    # price must have moved at least 0.5% in opposite direction
 
-    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "") -> list[PatternSignal]:
+    def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
         signals = []
         if not self.validate_data(ohlcv) or options_chain is None or options_chain.empty:
             return signals
@@ -49,7 +49,7 @@ class PCRDivergencePattern(AbstractPattern):
                 target_price=target,
                 stop_loss=stop,
                 expected_return_pct=round((target - entry) / entry * 100, 2),
-                confidence_score=round(confidence, 2),
+                confidence_score=round(self._regime_adj(confidence, context), 2),
                 explanation=self._explain_bullish(pcr, price_chg_pct),
                 trading_style="intraday",
                 metadata={"pcr": round(pcr, 2), "price_chg_pct": round(price_chg_pct, 2)},
@@ -73,13 +73,22 @@ class PCRDivergencePattern(AbstractPattern):
                 target_price=target,
                 stop_loss=stop,
                 expected_return_pct=round((entry - target) / entry * 100, 2),
-                confidence_score=round(confidence, 2),
+                confidence_score=round(self._regime_adj(confidence, context), 2),
                 explanation=self._explain_bearish(pcr, price_chg_pct),
                 trading_style="intraday",
                 metadata={"pcr": round(pcr, 2), "price_chg_pct": round(price_chg_pct, 2)},
             ))
 
         return signals
+
+    def _regime_adj(self, score: float, context: dict) -> float:
+        regime = context.get("regime", {})
+        suitable = regime.get("suitable_patterns", [])
+        if suitable:
+            if self.name in suitable:
+                return min(1.0, score * 1.2)
+            return score * 0.85
+        return score
 
     def _atr(self, ohlcv: pd.DataFrame, period: int = 14) -> float:
         high = ohlcv["high"]

@@ -1,9 +1,11 @@
-"""Options API endpoints — regime, IV rank, chain, max pain, events."""
+"""Options API endpoints — regime, IV rank, chain, max pain, events, expiry, risk."""
 from datetime import date
+from typing import Literal
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from app.core.options.regime import RegimeDetector
 from app.core.options.chain_service import ChainService
@@ -11,18 +13,23 @@ from app.core.options.iv_rank import IVRankService
 from app.core.options.max_pain import compute_max_pain
 from app.core.options.event_calendar import EventCalendar
 from app.core.options.greeks import compute_greeks, RISK_FREE_RATE
+from app.core.options.expiry import available_expiries, select_expiry
+from app.core.instruments import BASE_PRICES
+from app.core import risk
 
 router = APIRouter()
 
-SPOT_PRICES = {
-    "NIFTY": 24300, "BANKNIFTY": 52700, "FINNIFTY": 23400,
-    "MIDCPNIFTY": 12640, "HDFCBANK": 1840, "ICICIBANK": 1375,
-    "RELIANCE": 2970, "TATAMOTORS": 978, "INFY": 1920,
-}
-
 
 def _spot(underlying: str) -> float:
-    return float(SPOT_PRICES.get(underlying.upper(), 1500))
+    """Use current live price snapshot, fall back to base_price."""
+    try:
+        from app.core.data.kite_ticker import ticker_service
+        snap = ticker_service.get_snapshot()
+        if underlying.upper() in snap:
+            return snap[underlying.upper()]["ltp"]
+    except Exception:
+        pass
+    return float(BASE_PRICES.get(underlying.upper(), 1500))
 
 
 def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
@@ -137,3 +144,65 @@ async def get_events(count: int = 5):
         "event_risk": event_risk,
         "upcoming_events": events,
     }
+
+
+# ── Expiry endpoints ──────────────────────────────────────────────────────────
+
+@router.get("/expiry/{underlying}")
+async def get_expiries(underlying: str):
+    """Return all available expiry dates for an underlying with DTE."""
+    expiries = available_expiries(underlying.upper())
+    if not expiries:
+        raise HTTPException(404, f"Unknown underlying: {underlying}")
+    return {
+        "underlying": underlying.upper(),
+        "expiries": expiries,
+        "next": expiries[0],
+    }
+
+
+@router.get("/expiry/{underlying}/select")
+async def select_best_expiry(underlying: str, dte: int = 7):
+    """Pick the most appropriate expiry given a DTE preference."""
+    expiry = select_expiry(underlying.upper(), dte_preference=dte)
+    return {"underlying": underlying.upper(), "dte_preference": dte, "selected": expiry}
+
+
+# ── Risk / Kill-switch endpoints ──────────────────────────────────────────────
+
+@router.get("/risk/status")
+async def risk_status():
+    """Current risk gate status: halt flag, daily P&L, portfolio heat."""
+    from app.core.risk.gate import halt_status, get_daily_pnl
+    import redis as _redis
+    from app.config import settings
+
+    r = _redis.from_url(settings.redis_url, decode_responses=True)
+    deployed = float(r.get("daily_deployed") or 0)
+
+    return {
+        **halt_status(),
+        "daily_pnl":       round(get_daily_pnl(), 2),
+        "capital_deployed": round(deployed, 2),
+        "capital":         settings.paper_capital,
+    }
+
+
+class HaltRequest(BaseModel):
+    reason: str = "manual halt"
+
+
+@router.post("/risk/halt")
+async def trigger_halt(body: HaltRequest):
+    """Immediately halt all automated trading."""
+    from app.core.risk.gate import halt_trading
+    halt_trading(body.reason)
+    return {"halted": True, "reason": body.reason}
+
+
+@router.post("/risk/resume")
+async def trigger_resume():
+    """Resume trading after a halt."""
+    from app.core.risk.gate import resume_trading
+    resume_trading()
+    return {"halted": False}

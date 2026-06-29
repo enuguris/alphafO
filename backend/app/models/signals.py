@@ -43,10 +43,14 @@ class Signal(Base):
     valid_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Options-specific
-    option_type: Mapped[str | None] = mapped_column(String(2), nullable=True)        # CE | PE
+    option_type: Mapped[str | None] = mapped_column(String(2), nullable=True)         # CE | PE
     strike: Mapped[float | None] = mapped_column(Float, nullable=True)
-    expiry_date_str: Mapped[str | None] = mapped_column(String(20), nullable=True)   # "25JUL"
-    option_strategy: Mapped[str | None] = mapped_column(String(20), nullable=True)   # buy | sell | spread
+    expiry_date_str: Mapped[str | None] = mapped_column(String(20), nullable=True)    # "03JUL26" (NSE symbol)
+    expiry_date_iso: Mapped[str | None] = mapped_column(String(10), nullable=True)    # "2026-07-03"
+    expiry_display: Mapped[str | None] = mapped_column(String(30), nullable=True)     # "03 Jul 2026 (Thu)"
+    expiry_dte: Mapped[int | None] = mapped_column(Integer, nullable=True)            # days to expiry
+    expiry_series: Mapped[str | None] = mapped_column(String(10), nullable=True)      # "weekly" | "monthly"
+    option_strategy: Mapped[str | None] = mapped_column(String(20), nullable=True)    # buy | sell | spread
     lot_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Greeks at signal time
     delta: Mapped[float | None] = mapped_column(Float, nullable=True)
