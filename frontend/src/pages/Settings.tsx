@@ -14,9 +14,9 @@ const RISK_PARAMS = [
 ]
 
 const MODES = [
-  { key: 'testing' as const, label: 'Testing',      desc: 'No capital at risk. Uses synthetic/seed data.', color: 'var(--txt2)' },
-  { key: 'paper'   as const, label: 'Paper Trading', desc: 'Virtual ₹5,00,000 capital. Live data, no real money.', color: 'var(--orange)' },
-  { key: 'live'    as const, label: 'Live',          desc: 'Real capital. Requires 60+ paper trades ≥55% win rate.', color: 'var(--dn)' },
+  { key: 'testing' as const, label: 'Testing',      desc: 'Pattern engine runs on synthetic data. No orders placed.', color: 'var(--txt2)' },
+  { key: 'paper'   as const, label: 'Paper Trading', desc: 'Signals execute as virtual trades. Real Kite data when connected.', color: 'var(--orange)' },
+  { key: 'live'    as const, label: 'Live',          desc: 'Real orders via Kite. Requires valid access token.', color: 'var(--dn)' },
 ]
 
 type Status = { text: string; ok: boolean } | null

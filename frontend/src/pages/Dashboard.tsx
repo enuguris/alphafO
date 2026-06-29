@@ -2,8 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   fetchSignals, fetchPortfolio, fetchTrades, runSignals, initPortfolio,
-  scanAll, fetchInstruments, fetchSectors, createSignalSocket, createPriceSocket,
+  scanAll, fetchInstruments, fetchSectors, fetchDataStatus,
+  createSignalSocket, createPriceSocket,
 } from '../api/client'
+import { useModeStore } from '../store/modeStore'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid, BarChart, Bar } from 'recharts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -266,6 +268,7 @@ function SignalToast({ sig, onDismiss }: { sig: any; onDismiss: () => void }) {
 
 export default function Dashboard() {
   const qc = useQueryClient()
+  const { mode, syncFromBackend } = useModeStore()
   const [selectedSym, setSelectedSym] = useState('NIFTY')
   const [sector, setSector] = useState('Index')
   const [mainTab, setMainTab] = useState('Signals')
@@ -278,6 +281,9 @@ export default function Dashboard() {
   const [wsConnected, setWsConnected] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const priceWsRef = useRef<WebSocket | null>(null)
+
+  // Sync mode from backend on mount
+  useEffect(() => { syncFromBackend() }, [])
 
   // ── API queries ──────────────────────────────────────────────────────────────
   const { data: instrData } = useQuery({
@@ -295,8 +301,9 @@ export default function Dashboard() {
     queryFn: () => fetchSignals({ status: 'active', underlying: selectedSym, limit: 50 }),
     refetchInterval: 30_000,
   })
-  const { data: portfolio } = useQuery({ queryKey: ['portfolio'], queryFn: fetchPortfolio, refetchInterval: 10_000 })
-  const { data: trades }    = useQuery({ queryKey: ['trades'],    queryFn: () => fetchTrades('paper') })
+  const { data: portfolio }   = useQuery({ queryKey: ['portfolio'],   queryFn: fetchPortfolio,   refetchInterval: 10_000 })
+  const { data: trades }      = useQuery({ queryKey: ['trades'],      queryFn: () => fetchTrades('paper') })
+  const { data: dataStatus }  = useQuery({ queryKey: ['dataStatus'],  queryFn: fetchDataStatus,  refetchInterval: 60_000, staleTime: 30_000 })
 
   // ── Mutations ──────────────────────────────────────────────────────────────
   const scanMutation = useMutation({
@@ -387,13 +394,20 @@ export default function Dashboard() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
             <div className={wsConnected ? 'live-dot' : ''} style={{
               width: 6, height: 6, borderRadius: '50%',
-              background: wsConnected ? 'var(--up)' : 'var(--txt3)',
+              background: wsConnected ? (dataStatus?.data_source?.startsWith('kite') ? 'var(--up)' : 'var(--orange)') : 'var(--txt3)',
               flexShrink: 0,
             }} />
-            <span style={{ fontSize: 10, color: wsConnected ? 'var(--up)' : 'var(--txt3)' }}>
-              {wsConnected ? 'SIM PRICES' : 'OFFLINE'}
+            <span style={{ fontSize: 10, color: wsConnected ? (dataStatus?.data_source?.startsWith('kite') ? 'var(--up)' : 'var(--orange)') : 'var(--txt3)' }}>
+              {!wsConnected ? 'OFFLINE' : (dataStatus?.source_label ?? 'CONNECTING…')}
             </span>
           </div>
+          {/* Mode pill */}
+          <span style={{
+            fontSize: 9, padding: '1px 5px', borderRadius: 2, fontWeight: 700, letterSpacing: '0.05em',
+            background: mode === 'live' ? 'rgba(239,83,80,0.15)' : mode === 'paper' ? 'rgba(255,152,0,0.12)' : 'rgba(150,150,150,0.1)',
+            color: mode === 'live' ? 'var(--dn)' : mode === 'paper' ? 'var(--orange)' : 'var(--txt3)',
+            border: `1px solid ${mode === 'live' ? 'rgba(239,83,80,0.3)' : mode === 'paper' ? 'rgba(255,152,0,0.3)' : 'rgba(150,150,150,0.2)'}`,
+          }}>{mode.toUpperCase()}</span>
           <div style={{ flex: 1 }} />
           <button
             className="tv-btn tv-btn-primary"
@@ -481,7 +495,14 @@ export default function Dashboard() {
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 1 }}>
                 <span style={{ fontWeight: 700, color: 'var(--txt)', fontSize: 12 }}>{selectedSym}</span>
-                <span style={{ fontSize: 9, padding: '1px 4px', borderRadius: 2, background: 'rgba(255,152,0,0.15)', color: 'var(--orange)', border: '1px solid rgba(255,152,0,0.35)', fontWeight: 700, letterSpacing: '0.05em' }}>SIM</span>
+                {dataStatus && (
+                  <span style={{
+                    fontSize: 9, padding: '1px 4px', borderRadius: 2, fontWeight: 700, letterSpacing: '0.05em',
+                    background: dataStatus.data_source?.startsWith('kite') ? 'rgba(38,166,154,0.12)' : 'rgba(255,152,0,0.15)',
+                    color: dataStatus.data_source?.startsWith('kite') ? 'var(--up)' : 'var(--orange)',
+                    border: `1px solid ${dataStatus.data_source?.startsWith('kite') ? 'rgba(38,166,154,0.3)' : 'rgba(255,152,0,0.35)'}`,
+                  }}>{dataStatus.source_label ?? 'SIM'}</span>
+                )}
               </div>
               <div className="mono" style={{ fontSize: 18, fontWeight: 800, color: chgPct >= 0 ? 'var(--up)' : 'var(--dn)', lineHeight: 1.1 }}>
                 {ltp.toLocaleString('en-IN', { maximumFractionDigits: 2 })}

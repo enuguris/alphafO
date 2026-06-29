@@ -45,13 +45,85 @@ class RequestTokenIn(BaseModel):
 
 @router.put("/mode")
 async def set_mode(update: ModeUpdate):
-    if update.mode == AppMode.LIVE:
-        return {
-            "error": "Live mode can only be enabled after paper trading criteria are met.",
-            "use": "POST /api/v1/portfolio/promote-to-live",
-        }
     settings.app_mode = update.mode
     return {"mode": settings.app_mode, "message": f"Switched to {update.mode} mode"}
+
+
+@router.get("/data-status")
+async def data_status(db: AsyncSession = Depends(get_db)):
+    """
+    Report the actual data source the app is currently using.
+    This is separate from trading mode — mode controls order execution,
+    data source depends on Kite connectivity.
+    """
+    from datetime import datetime, time as dtime
+    import pytz
+
+    cfg = await _get_or_create_config(db)
+    today = date.today()
+    token_valid = bool(cfg.access_token_enc) and cfg.token_date == today
+    kite_configured = bool(cfg.api_key and cfg.access_token_enc and token_valid)
+
+    # Check if NSE market is open (9:15–15:30 IST Mon–Fri)
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    market_open_time  = dtime(9, 15)
+    market_close_time = dtime(15, 30)
+    is_weekday = now_ist.weekday() < 5
+    is_market_hours = (
+        is_weekday
+        and market_open_time <= now_ist.time() <= market_close_time
+    )
+
+    # Try to get a live price sample to confirm data is flowing
+    ltp_sample: dict | None = None
+    if kite_configured:
+        try:
+            from app.core.data.kite_adapter import KiteAdapter
+            from app.core.encryption import decrypt
+            from kiteconnect import KiteConnect
+
+            access_token = decrypt(cfg.access_token_enc)
+            kc = KiteConnect(api_key=cfg.api_key)
+            kc.set_access_token(access_token)
+            quote = kc.quote(["NSE:NIFTY 50"])
+            nifty = quote.get("NSE:NIFTY 50", {})
+            ltp_sample = {
+                "symbol": "NIFTY",
+                "ltp":    nifty.get("last_price"),
+                "close":  nifty.get("ohlc", {}).get("close"),
+                "source": "kite",
+            }
+            # Push real price into ticker snapshot so WebSocket serves it
+            from app.core.data.kite_ticker import ticker_service
+            if ltp_sample["ltp"]:
+                prev = ltp_sample["close"] or ltp_sample["ltp"]
+                chg  = round((ltp_sample["ltp"] - prev) / prev * 100, 2) if prev else 0.0
+                ticker_service._live_prices["NIFTY"] = {
+                    "ltp": ltp_sample["ltp"], "chg": chg
+                }
+        except Exception as e:
+            ltp_sample = {"error": str(e)}
+
+    if kite_configured and ltp_sample and "ltp" in ltp_sample:
+        data_source = "kite_live" if is_market_hours else "kite_eod"
+        source_label = "KITE LIVE" if is_market_hours else "KITE (EOD)"
+    elif kite_configured:
+        data_source = "kite_error"
+        source_label = "KITE (ERR)"
+    else:
+        data_source = "simulated"
+        source_label = "SIMULATED"
+
+    return {
+        "mode":           settings.app_mode,
+        "data_source":    data_source,
+        "source_label":   source_label,
+        "kite_configured": kite_configured,
+        "market_open":    is_market_hours,
+        "market_time_ist": now_ist.strftime("%H:%M IST"),
+        "ltp_sample":     ltp_sample,
+    }
 
 
 @router.get("/kite-credentials")

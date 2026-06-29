@@ -29,6 +29,9 @@ export const fetchEvents    = ()                     => api.get('/options/events
 export const fetchInstruments = (sector?: string)   => api.get('/instruments/', { params: sector ? { sector } : {} }).then(r => r.data)
 export const fetchSectors     = ()                  => api.get('/instruments/sectors').then(r => r.data)
 
+// ── Settings / Data status ────────────────────────────────────────────────
+export const fetchDataStatus = () => api.get('/settings/data-status').then(r => r.data)
+
 // ── Chat ──────────────────────────────────────────────────────────────────
 export const sendChat       = (messages: object[])   => api.post('/chat/', { messages }).then(r => r.data)
 
