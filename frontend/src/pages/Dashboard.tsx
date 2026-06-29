@@ -374,7 +374,7 @@ export default function Dashboard() {
               flexShrink: 0,
             }} />
             <span style={{ fontSize: 10, color: wsConnected ? 'var(--up)' : 'var(--txt3)' }}>
-              {wsConnected ? 'LIVE' : 'OFFLINE'}
+              {wsConnected ? 'SIM PRICES' : 'OFFLINE'}
             </span>
           </div>
           <div style={{ flex: 1 }} />
@@ -462,7 +462,10 @@ export default function Dashboard() {
         <div style={{ padding: '8px 10px', borderTop: '1px solid var(--border)', background: 'var(--bg2)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div>
-              <div style={{ fontWeight: 700, color: 'var(--txt)', fontSize: 12 }}>{selectedSym}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 1 }}>
+                <span style={{ fontWeight: 700, color: 'var(--txt)', fontSize: 12 }}>{selectedSym}</span>
+                <span style={{ fontSize: 9, padding: '1px 4px', borderRadius: 2, background: 'rgba(255,152,0,0.15)', color: 'var(--orange)', border: '1px solid rgba(255,152,0,0.35)', fontWeight: 700, letterSpacing: '0.05em' }}>SIM</span>
+              </div>
               <div className="mono" style={{ fontSize: 18, fontWeight: 800, color: chgPct >= 0 ? 'var(--up)' : 'var(--dn)', lineHeight: 1.1 }}>
                 {ltp.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
               </div>
