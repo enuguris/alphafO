@@ -133,3 +133,84 @@ async def generate_access_token(
         "token_date": cfg.token_date.isoformat(),
         "valid_until": "End of today (Kite tokens expire at midnight).",
     }
+
+
+@router.get("/kite-test")
+async def test_kite_connection(db: AsyncSession = Depends(get_db)):
+    """
+    Test Kite Connect end-to-end:
+      1. Credentials present in DB
+      2. Access token valid (not expired)
+      3. profile() API call succeeds
+      4. Fetch last 5 NIFTY daily candles — proves historical data works
+      5. Fetch live quote for NIFTY — proves quote API works
+    Returns a structured result per check so the UI can show exactly what passed/failed.
+    """
+    from datetime import timedelta
+    from kiteconnect import KiteConnect
+    from app.core.encryption import decrypt
+
+    results: list[dict] = []
+
+    def step(name: str, ok: bool, detail: str) -> dict:
+        r = {"check": name, "ok": ok, "detail": detail}
+        results.append(r)
+        return r
+
+    # 1. Credentials
+    cfg = await _get_or_create_config(db)
+    if not cfg.api_key or not cfg.api_secret_enc:
+        step("Credentials", False, "API key / secret not saved. Complete Step 1 first.")
+        return {"passed": False, "results": results}
+    step("Credentials", True, f"API key {cfg.api_key[:6]}… found in database")
+
+    # 2. Access token present and dated today
+    today = date.today()
+    if not cfg.access_token_enc or cfg.token_date != today:
+        step("Access Token", False,
+             f"Token missing or expired (dated {cfg.token_date}). Complete Step 2 to regenerate.")
+        return {"passed": False, "results": results}
+    step("Access Token", True, f"Token dated {cfg.token_date} — valid for today")
+
+    # 3. Profile API call
+    try:
+        access_token = decrypt(cfg.access_token_enc)
+        kite = KiteConnect(api_key=cfg.api_key)
+        kite.set_access_token(access_token)
+        profile = kite.profile()
+        step("Profile API", True,
+             f"Connected as {profile.get('user_name', '?')} ({profile.get('user_id', '?')}) "
+             f"— broker: {profile.get('broker', '?')}")
+    except Exception as exc:
+        step("Profile API", False, f"API call failed: {exc}")
+        return {"passed": False, "results": results}
+
+    # 4. Historical OHLCV — last 5 NIFTY daily candles
+    try:
+        from_date = today - timedelta(days=10)
+        candles = kite.historical_data(256265, from_date, today, "day")  # 256265 = NIFTY 50 index token
+        if not candles:
+            raise ValueError("Empty response")
+        last = candles[-1]
+        step("Historical Data", True,
+             f"NIFTY last close: ₹{last['close']:,.2f} on {str(last['date'])[:10]} "
+             f"({len(candles)} candles fetched)")
+    except Exception as exc:
+        step("Historical Data", False, f"historical_data() failed: {exc}")
+
+    # 5. Live quote
+    try:
+        quote = kite.quote(["NSE:NIFTY 50"])
+        nifty = quote.get("NSE:NIFTY 50", {})
+        ltp = nifty.get("last_price", 0)
+        step("Live Quote", True, f"NIFTY LTP: ₹{ltp:,.2f}")
+    except Exception as exc:
+        step("Live Quote", False, f"quote() failed: {exc}")
+
+    all_ok = all(r["ok"] for r in results)
+    return {
+        "passed": all_ok,
+        "results": results,
+        "summary": "All checks passed — Kite Connect is fully operational." if all_ok
+                   else "Some checks failed. See details above.",
+    }

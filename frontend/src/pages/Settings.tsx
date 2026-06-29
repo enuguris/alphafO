@@ -21,6 +21,9 @@ const MODES = [
 
 type Status = { text: string; ok: boolean } | null
 
+interface TestCheck { check: string; ok: boolean; detail: string }
+interface TestResult { passed: boolean; summary: string; results: TestCheck[] }
+
 export default function Settings() {
   const { mode, setMode } = useModeStore()
   const { theme, toggle } = useThemeStore()
@@ -33,6 +36,8 @@ export default function Settings() {
   const [tokenStatus,  setTokenStatus]  = useState<Status>(null)
   const [savingCreds,  setSavingCreds]  = useState(false)
   const [generatingToken, setGeneratingToken] = useState(false)
+  const [testing,      setTesting]      = useState(false)
+  const [testResult,   setTestResult]   = useState<TestResult | null>(null)
 
   // Saved state loaded from DB
   const [savedInfo, setSavedInfo] = useState<{
@@ -70,6 +75,23 @@ export default function Settings() {
       window.open(r.data.login_url, '_blank')
     } catch (e: any) {
       setCredStatus({ text: e?.response?.data?.detail ?? 'Could not generate login URL. Save credentials first.', ok: false })
+    }
+  }
+
+  const testConnection = async () => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const r = await api.get('/settings/kite-test')
+      setTestResult(r.data)
+    } catch (e: any) {
+      setTestResult({
+        passed: false,
+        summary: e?.response?.data?.detail ?? 'Connection test failed.',
+        results: [],
+      })
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -248,19 +270,72 @@ export default function Settings() {
               </details>
             </div>
 
-            {/* Status summary */}
-            <div style={{ padding: '10px 16px', background: 'var(--bg3)', display: 'flex', gap: 24 }}>
+            {/* Status summary + Test Connection */}
+            <div style={{ padding: '10px 16px', background: 'var(--bg3)', display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap' }}>
               {[
-                { label: 'API Key',     ok: !!savedInfo?.api_key,       val: savedInfo?.api_key ? `${savedInfo.api_key.slice(0,6)}…` : 'Not set' },
-                { label: 'API Secret',  ok: !!savedInfo?.has_secret,     val: savedInfo?.has_secret ? 'Encrypted in DB' : 'Not set' },
-                { label: 'Access Token',ok: !!savedInfo?.token_valid,    val: savedInfo?.token_valid ? `Valid (${savedInfo.token_date})` : 'Expired / not set' },
+                { label: 'API Key',     ok: !!savedInfo?.api_key,    val: savedInfo?.api_key ? `${savedInfo.api_key.slice(0,6)}…` : 'Not set' },
+                { label: 'API Secret',  ok: !!savedInfo?.has_secret,  val: savedInfo?.has_secret ? 'Encrypted in DB' : 'Not set' },
+                { label: 'Access Token',ok: !!savedInfo?.token_valid, val: savedInfo?.token_valid ? `Valid (${savedInfo.token_date})` : 'Expired / not set' },
               ].map(({ label, ok, val }) => (
                 <div key={label}>
                   <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
                   <div style={{ fontSize: 11, color: ok ? 'var(--up)' : 'var(--dn)', fontWeight: 600 }}>{val}</div>
                 </div>
               ))}
+              <button
+                onClick={testConnection}
+                disabled={testing || !savedInfo?.token_valid}
+                className="tv-btn tv-btn-primary"
+                style={{ marginLeft: 'auto', minWidth: 160 }}
+                title={!savedInfo?.token_valid ? 'Generate a valid access token first' : 'Run live connection test'}
+              >
+                {testing
+                  ? <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{ display: 'inline-block', width: 10, height: 10, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
+                      Testing…
+                    </span>
+                  : '⚡ Test Connection'}
+              </button>
             </div>
+
+            {/* Test result panel */}
+            {testResult && (
+              <div style={{
+                margin: '0', padding: '14px 16px',
+                background: testResult.passed ? 'rgba(38,166,154,0.06)' : 'rgba(239,83,80,0.06)',
+                borderTop: `1px solid ${testResult.passed ? 'rgba(38,166,154,0.2)' : 'rgba(239,83,80,0.2)'}`,
+              }}>
+                {/* Summary line */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: testResult.results.length ? 12 : 0 }}>
+                  <span style={{ fontSize: 18 }}>{testResult.passed ? '✓' : '✗'}</span>
+                  <span style={{ fontWeight: 700, fontSize: 12, color: testResult.passed ? 'var(--up)' : 'var(--dn)' }}>
+                    {testResult.summary}
+                  </span>
+                </div>
+
+                {/* Per-check breakdown */}
+                {testResult.results.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {testResult.results.map((r, i) => (
+                      <div key={i} style={{
+                        display: 'flex', gap: 10, alignItems: 'flex-start',
+                        padding: '7px 10px', borderRadius: 4,
+                        background: r.ok ? 'rgba(38,166,154,0.06)' : 'rgba(239,83,80,0.06)',
+                        border: `1px solid ${r.ok ? 'rgba(38,166,154,0.15)' : 'rgba(239,83,80,0.15)'}`,
+                      }}>
+                        <span style={{ fontSize: 13, lineHeight: 1, marginTop: 1, flexShrink: 0, color: r.ok ? 'var(--up)' : 'var(--dn)' }}>
+                          {r.ok ? '✓' : '✗'}
+                        </span>
+                        <div>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt)', marginBottom: 2 }}>{r.check}</div>
+                          <div style={{ fontSize: 11, color: 'var(--txt2)', lineHeight: 1.5 }}>{r.detail}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </section>
 
