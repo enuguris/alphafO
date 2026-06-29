@@ -95,6 +95,76 @@ async def list_signals(
     return {"signals": [s.__dict__ for s in signals], "count": len(signals)}
 
 
+@router.post("/scan-all")
+async def scan_all(
+    timeframes: list[str] | None = None,
+    symbols: list[str] | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Run multi-timeframe scan across all (or specified) instruments. Broadcasts via WebSocket."""
+    from app.core.scanner import run_full_scan
+    from app.api.websocket import manager
+    from app.core.instruments import priority_scan_list, all_symbols
+
+    scan_symbols = symbols or priority_scan_list()
+    scan_tfs = timeframes or ["15m", "1h", "4h", "daily"]
+
+    result = await run_full_scan(
+        symbols=scan_symbols,
+        timeframes=scan_tfs,
+        broadcast_fn=manager.broadcast,
+        db=db,
+    )
+
+    # Persist signals
+    from app.models.signals import Signal, SignalStatus
+    from datetime import timedelta
+    from sqlalchemy import and_
+
+    created = []
+    valid_until = datetime.utcnow() + timedelta(hours=24)
+    for s in result["signals"]:
+        cutoff = datetime.utcnow() - timedelta(hours=1)
+        dup_q = select(Signal).where(and_(
+            Signal.underlying == s["underlying"],
+            Signal.pattern_name == s["pattern_name"],
+            Signal.direction == s["direction"],
+            Signal.created_at >= cutoff,
+        ))
+        dup = (await db.execute(dup_q)).scalars().first()
+        if dup:
+            continue
+        sig = Signal(
+            pattern_name=s["pattern_name"], pattern_version=s.get("pattern_version", "1.0"),
+            symbol=s.get("symbol", s["underlying"]), underlying=s["underlying"],
+            instrument=s.get("instrument", s["underlying"]), direction=s["direction"],
+            entry_price=s["entry_price"], target_price=s["target_price"], stop_loss=s["stop_loss"],
+            expected_return_pct=s["expected_return_pct"], confidence_score=s["confidence_score"],
+            explanation=s.get("explanation", ""), trading_style=s.get("trading_style", "intraday"),
+            status=SignalStatus.ACTIVE, created_at=datetime.utcnow(), valid_until=valid_until,
+            option_type=s.get("option_type"), strike=s.get("strike"),
+            expiry_date_str=s.get("expiry_date_str"), option_strategy=s.get("option_strategy"),
+            lot_size=s.get("lot_size"), delta=s.get("delta"), gamma=s.get("gamma"),
+            theta=s.get("theta"), vega=s.get("vega"), iv_at_signal=s.get("iv_at_signal"),
+            iv_rank=s.get("iv_rank"), regime_trend=s.get("regime_trend"),
+            regime_volatility=s.get("regime_volatility"), estimated_premium=s.get("estimated_premium"),
+            max_loss=s.get("max_loss"), timeframe=s.get("timeframe"),
+        )
+        db.add(sig)
+        created.append(sig)
+
+    if created:
+        await db.commit()
+
+    return {
+        "symbols_scanned": result["symbols_scanned"],
+        "timeframes": result["timeframes"],
+        "signals_found": result["signals_found"],
+        "signals_new": len(created),
+        "duration_ms": result["duration_ms"],
+    }
+
+
 @router.get("/{signal_id}")
 async def get_signal(signal_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Signal).where(Signal.id == signal_id))

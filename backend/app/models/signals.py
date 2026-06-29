@@ -61,3 +61,5 @@ class Signal(Base):
     # Cost
     estimated_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Scan context
+    timeframe: Mapped[str | None] = mapped_column(String(10), nullable=True)  # 15m | 1h | 4h | daily
