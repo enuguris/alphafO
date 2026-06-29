@@ -129,6 +129,32 @@ function SignalRow({ s }: { s: any }) {
           ))}
         </div>
 
+        {/* Option contract */}
+        {s.strike && (
+          <div style={{ textAlign: 'right', minWidth: 80 }}>
+            <div style={{ fontSize: 10, color: 'var(--txt3)' }}>Contract</div>
+            <div className="mono" style={{ fontSize: 11, fontWeight: 700, color: s.option_type === 'CE' ? 'var(--dn)' : 'var(--up)' }}>
+              {s.strike?.toLocaleString('en-IN')} {s.option_type}
+            </div>
+            <div style={{ fontSize: 9, color: 'var(--txt3)' }}>{s.option_strategy?.toUpperCase()}</div>
+          </div>
+        )}
+
+        {/* Greeks */}
+        {s.delta != null && (
+          <div style={{ textAlign: 'right', minWidth: 70 }}>
+            <div style={{ fontSize: 10, color: 'var(--txt3)' }}>Δ / θ / IV</div>
+            <div className="mono" style={{ fontSize: 10, color: 'var(--txt)' }}>
+              {s.delta?.toFixed(2)} / {s.theta?.toFixed(1)} / {s.iv_at_signal?.toFixed(1)}%
+            </div>
+            {s.iv_rank != null && (
+              <div style={{ fontSize: 9, color: s.iv_rank > 0.7 ? 'var(--dn)' : s.iv_rank < 0.3 ? 'var(--up)' : 'var(--orange)' }}>
+                IVR {Math.round(s.iv_rank * 100)}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Expected return */}
         <div style={{ textAlign: 'right', minWidth: 50 }}>
           <div style={{ fontSize: 10, color: 'var(--txt3)' }}>Exp.</div>
@@ -139,8 +165,31 @@ function SignalRow({ s }: { s: any }) {
       </div>
 
       {exp && (
-        <div className="fade-up" style={{ padding: '0 12px 12px 25px', fontSize: 11, color: 'var(--txt2)', lineHeight: 1.6 }}>
-          {s.explanation}
+        <div className="fade-up" style={{ padding: '0 12px 12px 25px' }}>
+          <p style={{ fontSize: 11, color: 'var(--txt2)', lineHeight: 1.6, marginBottom: s.regime_trend ? 10 : 0 }}>
+            {s.explanation}
+          </p>
+          {(s.regime_trend || s.delta != null) && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+              {s.regime_trend && (
+                <span className={`badge ${s.regime_trend === 'bullish' ? 'badge-up' : s.regime_trend === 'bearish' ? 'badge-dn' : 'badge-warn'}`}>
+                  {s.regime_trend} regime
+                </span>
+              )}
+              {s.regime_volatility && (
+                <span className="badge badge-mute">{s.regime_volatility} vol</span>
+              )}
+              {s.estimated_premium != null && (
+                <span className="badge badge-mute">Premium ₹{s.estimated_premium?.toFixed(0)}</span>
+              )}
+              {s.max_loss != null && (
+                <span className="badge badge-dn">Max loss ₹{s.max_loss?.toFixed(0)}</span>
+              )}
+              {s.vega != null && (
+                <span className="badge badge-blue">Vega {s.vega?.toFixed(2)}</span>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

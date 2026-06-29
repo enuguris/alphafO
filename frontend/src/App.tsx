@@ -3,6 +3,7 @@ import { Routes, Route, NavLink } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Backtest from './pages/Backtest'
 import PaperTrading from './pages/PaperTrading'
+import Options from './pages/Options'
 import Settings from './pages/Settings'
 import ChatPanel from './components/ChatPanel'
 import { useModeStore } from './store/modeStore'
@@ -10,6 +11,7 @@ import { useThemeStore } from './store/themeStore'
 
 const NAV = [
   { to: '/',         label: 'Dashboard' },
+  { to: '/options',  label: 'Options' },
   { to: '/paper',    label: 'Paper Trading' },
   { to: '/backtest', label: 'Backtest' },
   { to: '/settings', label: 'Settings' },
@@ -122,6 +124,7 @@ export default function App() {
         <div style={{ flex: 1, overflow: 'auto' }}>
           <Routes>
             <Route path="/"         element={<Dashboard />} />
+            <Route path="/options"  element={<Options />} />
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/paper"    element={<PaperTrading />} />
             <Route path="/settings" element={<Settings />} />

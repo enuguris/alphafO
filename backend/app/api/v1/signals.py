@@ -1,5 +1,5 @@
 """Signal API endpoints."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,13 @@ from app.config import settings, AppMode
 from app.database import get_db
 from app.models.signals import Signal, SignalStatus
 from app.core.signals.generator import SignalGenerator
+from app.core.options.regime import RegimeDetector
+from app.core.options.chain_service import ChainService
+from app.core.options.iv_rank import IVRankService
+from app.core.options.event_calendar import EventCalendar
+from app.core.options.strike_selector import StrikeSelector
+from app.core.options.max_pain import compute_max_pain
+from app.core.options.greeks import compute_greeks, RISK_FREE_RATE
 
 router = APIRouter()
 
@@ -103,7 +110,7 @@ async def run_signals(
     patterns: list[str] | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Run pattern detection and persist new signals to DB."""
+    """Run pattern detection with regime and options enrichment, persist signals to DB."""
 
     # ── 1. Fetch OHLCV ────────────────────────────────────────────────────────
     ohlcv: pd.DataFrame
@@ -119,7 +126,6 @@ async def run_signals(
         try:
             from app.core.data.kite_adapter import KiteAdapter
             adapter = KiteAdapter()
-            # Map underlying name → Kite NFO instrument token
             instruments_df = adapter.get_instruments("NFO")
             fut = instruments_df[
                 instruments_df["name"].str.upper() == underlying.upper()
@@ -127,11 +133,10 @@ async def run_signals(
             if fut.empty:
                 raise ValueError(f"No NFO instrument found for {underlying}")
             token = int(fut.iloc[0]["instrument_token"])
-            from datetime import date, timedelta as td
+            from datetime import timedelta as td
             ohlcv = adapter.get_historical(token, date.today() - td(days=180), date.today())
             data_source = "kite"
         except Exception as exc:
-            # fall back to synthetic if Kite fails
             ohlcv = _synthetic_ohlcv(underlying)
             data_source = f"synthetic (kite error: {exc})"
     else:
@@ -144,9 +149,58 @@ async def run_signals(
             detail=f"Insufficient OHLCV data for {underlying} (source: {data_source})"
         )
 
-    # ── 2. Run pattern engine ─────────────────────────────────────────────────
+    spot_price = float(ohlcv["close"].iloc[-1])
+
+    # ── 2. Detect regime ──────────────────────────────────────────────────────
+    try:
+        regime = RegimeDetector().detect(ohlcv)
+    except Exception as e:
+        regime = {"trend": "ranging", "volatility": "normal", "adx": 20.0,
+                  "india_vix_proxy": 15.0, "suitable_patterns": []}
+
+    # ── 3. Get options chain ──────────────────────────────────────────────────
+    chain_svc = ChainService()
+    chain_df = chain_svc.get_chain(underlying)
+
+    # ── 4. Compute IV rank ────────────────────────────────────────────────────
+    iv_history = chain_svc.get_iv_history(underlying)
+    current_iv = float(ohlcv["iv"].iloc[-1]) if "iv" in ohlcv.columns else 18.0
+    iv_rank_val = IVRankService.iv_rank(current_iv, iv_history)
+    iv_pct = IVRankService.iv_percentile(current_iv, iv_history)
+    iv_regime_str = IVRankService.iv_regime(iv_rank_val)
+    strategy_bias = IVRankService.strategy_bias(iv_rank_val)
+
+    # ── 5. Check event calendar ───────────────────────────────────────────────
+    cal = EventCalendar()
+    today = date.today()
+    event_risk = cal.is_event_risk(today)
+    upcoming_events = cal.next_events(today, count=3)
+    event_warning = ""
+    if event_risk:
+        event_warning = "⚠️ Event risk: major market event within 2 days — reduce position size."
+
+    # ── 6. Build context for patterns ─────────────────────────────────────────
+    context = {
+        "iv_rank": iv_rank_val,
+        "regime": regime,
+    }
+
+    # ── 7. Run signal generator ───────────────────────────────────────────────
+    # Use regime-suitable patterns as soft filter (boost confidence), not hard gate
     generator = SignalGenerator()
-    raw_signals = generator.run(ohlcv, underlying=underlying, pattern_filter=patterns or None)
+    raw_signals = generator.run(
+        ohlcv,
+        options_chain=chain_df,
+        underlying=underlying,
+        pattern_filter=patterns or None,
+        context=context,
+    )
+
+    # ── 8. Compute max pain ───────────────────────────────────────────────────
+    try:
+        max_pain_result = compute_max_pain(chain_df[["strike", "ce_oi", "pe_oi"]])
+    except Exception:
+        max_pain_result = {"max_pain_strike": None, "pcr": None, "total_oi": None}
 
     if not raw_signals:
         return {
@@ -154,9 +208,17 @@ async def run_signals(
             "underlying": underlying,
             "data_source": data_source,
             "signals_created": 0,
+            "regime": regime,
+            "iv_rank": round(iv_rank_val, 4),
+            "iv_percentile": round(iv_pct, 4),
+            "iv_regime": iv_regime_str,
+            "strategy_bias": strategy_bias,
+            "max_pain": max_pain_result,
+            "upcoming_events": upcoming_events,
+            "event_warning": event_warning,
         }
 
-    # ── 3. Expire old active signals for this underlying ─────────────────────
+    # ── 9. Expire old active signals ──────────────────────────────────────────
     old_q = select(Signal).where(
         Signal.underlying == underlying,
         Signal.status == SignalStatus.ACTIVE,
@@ -165,27 +227,94 @@ async def run_signals(
     for old_sig in old_result.scalars().all():
         old_sig.status = SignalStatus.EXPIRED
 
-    # ── 4. Persist new signals ────────────────────────────────────────────────
+    # ── 10. Persist enriched signals ──────────────────────────────────────────
+    selector = StrikeSelector()
     created = []
     valid_until = datetime.utcnow() + timedelta(hours=24)
+    dte = 7  # default DTE — weekly expiry
+
     for s in raw_signals:
+        # Pick option contract
+        try:
+            opt = selector.select(
+                underlying=underlying,
+                spot_price=spot_price,
+                direction=s.direction,
+                iv_rank=iv_rank_val,
+                dte=dte,
+                pattern_name=s.pattern_name,
+            )
+        except Exception:
+            opt = {
+                "instrument": s.instrument or f"{underlying}_FUT",
+                "option_type": None, "strategy": None,
+                "strike": None, "expiry_date_str": None,
+                "lot_size": None, "reasoning": "",
+            }
+
+        # Compute Greeks for the selected strike
+        greeks_data = {}
+        if opt.get("strike") and opt.get("option_type"):
+            try:
+                T = dte / 365.0
+                sigma = current_iv / 100.0
+                g = compute_greeks(spot_price, opt["strike"], T, sigma, opt["option_type"], RISK_FREE_RATE)
+                greeks_data = {
+                    "delta": round(g.delta, 4),
+                    "gamma": round(g.gamma, 6),
+                    "theta": round(g.theta, 4),
+                    "vega": round(g.vega, 4),
+                }
+                estimated_premium = abs(g.delta) * spot_price * 0.02  # rough estimate
+                max_loss_val = estimated_premium * (opt.get("lot_size") or 25)
+            except Exception:
+                greeks_data = {}
+                estimated_premium = None
+                max_loss_val = None
+        else:
+            estimated_premium = None
+            max_loss_val = None
+
+        # Build explanation with event warning
+        explanation = s.explanation
+        if event_warning:
+            explanation = f"{event_warning}\n\n{explanation}"
+        if opt.get("reasoning"):
+            explanation = f"{explanation}\n\nOption selection: {opt['reasoning']}"
+
         sig = Signal(
-            pattern_name       = s.pattern_name,
-            pattern_version    = s.pattern_version,
-            symbol             = s.symbol or underlying,
-            underlying         = underlying,
-            instrument         = s.instrument or underlying,
-            direction          = s.direction,
-            entry_price        = round(s.entry_price, 2),
-            target_price       = round(s.target_price, 2),
-            stop_loss          = round(s.stop_loss, 2),
+            pattern_name        = s.pattern_name,
+            pattern_version     = s.pattern_version,
+            symbol              = s.symbol or underlying,
+            underlying          = underlying,
+            instrument          = opt.get("instrument") or s.instrument or underlying,
+            direction           = s.direction,
+            entry_price         = round(s.entry_price, 2),
+            target_price        = round(s.target_price, 2),
+            stop_loss           = round(s.stop_loss, 2),
             expected_return_pct = round(s.expected_return_pct, 2),
-            confidence_score   = round(s.confidence_score, 4),
-            explanation        = s.explanation,
-            trading_style      = s.trading_style,
-            status             = SignalStatus.ACTIVE,
-            created_at         = datetime.utcnow(),
-            valid_until        = valid_until,
+            confidence_score    = round(s.confidence_score, 4),
+            explanation         = explanation,
+            trading_style       = s.trading_style,
+            status              = SignalStatus.ACTIVE,
+            created_at          = datetime.utcnow(),
+            valid_until         = valid_until,
+            # Options fields
+            option_type         = opt.get("option_type"),
+            strike              = opt.get("strike"),
+            expiry_date_str     = opt.get("expiry_date_str"),
+            option_strategy     = opt.get("strategy"),
+            lot_size            = opt.get("lot_size"),
+            delta               = greeks_data.get("delta"),
+            gamma               = greeks_data.get("gamma"),
+            theta               = greeks_data.get("theta"),
+            vega                = greeks_data.get("vega"),
+            iv_at_signal        = round(current_iv, 4),
+            iv_rank             = round(iv_rank_val, 4),
+            regime_trend        = regime.get("trend"),
+            regime_volatility   = regime.get("volatility"),
+            estimated_premium   = round(estimated_premium, 2) if estimated_premium else None,
+            max_loss            = round(max_loss_val, 2) if max_loss_val else None,
         )
         db.add(sig)
         created.append(sig)
@@ -199,5 +328,13 @@ async def run_signals(
         "underlying": underlying,
         "data_source": data_source,
         "signals_created": len(created),
+        "regime": regime,
+        "iv_rank": round(iv_rank_val, 4),
+        "iv_percentile": round(iv_pct, 4),
+        "iv_regime": iv_regime_str,
+        "strategy_bias": strategy_bias,
+        "max_pain": max_pain_result,
+        "upcoming_events": upcoming_events,
+        "event_warning": event_warning,
         "signals": [s.__dict__ for s in created],
     }

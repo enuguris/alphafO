@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 
 
+
 class SignalDirection(str, enum.Enum):
     LONG = "long"
     SHORT = "short"
@@ -40,3 +41,23 @@ class Signal(Base):
     status: Mapped[str] = mapped_column(Enum(SignalStatus), default=SignalStatus.ACTIVE)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     valid_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Options-specific
+    option_type: Mapped[str | None] = mapped_column(String(2), nullable=True)        # CE | PE
+    strike: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expiry_date_str: Mapped[str | None] = mapped_column(String(20), nullable=True)   # "25JUL"
+    option_strategy: Mapped[str | None] = mapped_column(String(20), nullable=True)   # buy | sell | spread
+    lot_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Greeks at signal time
+    delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gamma: Mapped[float | None] = mapped_column(Float, nullable=True)
+    theta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vega: Mapped[float | None] = mapped_column(Float, nullable=True)
+    iv_at_signal: Mapped[float | None] = mapped_column(Float, nullable=True)
+    iv_rank: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Regime
+    regime_trend: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    regime_volatility: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Cost
+    estimated_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
