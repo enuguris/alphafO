@@ -23,13 +23,17 @@ class ChainService:
         Get options chain DataFrame.
         Columns: strike, ce_oi, pe_oi, ce_iv, pe_iv, ce_ltp, pe_ltp, ce_delta, pe_delta
 
-        Falls back to synthetic data if kite not available.
+        Priority: Kite (real-time) → NSE via jugaad-data (free, real) → synthetic fallback.
         """
         if kite_adapter is not None:
             try:
                 return self._from_kite(underlying, kite_adapter)
             except Exception:
                 pass
+        try:
+            return self._from_nse(underlying)
+        except Exception:
+            pass
         return self._synthetic_chain(underlying)
 
     def _get_live_spot(self, underlying: str) -> float:
@@ -108,6 +112,100 @@ class ChainService:
             })
 
         return pd.DataFrame(rows)
+
+    def _from_nse(self, underlying: str) -> pd.DataFrame:
+        """
+        Fetch live option chain from NSE via jugaad-data (free, no API key).
+        Uses the nearest weekly expiry. Returns same schema as _from_kite.
+        """
+        from jugaad_data.nse import NSELive
+
+        NSE_SYMBOLS = {
+            "NIFTY": "NIFTY", "BANKNIFTY": "BANKNIFTY",
+            "FINNIFTY": "FINNIFTY", "MIDCPNIFTY": "MIDCPNIFTY",
+        }
+        nse_sym = NSE_SYMBOLS.get(underlying.upper())
+        if not nse_sym:
+            raise ValueError(f"No NSE symbol mapping for {underlying}")
+
+        n = NSELive()
+        data = n.index_option_chain(nse_sym)
+        records = data.get("records", {}).get("data", [])
+        if not records:
+            raise ValueError("Empty response from NSE")
+
+        # Pick nearest expiry (records include multiple expiries)
+        expiry_dates = data.get("records", {}).get("expiryDates", [])
+        if not expiry_dates:
+            raise ValueError("No expiry dates in NSE response")
+        nearest_expiry = expiry_dates[0]  # e.g. "30-Jun-2026"
+
+        spot = self._get_live_spot(underlying)
+        step = STRIKE_STEPS.get(underlying.upper(), DEFAULT_STEP)
+        atm = round(spot / step) * step
+
+        # Filter to nearest expiry, ATM ± 10 strikes
+        strike_window = {atm + (i - 10) * step for i in range(21)}
+        rows = []
+        for rec in records:
+            ce = rec.get("CE", {})
+            pe = rec.get("PE", {})
+            if not ce and not pe:
+                continue
+            expiry = (ce or pe).get("expiryDate", "")
+            # NSE returns "30-Jun-2026", nearest_expiry is "30-Jun-2026"
+            if expiry and expiry.replace("-", " ").lower()[:6] != nearest_expiry.replace("-", " ").lower()[:6]:
+                continue
+            strike = rec.get("strikePrice") or (ce or pe).get("strikePrice")
+            if not strike or strike not in strike_window:
+                continue
+
+            ce_iv_raw = ce.get("impliedVolatility", 0) or 0
+            pe_iv_raw = pe.get("impliedVolatility", 0) or 0
+            # NSE returns IV as % (e.g. 18.5); convert to fraction
+            ce_iv = ce_iv_raw / 100 if ce_iv_raw > 2 else ce_iv_raw
+            pe_iv = pe_iv_raw / 100 if pe_iv_raw > 2 else pe_iv_raw
+            ce_iv = ce_iv if 0.01 < ce_iv < 3 else 0.0
+            pe_iv = pe_iv if 0.01 < pe_iv < 3 else 0.0
+
+            # OI from NSE is in lots — convert to contracts (×lot_size) if needed
+            # NSE openInterest is already in contracts for index options
+            ce_oi = int(ce.get("openInterest", 0) or 0)
+            pe_oi = int(pe.get("openInterest", 0) or 0)
+            ce_oi_chg = int(ce.get("changeinOpenInterest", 0) or 0)
+            pe_oi_chg = int(pe.get("changeinOpenInterest", 0) or 0)
+
+            try:
+                from app.core.options.expiry import available_expiries
+                expiries = available_expiries(underlying)
+                T = max(expiries[0]["dte"], 1) / 365.0 if expiries else 7 / 365.0
+                iv_for_greeks = ce_iv or pe_iv or 0.18
+                g_ce = compute_greeks(spot, strike, T, ce_iv or iv_for_greeks, "CE", RISK_FREE_RATE)
+                g_pe = compute_greeks(spot, strike, T, pe_iv or iv_for_greeks, "PE", RISK_FREE_RATE)
+                ce_delta = round(g_ce.delta, 4)
+                pe_delta = round(g_pe.delta, 4)
+            except Exception:
+                ce_delta, pe_delta = 0.5, -0.5
+
+            rows.append({
+                "strike":      strike,
+                "ce_oi":       ce_oi,
+                "pe_oi":       pe_oi,
+                "ce_oi_chg":   ce_oi_chg,
+                "pe_oi_chg":   pe_oi_chg,
+                "ce_iv":       round(ce_iv, 4),
+                "pe_iv":       round(pe_iv, 4),
+                "ce_ltp":      float(ce.get("lastPrice", 0) or 0),
+                "pe_ltp":      float(pe.get("lastPrice", 0) or 0),
+                "ce_delta":    ce_delta,
+                "pe_delta":    pe_delta,
+            })
+
+        if not rows:
+            raise ValueError("No rows after filtering NSE chain")
+
+        df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+        return df
 
     def _from_kite(self, underlying: str, kite_adapter) -> pd.DataFrame:
         """Fetch live options chain from Kite quote API using ATM±10 strikes."""

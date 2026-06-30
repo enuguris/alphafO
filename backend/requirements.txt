@@ -20,6 +20,7 @@ ta==0.11.0
 scipy==1.13.1
 scikit-learn==1.5.0
 yfinance>=0.2.40          # free NSE historical data fallback
+jugaad-data>=0.5          # free NSE option chain fallback (no API key needed)
 
 # Zerodha
 kiteconnect==5.0.1
