@@ -167,13 +167,24 @@ class ChainService:
         return df
 
     def get_iv_history(self, underlying: str) -> list:
-        """Return 30 days of synthetic IV history (12-28%)."""
-        rng = np.random.default_rng(abs(hash(underlying + "iv")) % (2**31))
-        # Generate IV with some autocorrelation for realism
-        ivs = []
-        iv = 18.0
-        for _ in range(30):
-            iv = iv + rng.uniform(-1.5, 1.5)
-            iv = max(12.0, min(28.0, iv))
-            ivs.append(round(iv, 2))
-        return ivs
+        """
+        Return 1-year synthetic IV history spanning a realistic NSE range.
+
+        NIFTY VIX typically oscillates 10–35%; BANKNIFTY slightly higher.
+        We generate 252 values normally-distributed around the mid-point with
+        explicit anchors at the lo/hi to guarantee the empirical range covers
+        a realistic window. This ensures iv_rank is meaningful (0.3–0.7 most
+        of the time) rather than always 0 or 1 from a narrow synthetic window.
+        """
+        rng = np.random.default_rng(abs(hash(underlying + "ivhist")) % (2**31))
+        base = {"NIFTY": 15.5, "BANKNIFTY": 17.5}.get(underlying.upper(), 16.0)
+        lo = base * 0.65   # ≈ 10% for NIFTY
+        hi = base * 2.00   # ≈ 31% for NIFTY
+        # Normal distribution centred at mid-point, clipped to [lo, hi]
+        mid = (lo + hi) / 2
+        sigma = (hi - lo) / 6   # 3-sigma → touches lo/hi
+        samples = rng.normal(mid, sigma, 248).clip(lo, hi)
+        # Add explicit anchors so min/max always span the full range
+        ivs = list(np.round(np.concatenate([[lo, lo * 1.05, hi * 0.95, hi], samples]), 2))
+        rng.shuffle(ivs)
+        return list(ivs)
