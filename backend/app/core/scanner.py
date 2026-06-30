@@ -90,16 +90,24 @@ def synthetic_ohlcv(underlying: str, timeframe: Timeframe = "daily") -> pd.DataF
     seed = abs(hash(f"{underlying}_{timeframe}")) % (2**31)
     rng = np.random.default_rng(seed)
 
-    # Use live spot as base so synthetic OHLCV stays aligned with real chain strikes
+    # Use Redis spot (cross-process live price) as base; Celery's local ticker has stale defaults
     base = BASE_PRICES.get(underlying.upper(), 1500)
     try:
-        from app.core.data.kite_ticker import ticker_service
-        snap = ticker_service.get_snapshot() or {}
-        live = snap.get(underlying.upper(), {}).get("ltp", 0)
-        if live and live > 10:
-            base = live
+        import redis as _redis_mod
+        from app.config import settings as _settings
+        _r = _redis_mod.from_url(_settings.redis_url, decode_responses=True)
+        _redis_spot = _r.get(f"spot:{underlying.upper()}")
+        if _redis_spot:
+            base = float(_redis_spot)
     except Exception:
-        pass
+        try:
+            from app.core.data.kite_ticker import ticker_service
+            snap = ticker_service.get_snapshot() or {}
+            live = snap.get(underlying.upper(), {}).get("ltp", 0)
+            if live and live > 10:
+                base = live
+        except Exception:
+            pass
 
     # Freq for date range
     freq_map = {"15m": "15min", "1h": "h", "4h": "4h", "daily": "D"}
@@ -264,14 +272,23 @@ async def scan_instrument(
     try:
         # 1. Data — use real Kite OHLCV when configured, else synthetic
         ohlcv, data_source = await _fetch_ohlcv(underlying, timeframe)
-        # Spot: prefer live tick over OHLCV last close
+        # Spot: Redis spot:{SYM} is the authoritative cross-process live price
+        # (written by FastAPI's KiteTicker on every tick). The Celery-local ticker
+        # instance has stale BASE_PRICES defaults — do NOT use it for spot.
         snap: dict = {}
         try:
             from app.core.data.kite_ticker import ticker_service
             snap = ticker_service.get_snapshot() or {}
-            spot = snap[underlying.upper()]["ltp"] if underlying.upper() in snap else float(ohlcv["close"].iloc[-1])
         except Exception:
-            spot = float(ohlcv["close"].iloc[-1])
+            snap = {}
+        try:
+            import redis as _redis_mod
+            from app.config import settings as _settings
+            _r = _redis_mod.from_url(_settings.redis_url, decode_responses=True)
+            _redis_spot = _r.get(f"spot:{underlying.upper()}")
+            spot = float(_redis_spot) if _redis_spot else float(ohlcv["close"].iloc[-1])
+        except Exception:
+            spot = snap.get(underlying.upper(), {}).get("ltp") or float(ohlcv["close"].iloc[-1])
 
         # 2. Regime — use real India VIX from ticker
         try:
