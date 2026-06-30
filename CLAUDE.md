@@ -70,7 +70,8 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 ### Regime detection — real OHLCV
 - `build_ohlcv_from_bhav(underlying)` reads 253 cached bhav files → real FUTIDX closing prices
 - `_synthetic_ohlcv()` in options.py prefers bhav data, falls back to date-seeded random walk
-- IV column in bhav-based OHLCV is synthetic (18% default) — bhav files don't have IV data
+- IV column in bhav-based OHLCV: uses India VIX history (`fetch_india_vix()`) merged by date via `pd.merge_asof`; falls back to flat 18% if VIX cache unavailable
+- BANKNIFTY uses same VIX values as NIFTY (VIX only covers NIFTY index; close enough for regime detection)
 
 ### MTM repricing in Celery
 - Celery worker has no active KiteTicker WebSocket (separate process, no in-memory prices)
@@ -132,7 +133,7 @@ Run these after any change before committing:
 ```
 1. GET /api/v1/system/health        → all 6 components green (db, redis, kite, ticker, celery, market_data)
 2. GET /api/v1/signals/             → returns only NIFTY/BANKNIFTY signals, no nan/inf in response
-3. GET /api/v1/portfolio/?mode=paper → capital > 0, capital field present (alias for capital_current)
+3. GET /api/v1/portfolio/?mode=paper → capital > 0, win_rate computed from winning_trades/total_trades
 4. GET /api/v1/dashboard/report     → summary has sharpe_ratio, max_drawdown_pct fields
 5. GET /api/v1/dashboard/pre-market → pcr.NIFTY.pcr and pcr.BANKNIFTY.pcr not null; fii.net_cr present
 6. POST /api/v1/system/run-task/scan-priority-15m → {"queued": true}   ← use hyphens!
@@ -144,6 +145,7 @@ Run these after any change before committing:
 12. After scan + 30s → GET /api/v1/trades/?mode=paper show new trades; check option_strategy matches action
 13. GET /api/v1/options/regime/NIFTY → uses real bhav data (trend based on 253 days of actual prices)
 14. Signals: max_pain/mean_reversion direction=short → option_type=PE, option_strategy=buy (not sell)
+15. Settings page: Risk Controls section shows halt/resume buttons; POST /api/v1/options/risk/halt+resume work
 ```
 
 ### FII data gotchas
