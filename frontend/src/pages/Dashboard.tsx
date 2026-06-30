@@ -475,7 +475,7 @@ export default function Dashboard() {
     queryFn: () => fetchSignals({ status: 'active', underlying: selectedSym, limit: 50 }),
     refetchInterval: 30_000,
   })
-  const { data: portfolio }   = useQuery({ queryKey: ['portfolio'],   queryFn: fetchPortfolio,   refetchInterval: 10_000 })
+  const { data: portfolio }   = useQuery({ queryKey: ['portfolio', mode], queryFn: () => fetchPortfolio(mode === 'live' ? 'live' : 'paper'), refetchInterval: 10_000 })
   const { data: trades }      = useQuery({ queryKey: ['trades'],      queryFn: () => fetchTrades('paper') })
   const { data: dataStatus }  = useQuery({ queryKey: ['dataStatus'],  queryFn: fetchDataStatus,  refetchInterval: 60_000, staleTime: 30_000 })
   const { data: preMarket, isLoading: pmLoading } = useQuery({ queryKey: ['preMarket'], queryFn: fetchPreMarket, staleTime: 120_000, refetchInterval: 300_000 })

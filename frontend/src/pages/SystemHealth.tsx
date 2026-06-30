@@ -22,14 +22,22 @@ const CARD: React.CSSProperties = {
   marginBottom: 12,
 }
 
-const TASK_MAP: Record<string, string> = {
-  'sync-market-data':           'sync_market_data',
-  'cleanup-stale-signals':      'cleanup_stale_signals',
-  'nightly-pattern-backtest':   'run_nightly_backtests',
-  'nightly-pattern-discovery':  'run_nightly_discovery',
-  'mtm-update':                 'mtm_update',
-  'eod-close-intraday':         'eod_close_intraday',
-}
+// Tasks that can be triggered manually (beat schedule name → same name for API)
+const TRIGGERABLE_TASKS = new Set([
+  'scan-priority-15m',
+  'scan-all-1h',
+  'scan-eod',
+  'scan-premarket',
+  'sync-market-data',
+  'cleanup-stale-signals',
+  'nightly-pattern-backtest',
+  'nightly-pattern-discovery',
+  'mtm-update',
+  'eod-close-intraday',
+  'expiry-settlement',
+  'reset-daily-pnl',
+  'generate-briefing',
+])
 
 export default function SystemHealth() {
   const { data: health, refetch: refetchHealth } = useQuery({
@@ -47,11 +55,10 @@ export default function SystemHealth() {
   const [msgs, setMsgs] = useState<{ task: string; msg: string; ok: boolean }[]>([])
 
   const triggerTask = async (beatName: string) => {
-    const taskKey = TASK_MAP[beatName]
-    if (!taskKey) return
+    if (!TRIGGERABLE_TASKS.has(beatName)) return
     setRunning(beatName)
     try {
-      const r = await runTask(taskKey)
+      const r = await runTask(beatName)
       setMsgs(m => [{ task: beatName, msg: r.message || 'Queued', ok: true }, ...m.slice(0, 4)])
       setTimeout(() => refetchHealth(), 3000)
     } catch {
@@ -168,7 +175,7 @@ export default function SystemHealth() {
                     {t.last_run ? new Date(t.last_run + 'Z').toLocaleTimeString() : '—'}
                   </td>
                   <td style={{ padding: '5px 8px' }}>
-                    {TASK_MAP[t.name] && (
+                    {TRIGGERABLE_TASKS.has(t.name) && (
                       <button
                         className="tv-btn tv-btn-ghost"
                         style={{ fontSize: 10, padding: '2px 8px' }}

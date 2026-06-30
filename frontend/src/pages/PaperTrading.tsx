@@ -18,6 +18,8 @@ export default function PaperTrading() {
   const open   = list.filter(t => t.status === 'open')
   const closed = list.filter(t => t.status === 'closed')
   const totalPnl = closed.reduce((s, t) => s + (t.pnl ?? 0), 0)
+  const winners = closed.filter(t => (t.pnl ?? 0) > 0).length
+  const winRate = closed.length > 0 ? winners / closed.length : null
 
   const pnlCurve = closed.map((t, i) => ({
     i: i + 1,
@@ -32,7 +34,7 @@ export default function PaperTrading() {
         {[
           { label: 'Capital',      val: fmtINR(portfolio?.capital),   color: 'var(--txt)' },
           { label: 'Realised P&L', val: fmtINR(totalPnl),             color: totalPnl >= 0 ? 'var(--up)' : 'var(--dn)' },
-          { label: 'Win Rate',     val: portfolio?.win_rate != null ? `${(portfolio.win_rate * 100).toFixed(1)}%` : '—', color: (portfolio?.win_rate ?? 0) >= 0.55 ? 'var(--up)' : 'var(--orange)' },
+          { label: 'Win Rate',     val: winRate != null ? `${(winRate * 100).toFixed(1)}%` : '—', color: (winRate ?? 0) >= 0.55 ? 'var(--up)' : 'var(--orange)' },
           { label: 'Open',         val: String(open.length),           color: 'var(--txt)' },
           { label: 'Closed',       val: String(closed.length),         color: 'var(--txt)' },
         ].map(({ label, val, color }) => (
