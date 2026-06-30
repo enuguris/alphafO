@@ -74,13 +74,13 @@ function SummaryCard({ label, value, sub, color }: { label: string; value: strin
 
 declare global { interface Window { TradingView: any } }
 
-// underlying → TradingView symbol (index spot, always available, never expires)
+// underlying → TradingView continuous futures symbol (1! = front-month, always has data)
 function tvUnderlying(sym?: string): string {
-  if (!sym) return 'NSE:NIFTY'
+  if (!sym) return 'NSE:NIFTY1!'
   const u = sym.replace(/\d.*/, '').toUpperCase()
-  if (u === 'BANKNIFTY') return 'NSE:BANKNIFTY'
-  if (u === 'FINNIFTY')  return 'NSE:FINNIFTY'
-  return 'NSE:NIFTY'
+  if (u === 'BANKNIFTY') return 'NSE:BANKNIFTY1!'
+  if (u === 'FINNIFTY')  return 'NSE:FINNIFTY1!'
+  return 'NSE:NIFTY1!'
 }
 
 function TradingViewChart({ symbol, tradeId, strike, optionType }: {
