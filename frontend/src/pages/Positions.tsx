@@ -74,14 +74,24 @@ function SummaryCard({ label, value, sub, color }: { label: string; value: strin
 
 declare global { interface Window { TradingView: any } }
 
-function TradingViewChart({ symbol, tradeId }: { symbol: string; tradeId: number }) {
-  const containerId = `tv_${tradeId}_${symbol.replace(/[^a-zA-Z0-9]/g, '')}`
+// underlying → TradingView symbol (index spot, always available, never expires)
+function tvUnderlying(sym?: string): string {
+  if (!sym) return 'NSE:NIFTY'
+  const u = sym.replace(/\d.*/, '').toUpperCase()
+  if (u === 'BANKNIFTY') return 'NSE:BANKNIFTY'
+  if (u === 'FINNIFTY')  return 'NSE:FINNIFTY'
+  return 'NSE:NIFTY'
+}
+
+function TradingViewChart({ symbol, tradeId, strike, optionType }: {
+  symbol: string; tradeId: number; strike?: number | null; optionType?: string | null
+}) {
+  const tvSym = tvUnderlying(symbol)
+  const containerId = `tv_${tradeId}_${tvSym.replace(/[^a-zA-Z0-9]/g, '')}`
   const wrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!wrapRef.current) return
-
-    // Determine theme to pass to TradingView widget
     const appTheme = document.documentElement.getAttribute('data-theme') || 'dark'
     const tvTheme = appTheme === 'light' || appTheme === 'solarized' ? 'light' : 'dark'
 
@@ -90,12 +100,12 @@ function TradingViewChart({ symbol, tradeId }: { symbol: string; tradeId: number
       wrapRef.current.innerHTML = ''
       const inner = document.createElement('div')
       inner.id = containerId
-      inner.style.height = '400px'
+      inner.style.height = '380px'
       wrapRef.current.appendChild(inner)
       // eslint-disable-next-line no-new
       new window.TradingView.widget({
         autosize: true,
-        symbol: `NSE:${symbol}`,
+        symbol: tvSym,
         interval: '5',
         timezone: 'Asia/Kolkata',
         theme: tvTheme,
@@ -114,27 +124,40 @@ function TradingViewChart({ symbol, tradeId }: { symbol: string; tradeId: number
     if (window.TradingView) {
       initWidget()
     } else {
-      const script = document.createElement('script')
-      script.src = 'https://s3.tradingview.com/tv.js'
-      script.async = true
-      script.onload = initWidget
-      document.head.appendChild(script)
+      const existing = document.querySelector('script[src="https://s3.tradingview.com/tv.js"]')
+      if (existing) {
+        existing.addEventListener('load', initWidget)
+      } else {
+        const script = document.createElement('script')
+        script.src = 'https://s3.tradingview.com/tv.js'
+        script.async = true
+        script.onload = initWidget
+        document.head.appendChild(script)
+      }
     }
 
     return () => { if (wrapRef.current) wrapRef.current.innerHTML = '' }
-  }, [symbol, containerId])
+  }, [tvSym, containerId])
 
   return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden', marginTop: 14 }}>
-      <div ref={wrapRef} style={{ height: 400 }} />
+    <div style={{ marginTop: 12 }}>
+      {/* subtitle so user knows this is the underlying, not the option itself */}
+      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 4 }}>
+        <span style={{ color: 'var(--blue)', fontWeight: 600 }}>{tvSym}</span>
+        {' '}— underlying index · 5-min candles · IST
+        {strike && <span style={{ marginLeft: 8, color: 'var(--txt2)' }}>option strike: <strong style={{ color: 'var(--orange)' }}>₹{strike}</strong> {optionType}</span>}
+      </div>
+      <div style={{ border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
+        <div ref={wrapRef} style={{ height: 380 }} />
+      </div>
     </div>
   )
 }
 
 // ── Signal rationale panel ────────────────────────────────────────────────────
 
-function SignalRationale({ tradeId, symbol }: {
-  tradeId: number; symbol?: string
+function SignalRationale({ tradeId, symbol, strike, optionType }: {
+  tradeId: number; symbol?: string; strike?: number | null; optionType?: string | null
 }) {
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(false)
@@ -200,8 +223,8 @@ function SignalRationale({ tradeId, symbol }: {
         </div>
       )}
 
-      {/* Embedded TradingView 5-min chart for this option symbol */}
-      {sym && <TradingViewChart symbol={sym} tradeId={tradeId} />}
+      {/* Embedded TradingView 5-min chart (underlying index — always available) */}
+      {sym && <TradingViewChart symbol={sym} tradeId={tradeId} strike={strike} optionType={optionType} />}
     </div>
   )
 }
@@ -457,7 +480,7 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
       <ChargesBreakdown t={t} currentPrice={currentPrice} />
 
       {/* Signal rationale */}
-      <SignalRationale tradeId={t.id} symbol={t.symbol} />
+      <SignalRationale tradeId={t.id} symbol={t.symbol} strike={t.strike} optionType={t.option_type} />
 
       <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
         <button onClick={onCollapse} className="tv-btn" style={{ fontSize: 11, padding: '3px 12px' }}>Collapse ▲</button>
