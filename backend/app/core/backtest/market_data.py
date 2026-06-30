@@ -450,3 +450,52 @@ def enrich_ohlcv(df: pd.DataFrame, underlying: str) -> pd.DataFrame:
         f"FII={n_fii}/{len(df)} PCR={n_pcr}/{len(df)} DTE=✓"
     )
     return df
+
+
+def build_ohlcv_from_bhav(underlying: str, rows: int = 120) -> Optional[pd.DataFrame]:
+    """
+    Build a real OHLCV DataFrame from cached bhav files (FUTIDX near-month contract).
+    Returns None if insufficient bhav data.
+    Used by regime detection as a higher-quality alternative to synthetic random walks.
+    """
+    sym = underlying.upper()
+    bhav_dir = CACHE_DIR / "bhav"
+    records: list[dict] = []
+
+    for csv_f in sorted(bhav_dir.glob("fo*.csv")):
+        try:
+            df_b = pd.read_csv(csv_f, low_memory=False)
+            # Filter to near-month FUTIDX for this symbol
+            fut = df_b[
+                (df_b["INSTRUMENT"] == "FUTIDX") &
+                (df_b["SYMBOL"] == sym)
+            ].copy()
+            if fut.empty:
+                continue
+            # Nearest expiry = first expiry date
+            fut["EXPIRY_DT"] = pd.to_datetime(fut["EXPIRY_DT"], dayfirst=True)
+            nearest = fut.sort_values("EXPIRY_DT").iloc[0]
+            ts = str(nearest.get("TIMESTAMP", "")).strip()
+            if not ts:
+                continue
+            trade_date = pd.to_datetime(ts, dayfirst=True)
+            records.append({
+                "timestamp": trade_date,
+                "open":  float(nearest.get("OPEN", 0) or 0),
+                "high":  float(nearest.get("HIGH", 0) or 0),
+                "low":   float(nearest.get("LOW", 0) or 0),
+                "close": float(nearest.get("CLOSE", 0) or 0),
+                "volume": float(nearest.get("CONTRACTS", 0) or 0),
+                "oi":    float(nearest.get("OPEN_INT", 0) or 0),
+            })
+        except Exception:
+            continue
+
+    if not records:
+        return None
+
+    result = pd.DataFrame(records).sort_values("timestamp").drop_duplicates("timestamp")
+    result = result[result["close"] > 0].tail(rows).reset_index(drop=True)
+    # Synthetic IV column (ATM IV not available from bhav)
+    result["iv"] = 18.0
+    return result if len(result) >= 20 else None

@@ -33,9 +33,21 @@ def _spot(underlying: str) -> float:
 
 
 def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
-    """Minimal OHLCV for regime detection — seed includes today's date so regime varies day-to-day."""
+    """
+    OHLCV for regime detection.
+    Prefers real bhav data (FUTIDX closing prices from 253 cached files).
+    Falls back to date-seeded synthetic random walk if bhav data insufficient.
+    """
     import numpy as np
     from datetime import datetime
+    try:
+        from app.core.backtest.market_data import build_ohlcv_from_bhav
+        real_df = build_ohlcv_from_bhav(underlying, rows=rows)
+        if real_df is not None and len(real_df) >= 20:
+            return real_df
+    except Exception:
+        pass
+    # Fallback: date-seeded synthetic data
     today_ord = datetime.today().toordinal()
     seed = abs(hash(f"{underlying}_{today_ord}")) % (2**31)
     rng = np.random.default_rng(seed)
