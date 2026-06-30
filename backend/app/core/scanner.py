@@ -67,10 +67,26 @@ TIMEFRAME_STYLE: dict[Timeframe, str] = {
 
 def synthetic_ohlcv(underlying: str, timeframe: Timeframe = "daily") -> pd.DataFrame:
     """
-    Generate deterministic synthetic OHLCV that reliably triggers patterns.
-    Each timeframe gets a different seed so signals vary across TFs.
+    Generate OHLCV for pattern scanning.
+    For daily timeframe: prefers real bhav FUTIDX data (253 cached files).
+    For intraday timeframes (15m, 1h, 4h): uses deterministic synthetic data.
     """
     rows = TIMEFRAME_ROWS[timeframe]
+
+    # For daily timeframe, try real bhav data first
+    if timeframe == "daily":
+        try:
+            from app.core.backtest.market_data import build_ohlcv_from_bhav
+            real_df = build_ohlcv_from_bhav(underlying, rows=rows)
+            if real_df is not None and len(real_df) >= 20:
+                # Add oi column if missing
+                if "oi" not in real_df.columns:
+                    real_df["oi"] = 0.0
+                logger.debug(f"[scanner] Using real bhav OHLCV for {underlying}/daily: {len(real_df)} bars")
+                return real_df
+        except Exception as e:
+            logger.debug(f"[scanner] bhav OHLCV unavailable for {underlying}: {e}")
+
     seed = abs(hash(f"{underlying}_{timeframe}")) % (2**31)
     rng = np.random.default_rng(seed)
 
