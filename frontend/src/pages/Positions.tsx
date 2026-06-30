@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchTrades, closeTrade, refreshMtm, createPriceSocket } from '../api/client'
+import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket } from '../api/client'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -66,6 +66,207 @@ function SummaryCard({ label, value, sub, color }: { label: string; value: strin
       <div style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>{label}</div>
       <div style={{ fontSize: 17, fontWeight: 700, color: color || 'var(--txt)', fontFamily: 'monospace' }}>{value}</div>
       {sub && <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 1 }}>{sub}</div>}
+    </div>
+  )
+}
+
+// ── Inline 5-minute option chart (SVG) ───────────────────────────────────────
+
+function OptionChart({ bars, entryPrice, stopLoss, targetPrice, entryTime }: {
+  bars: { time: string; open: number; high: number; low: number; close: number }[]
+  entryPrice?: number | null
+  stopLoss?: number | null
+  targetPrice?: number | null
+  entryTime?: string | null
+}) {
+  if (!bars || bars.length < 2) return (
+    <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--txt3)', fontSize: 12 }}>
+      Chart data unavailable
+    </div>
+  )
+
+  const W = 600, H = 160, PAD = { top: 10, bottom: 24, left: 8, right: 60 }
+  const cW = W - PAD.left - PAD.right
+  const cH = H - PAD.top - PAD.bottom
+
+  const allPrices = bars.flatMap(b => [b.high, b.low]).filter(v => isFinite(v) && v > 0)
+  if (entryPrice) allPrices.push(entryPrice)
+  if (stopLoss) allPrices.push(stopLoss)
+  if (targetPrice) allPrices.push(targetPrice)
+  const yMin = Math.min(...allPrices) * 0.995
+  const yMax = Math.max(...allPrices) * 1.005
+  const yRange = yMax - yMin || 1
+
+  const xScale = (i: number) => PAD.left + (i / (bars.length - 1)) * cW
+  const yScale = (v: number) => PAD.top + cH - ((v - yMin) / yRange) * cH
+
+  // Line path
+  const pts = bars.map((b, i) => `${xScale(i)},${yScale(b.close)}`).join(' ')
+
+  // Entry time marker index
+  let entryIdx = -1
+  if (entryTime) {
+    const et = new Date(entryTime).getTime()
+    let minDiff = Infinity
+    bars.forEach((b, i) => {
+      const diff = Math.abs(new Date(b.time).getTime() - et)
+      if (diff < minDiff) { minDiff = diff; entryIdx = i }
+    })
+  }
+
+  // Y-axis labels (4 ticks)
+  const yTicks = [0, 0.33, 0.66, 1].map(f => yMin + f * yRange)
+
+  // X-axis labels (first, entry, last)
+  const xLabels = [0, bars.length - 1].map(i => ({
+    i, label: new Date(bars[i].time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  }))
+
+  const hline = (price: number, color: string, label: string, dash = '4,3') => {
+    const y = yScale(price)
+    return (
+      <g key={label}>
+        <line x1={PAD.left} x2={W - PAD.right} y1={y} y2={y} stroke={color} strokeWidth={1} strokeDasharray={dash} opacity={0.8} />
+        <text x={W - PAD.right + 4} y={y + 4} fill={color} fontSize={9} fontFamily="monospace">₹{price.toFixed(0)}</text>
+        <text x={W - PAD.right + 4} y={y - 3} fill={color} fontSize={8} opacity={0.7}>{label}</text>
+      </g>
+    )
+  }
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block', maxWidth: W }}>
+      {/* Grid lines */}
+      {yTicks.map((v, i) => (
+        <line key={i} x1={PAD.left} x2={W - PAD.right} y1={yScale(v)} y2={yScale(v)}
+          stroke="var(--border)" strokeWidth={0.5} opacity={0.5} />
+      ))}
+
+      {/* Price area fill */}
+      <defs>
+        <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="var(--blue)" stopOpacity="0.15" />
+          <stop offset="100%" stopColor="var(--blue)" stopOpacity="0.01" />
+        </linearGradient>
+      </defs>
+      <polygon
+        points={`${PAD.left},${PAD.top + cH} ${pts} ${xScale(bars.length - 1)},${PAD.top + cH}`}
+        fill="url(#chartGrad)"
+      />
+
+      {/* Price line */}
+      <polyline points={pts} fill="none" stroke="var(--blue)" strokeWidth={1.5} />
+
+      {/* Horizontal reference lines */}
+      {entryPrice  && hline(entryPrice,  'var(--txt)',    'Entry', '3,3')}
+      {stopLoss    && hline(stopLoss,    'var(--dn)',     'Stop')}
+      {targetPrice && hline(targetPrice, 'var(--up)',     'Target')}
+
+      {/* Entry time vertical marker */}
+      {entryIdx >= 0 && (
+        <g>
+          <line x1={xScale(entryIdx)} x2={xScale(entryIdx)} y1={PAD.top} y2={PAD.top + cH}
+            stroke="var(--orange)" strokeWidth={1} strokeDasharray="3,3" opacity={0.8} />
+          <circle cx={xScale(entryIdx)} cy={yScale(bars[entryIdx].close)} r={3}
+            fill="var(--orange)" />
+        </g>
+      )}
+
+      {/* X labels */}
+      {xLabels.map(({ i, label }) => (
+        <text key={i} x={xScale(i)} y={H - 4} fill="var(--txt3)" fontSize={9} textAnchor={i === 0 ? 'start' : 'end'} fontFamily="monospace">{label}</text>
+      ))}
+
+      {/* Y ticks */}
+      {yTicks.map((v, i) => (
+        <text key={i} x={PAD.left - 2} y={yScale(v) + 3} fill="var(--txt3)" fontSize={8} textAnchor="end" fontFamily="monospace">
+          {v.toFixed(0)}
+        </text>
+      ))}
+    </svg>
+  )
+}
+
+// ── Signal rationale panel ────────────────────────────────────────────────────
+
+function SignalRationale({ tradeId, entryPrice, stopLoss, targetPrice, entryTime }: {
+  tradeId: number; entryPrice?: number | null; stopLoss?: number | null; targetPrice?: number | null; entryTime?: string | null
+}) {
+  const [data, setData] = useState<any>(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    setLoading(true)
+    fetchTradeChart(tradeId)
+      .then(d => { setData(d); setLoading(false) })
+      .catch(() => { setErr('Failed to load chart'); setLoading(false) })
+  }, [tradeId])
+
+  if (loading) return <div style={{ padding: '16px 0', color: 'var(--txt3)', fontSize: 12 }}>Loading chart & rationale…</div>
+  if (err) return <div style={{ padding: '8px 0', color: 'var(--dn)', fontSize: 12 }}>{err}</div>
+  if (!data) return null
+
+  const sig = data.signal || {}
+  const PATTERN_LABELS: Record<string, string> = {
+    mean_reversion: 'Mean Reversion', max_pain: 'Max Pain', gap_fill: 'Gap Fill',
+    oi_buildup: 'OI Buildup', vwap_oi: 'VWAP + OI', pcr_divergence: 'PCR Divergence',
+    iv_crush: 'IV Crush', expiry_week: 'Expiry Week'
+  }
+  const pLabel = PATTERN_LABELS[sig.pattern_name] || sig.pattern_name || '—'
+  const confColor = (sig.confidence ?? 0) >= 0.9 ? 'var(--up)' : (sig.confidence ?? 0) >= 0.75 ? 'var(--orange)' : 'var(--txt2)'
+  const ivLabel = sig.iv_rank != null ? `${(sig.iv_rank * 100).toFixed(0)}th pct` : '—'
+  const ivColor = sig.iv_rank != null ? (sig.iv_rank >= 0.6 ? 'var(--dn)' : sig.iv_rank <= 0.35 ? 'var(--up)' : 'var(--orange)') : 'var(--txt3)'
+
+  const badge = (label: string, value: string, color = 'var(--txt)') => (
+    <div style={{ padding: '6px 10px', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 5, minWidth: 90 }}>
+      <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>{label}</div>
+      <div style={{ fontSize: 12, fontWeight: 700, color }}>{value}</div>
+    </div>
+  )
+
+  return (
+    <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 14 }}>
+      {/* Section header */}
+      <div style={{ fontSize: 10, color: 'var(--blue)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700, marginBottom: 10 }}>
+        Signal Rationale & 5-Minute Chart
+      </div>
+
+      {/* Parameter badges row */}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+        {badge('Pattern', pLabel, 'var(--blue)')}
+        {badge('Confidence', sig.confidence != null ? `${(sig.confidence * 100).toFixed(0)}%` : '—', confColor)}
+        {badge('IV Rank', ivLabel, ivColor)}
+        {badge('Direction', sig.direction || '—', sig.direction === 'LONG' || sig.direction === 'long' ? 'var(--up)' : 'var(--dn)')}
+        {badge('Strategy', sig.option_strategy?.toUpperCase() || '—')}
+        {sig.regime_trend && badge('Regime', sig.regime_trend)}
+        {sig.timeframe && badge('Timeframe', sig.timeframe)}
+        {sig.delta != null && badge('Delta at entry', sig.delta.toFixed(3))}
+      </div>
+
+      {/* Explanation text */}
+      {sig.explanation && (
+        <div style={{
+          padding: '10px 12px', background: 'var(--bg)', border: '1px solid var(--border)',
+          borderRadius: 5, fontSize: 12, color: 'var(--txt2)', lineHeight: 1.6, marginBottom: 14
+        }}>
+          {sig.explanation}
+        </div>
+      )}
+
+      {/* 5-minute chart */}
+      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 4 }}>
+        Option price — 5-min bars ({data.chart_source === 'kite' ? 'live Kite data' : 'BS estimated from underlying'})
+        {' · '}{data.symbol}
+      </div>
+      <div style={{ border: '1px solid var(--border)', borderRadius: 5, padding: '8px 8px 4px', background: 'var(--bg)' }}>
+        <OptionChart
+          bars={data.chart || []}
+          entryPrice={entryPrice}
+          stopLoss={stopLoss}
+          targetPrice={targetPrice}
+          entryTime={entryTime}
+        />
+      </div>
     </div>
   )
 }
@@ -173,6 +374,15 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
           {row('Capital at risk', t.capital_at_risk_pct ? `${t.capital_at_risk_pct.toFixed(2)}% of portfolio` : '—')}
         </div>
       </div>
+      {/* Signal rationale + 5-min chart */}
+      <SignalRationale
+        tradeId={t.id}
+        entryPrice={t.entry_price}
+        stopLoss={t.stop_loss}
+        targetPrice={t.target_price}
+        entryTime={t.entry_time}
+      />
+
       <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
         <button onClick={onCollapse} className="tv-btn" style={{ fontSize: 11, padding: '3px 12px' }}>Collapse ▲</button>
       </div>

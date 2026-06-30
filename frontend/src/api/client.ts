@@ -16,6 +16,7 @@ export const fetchTrades     = (mode = 'live')       => api.get('/trades/', { pa
 export const fetchOpenTrades = (mode = 'live')       => api.get('/trades/', { params: { mode, status: 'open' } }).then(r => r.data)
 export const closeTrade      = (id: number)          => api.post(`/trades/${id}/close`).then(r => r.data)
 export const refreshMtm      = ()                    => api.post('/trades/refresh-mtm').then(r => r.data)
+export const fetchTradeChart = (id: number)          => api.get(`/trades/${id}/chart`).then(r => r.data)
 
 // ── Backtest ───────────────────────────────────────────────────────────────
 export const runBacktest    = (data: object)         => api.post('/backtest/run', data).then(r => r.data)
