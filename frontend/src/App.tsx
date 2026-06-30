@@ -7,6 +7,7 @@ import Positions from './pages/Positions'
 import Options from './pages/Options'
 import Settings from './pages/Settings'
 import ChatPanel from './components/ChatPanel'
+import LiveStatus from './components/LiveStatus'
 import PatternFinder from './pages/PatternFinder'
 import Report from './pages/Report'
 import SystemHealth from './pages/SystemHealth'
@@ -37,6 +38,7 @@ export default function App() {
   const mode = useModeStore(s => s.mode)
   const { theme, toggle } = useThemeStore()
   const [chatOpen, setChatOpen] = useState(false)
+  const [statusOpen, setStatusOpen] = useState(false)
   const themeInfo = THEMES.find(t => t.id === theme) ?? THEMES[0]
   const THEME_ICONS: Record<string, string> = {
     dark: '🌑', midnight: '🌌', 'high-contrast': '⬛', solarized: '🌊', light: '☀'
@@ -117,6 +119,20 @@ export default function App() {
             <span>{themeInfo.name}</span>
           </button>
 
+          {/* Live Status toggle */}
+          <button
+            onClick={() => setStatusOpen(o => !o)}
+            className="tv-btn tv-btn-ghost"
+            style={{
+              padding: '4px 10px', fontSize: 11,
+              background: statusOpen ? 'rgba(38,198,160,0.12)' : 'transparent',
+              color: statusOpen ? '#26c6a0' : 'var(--txt2)',
+              border: `1px solid ${statusOpen ? 'rgba(38,198,160,0.35)' : 'var(--border2)'}`,
+            }}
+          >
+            ◉ Live
+          </button>
+
           {/* AI Chat toggle */}
           <button
             onClick={() => setChatOpen(o => !o)}
@@ -150,6 +166,7 @@ export default function App() {
           </Routes>
         </div>
         <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} />
+        {statusOpen && <LiveStatus onClose={() => setStatusOpen(false)} />}
       </div>
     </div>
   )
