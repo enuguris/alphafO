@@ -10,7 +10,7 @@ interface ModeStore {
 }
 
 export const useModeStore = create<ModeStore>(set => ({
-  mode: 'testing',
+  mode: 'live',
 
   setMode: async (mode) => {
     set({ mode })

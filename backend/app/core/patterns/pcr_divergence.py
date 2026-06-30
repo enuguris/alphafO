@@ -10,9 +10,9 @@ class PCRDivergencePattern(AbstractPattern):
     description = "Detects extreme PCR readings that diverge from price action, signalling reversal"
     min_data_rows = 20
 
-    PCR_BULLISH_THRESHOLD = 1.3   # PCR above this = too many puts = bullish contrarian
-    PCR_BEARISH_THRESHOLD = 0.7   # PCR below this = too many calls = bearish contrarian
-    PRICE_DIVERGENCE_PCT = 0.5    # price must have moved at least 0.5% in opposite direction
+    PCR_BULLISH_THRESHOLD = 1.15  # PCR above this = elevated put buying = bullish contrarian
+    PCR_BEARISH_THRESHOLD = 0.85  # PCR below this = elevated call buying = bearish contrarian
+    PRICE_DIVERGENCE_PCT = 0.0    # any negative price move with high PCR = bullish contrarian signal
 
     def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
         signals = []
@@ -43,7 +43,7 @@ class PCRDivergencePattern(AbstractPattern):
                 pattern_version=self.version,
                 symbol=underlying,
                 underlying=underlying,
-                instrument=f"{underlying}_FUT",
+                instrument=underlying,
                 direction="long",
                 entry_price=entry,
                 target_price=target,
@@ -67,7 +67,7 @@ class PCRDivergencePattern(AbstractPattern):
                 pattern_version=self.version,
                 symbol=underlying,
                 underlying=underlying,
-                instrument=f"{underlying}_FUT",
+                instrument=underlying,
                 direction="short",
                 entry_price=entry,
                 target_price=target,
@@ -99,21 +99,16 @@ class PCRDivergencePattern(AbstractPattern):
 
     def _explain_bullish(self, pcr: float, price_chg: float) -> str:
         return (
-            f"PCR Divergence — Bullish Reversal Signal. "
-            f"Current PCR is {pcr:.2f} (above threshold of {self.PCR_BULLISH_THRESHOLD}), indicating extreme put-buying. "
-            f"Price has fallen {abs(price_chg):.1f}% but sentiment is too fearful. "
-            f"Market makers who sold these puts are now heavily delta-hedged short — as price stabilises, "
-            f"they will mechanically buy back the underlying, creating a reversal squeeze. "
-            f"Target: 3–4% upside. Stop: 1.5× ATR below entry."
+            f"PCR at {pcr:.2f} — too many people are buying puts (fear extreme). "
+            f"Price fell {abs(price_chg):.1f}% but the crowd is now too bearish. "
+            f"When everyone has already bought protection, the selling pressure exhausts itself. Buy the bounce."
         )
 
     def _explain_bearish(self, pcr: float, price_chg: float) -> str:
         return (
-            f"PCR Divergence — Bearish Reversal Signal. "
-            f"Current PCR is {pcr:.2f} (below threshold of {self.PCR_BEARISH_THRESHOLD}), indicating extreme call-buying (complacency). "
-            f"Price has risen {price_chg:.1f}% but too many retail traders are piling into calls. "
-            f"Dealer hedging dynamics favour a pullback as call writers delta-hedge by selling the underlying. "
-            f"Target: 3–4% downside. Stop: 1.5× ATR above entry."
+            f"PCR at {pcr:.2f} — too many people are buying calls (complacency). "
+            f"Price rose {price_chg:.1f}% but the crowd has piled into calls. "
+            f"When call-buying becomes excessive, dealer hedging creates selling pressure. Sell into the rally."
         )
 
     def why_it_works(self) -> str:

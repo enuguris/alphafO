@@ -169,8 +169,16 @@ def index_symbols() -> list[str]:
     return [i["sym"] for i in INDICES]
 
 
+# ── Testing focus ─────────────────────────────────────────────────────────────
+# Set to a non-empty list to restrict all scanning/discovery to these symbols.
+# Empty list = full universe.
+TESTING_FOCUS: list[str] = ["NIFTY", "BANKNIFTY"]
+
+
 def priority_scan_list() -> list[str]:
     """High-liquidity instruments scanned on every cycle."""
+    if TESTING_FOCUS:
+        return list(TESTING_FOCUS)
     return [
         "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
         "RELIANCE", "HDFCBANK", "ICICIBANK", "TCS", "INFY",

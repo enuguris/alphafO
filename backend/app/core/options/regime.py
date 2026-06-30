@@ -17,7 +17,7 @@ REGIME_PATTERNS = {
 class RegimeDetector:
     """Detect market regime from OHLCV data."""
 
-    def detect(self, ohlcv: pd.DataFrame) -> dict:
+    def detect(self, ohlcv: pd.DataFrame, india_vix: float = 0.0) -> dict:
         """
         Detect regime from OHLCV.
 
@@ -70,11 +70,12 @@ class RegimeDetector:
         suitable.update(REGIME_PATTERNS.get(key_trend, []))
         suitable.update(REGIME_PATTERNS.get(key_vol, []))
 
+        vix_out = round(india_vix, 2) if india_vix > 0 else round(hv20, 2)
         return {
             "trend": trend,
             "volatility": volatility,
             "adx": round(adx_val, 2),
-            "india_vix_proxy": round(hv20, 2),
+            "india_vix_proxy": vix_out,
             "suitable_patterns": sorted(suitable),
         }
 

@@ -75,6 +75,16 @@ def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+def _safe_dict(obj) -> dict:
+    """Convert SQLAlchemy model to dict, replacing nan/inf with None for JSON safety."""
+    import math
+    d = {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
+    for k, v in d.items():
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            d[k] = None
+    return d
+
+
 @router.get("/")
 async def list_signals(
     pattern: str | None = None,
@@ -83,15 +93,18 @@ async def list_signals(
     limit: int = 50,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.core.instruments import TESTING_FOCUS
     q = select(Signal).where(Signal.status == status)
     if pattern:
         q = q.where(Signal.pattern_name == pattern)
     if underlying:
         q = q.where(Signal.underlying == underlying)
+    elif TESTING_FOCUS:
+        q = q.where(Signal.underlying.in_(TESTING_FOCUS))
     q = q.order_by(Signal.created_at.desc()).limit(limit)
     result = await db.execute(q)
     signals = result.scalars().all()
-    return {"signals": [s.__dict__ for s in signals], "count": len(signals)}
+    return {"signals": [_safe_dict(s) for s in signals], "count": len(signals)}
 
 
 @router.post("/scan-all")
@@ -103,9 +116,12 @@ async def scan_all(
     """Run multi-timeframe scan across all (or specified) instruments. Broadcasts via WebSocket."""
     from app.core.scanner import run_full_scan
     from app.api.websocket import manager
-    from app.core.instruments import priority_scan_list, all_symbols
+    from app.core.instruments import priority_scan_list, all_symbols, TESTING_FOCUS
 
     scan_symbols = symbols or priority_scan_list()
+    # Enforce testing focus — never scan outside the configured focus set
+    if TESTING_FOCUS:
+        scan_symbols = [s for s in scan_symbols if s in TESTING_FOCUS] or list(TESTING_FOCUS)
     scan_tfs = timeframes or ["15m", "1h", "4h", "daily"]
 
     result = await run_full_scan(
@@ -159,6 +175,11 @@ async def scan_all(
 
     if created:
         await db.commit()
+        for sig in created:
+            await db.refresh(sig)
+        # Auto-execute paper trades for high-confidence signals
+        from app.workers.tasks import _auto_paper_trade
+        await _auto_paper_trade(created, db)
 
     return {
         "symbols_scanned": result["symbols_scanned"],
@@ -175,7 +196,7 @@ async def get_signal(signal_id: int, db: AsyncSession = Depends(get_db)):
     signal = result.scalar_one_or_none()
     if not signal:
         raise HTTPException(404, "Signal not found")
-    return signal.__dict__
+    return _safe_dict(signal)
 
 
 @router.post("/run")
@@ -185,6 +206,9 @@ async def run_signals(
     db: AsyncSession = Depends(get_db),
 ):
     """Run pattern detection with regime and options enrichment, persist signals to DB."""
+    from app.core.instruments import TESTING_FOCUS
+    if TESTING_FOCUS and underlying not in TESTING_FOCUS:
+        raise HTTPException(400, f"Testing focus active: only {TESTING_FOCUS} allowed")
 
     # ── 1. Fetch OHLCV ────────────────────────────────────────────────────────
     ohlcv: pd.DataFrame
@@ -292,14 +316,18 @@ async def run_signals(
             "event_warning": event_warning,
         }
 
-    # ── 9. Expire old active signals ──────────────────────────────────────────
-    old_q = select(Signal).where(
-        Signal.underlying == underlying,
-        Signal.status == SignalStatus.ACTIVE,
-    )
-    old_result = await db.execute(old_q)
-    for old_sig in old_result.scalars().all():
-        old_sig.status = SignalStatus.EXPIRED
+    # ── 9. Expire old signals — only for pattern+direction combos being replaced ──
+    new_combos = {(s.pattern_name, s.direction) for s in raw_signals}
+    if new_combos:
+        from sqlalchemy import tuple_ as sql_tuple
+        old_q = select(Signal).where(
+            Signal.underlying == underlying,
+            Signal.status == SignalStatus.ACTIVE,
+            sql_tuple(Signal.pattern_name, Signal.direction).in_(list(new_combos)),
+        )
+        old_result = await db.execute(old_q)
+        for old_sig in old_result.scalars().all():
+            old_sig.status = SignalStatus.EXPIRED
 
     # ── 10. Persist enriched signals ──────────────────────────────────────────
     selector = StrikeSelector()

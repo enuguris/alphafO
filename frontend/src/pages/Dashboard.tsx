@@ -3,10 +3,10 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   fetchSignals, fetchPortfolio, fetchTrades, runSignals, initPortfolio,
   scanAll, fetchInstruments, fetchSectors, fetchDataStatus,
-  createSignalSocket, createPriceSocket,
+  createSignalSocket, createPriceSocket, fetchPreMarket, fetchPatternPerf,
 } from '../api/client'
 import { useModeStore } from '../store/modeStore'
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid, BarChart, Bar } from 'recharts'
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid, BarChart, Bar, Cell } from 'recharts'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -54,9 +54,127 @@ function WatchRow({ inst, ltp, chg, selected, onSelect }: {
   )
 }
 
+// ─── Trade Quality scorer ─────────────────────────────────────────────────────
+
+function tradeQuality(s: any, spot: number): { score: number; grade: string; color: string; factors: { icon: string; label: string; detail: string; good: boolean }[] } {
+  const isCE = s.option_type === 'CE'
+  const isPE = s.option_type === 'PE'
+  const strike = s.strike ?? 0
+  const ivRank = s.iv_rank ?? 0.5
+  const dte = s.expiry_dte ?? 7
+  const theta = s.theta ?? 0        // negative number, daily decay per unit
+  const delta = Math.abs(s.delta ?? 0.3)
+  const regime = s.regime_trend ?? 'ranging'
+  const entryPremium = s.entry_price ?? 0
+
+  const factors: { icon: string; label: string; detail: string; good: boolean }[] = []
+  let score = 0
+
+  // ── 1. Moneyness (25 pts) ──
+  let moneynessScore = 0
+  let moneynessDetail = ''
+  if (spot > 0 && strike > 0) {
+    const pctFromStrike = isCE
+      ? (spot - strike) / spot * 100   // positive = ITM for CE
+      : (strike - spot) / spot * 100   // positive = ITM for PE
+    if (pctFromStrike >= 0) {
+      moneynessScore = 18; moneynessDetail = `ITM by ${Math.abs(pctFromStrike).toFixed(1)}% — intrinsic value supports premium`
+    } else if (pctFromStrike >= -1) {
+      moneynessScore = 25; moneynessDetail = `Near ATM (${Math.abs(pctFromStrike).toFixed(1)}% OTM) — highest gamma, best leverage`
+    } else if (pctFromStrike >= -2) {
+      moneynessScore = 20; moneynessDetail = `${Math.abs(pctFromStrike).toFixed(1)}% OTM — reasonable entry, needs ${Math.abs(pctFromStrike).toFixed(1)}% move`
+    } else if (pctFromStrike >= -4) {
+      moneynessScore = 12; moneynessDetail = `${Math.abs(pctFromStrike).toFixed(1)}% OTM — needs a significant move`
+    } else {
+      moneynessScore = 4; moneynessDetail = `Deep OTM (${Math.abs(pctFromStrike).toFixed(1)}%) — low probability, lottery ticket territory`
+    }
+    factors.push({ icon: '◎', label: 'Moneyness', detail: moneynessDetail, good: moneynessScore >= 18 })
+  } else {
+    moneynessScore = 12
+    factors.push({ icon: '◎', label: 'Moneyness', detail: 'Spot price unavailable — cannot assess moneyness', good: false })
+  }
+  score += moneynessScore
+
+  // ── 2. IV environment (25 pts) — buying options when IV is low = good ──
+  let ivScore = 0
+  let ivDetail = ''
+  const ivPct = ivRank * 100
+  if (ivPct < 20) { ivScore = 25; ivDetail = `IV rank ${ivPct.toFixed(0)}% — cheap premium, ideal to buy options` }
+  else if (ivPct < 40) { ivScore = 20; ivDetail = `IV rank ${ivPct.toFixed(0)}% — fair premium, acceptable to buy` }
+  else if (ivPct < 60) { ivScore = 12; ivDetail = `IV rank ${ivPct.toFixed(0)}% — elevated IV, you're paying up for options` }
+  else if (ivPct < 80) { ivScore = 6; ivDetail = `IV rank ${ivPct.toFixed(0)}% — high IV, premium is expensive` }
+  else { ivScore = 2; ivDetail = `IV rank ${ivPct.toFixed(0)}% — very high IV, significant IV crush risk on any pullback` }
+  score += ivScore
+  factors.push({ icon: '〜', label: 'IV environment', detail: ivDetail, good: ivScore >= 18 })
+
+  // ── 3. Time decay burden (25 pts) ──
+  let dteScore = 0
+  let dteDetail = ''
+  const dailyDecayPct = entryPremium > 0 ? Math.abs(theta) / entryPremium * 100 : 0
+  if (dte >= 10 && dte <= 21) { dteScore = 25; dteDetail = `${dte} DTE — sweet spot: enough time for move, theta not brutal yet` }
+  else if (dte >= 5 && dte < 10) { dteScore = 18; dteDetail = `${dte} DTE — theta accelerating (≈${dailyDecayPct.toFixed(1)}%/day of premium), needs quick move` }
+  else if (dte >= 22 && dte <= 45) { dteScore = 18; dteDetail = `${dte} DTE — plenty of time but you're paying for it in theta` }
+  else if (dte >= 2 && dte < 5) { dteScore = 8; dteDetail = `${dte} DTE — very high theta risk (≈${dailyDecayPct.toFixed(1)}%/day), needs move today` }
+  else if (dte < 2) { dteScore = 2; dteDetail = `Expiring ${dte === 1 ? 'tomorrow' : 'today'} — extreme gamma/theta, binary bet only` }
+  else { dteScore = 12; dteDetail = `${dte} DTE — long-dated, slow movement in premium` }
+  score += dteScore
+  factors.push({ icon: '⏱', label: 'Time to expiry', detail: dteDetail, good: dteScore >= 18 })
+
+  // ── 4. Regime alignment (25 pts) ──
+  let regimeScore = 0
+  let regimeDetail = ''
+  const aligned = (isCE && regime === 'bullish') || (isPE && regime === 'bearish')
+  const opposed = (isCE && regime === 'bearish') || (isPE && regime === 'bullish')
+  if (aligned) { regimeScore = 25; regimeDetail = `${regime} regime aligns with ${s.option_type} — trend is in your favour` }
+  else if (opposed) { regimeScore = 5; regimeDetail = `${regime} regime opposes ${s.option_type} — you're trading against the trend` }
+  else { regimeScore = 13; regimeDetail = `Ranging market — directional option needs a catalyst to work` }
+  score += regimeScore
+  factors.push({ icon: '⟳', label: 'Regime alignment', detail: regimeDetail, good: regimeScore >= 18 })
+
+  // Grade
+  let grade: string, color: string
+  if (score >= 78) { grade = 'Strong entry'; color = 'var(--up)' }
+  else if (score >= 58) { grade = 'Fair entry'; color = 'var(--orange)' }
+  else if (score >= 38) { grade = 'Weak entry'; color = '#ff9800' }
+  else { grade = 'Poor entry'; color = 'var(--dn)' }
+
+  return { score, grade, color, factors }
+}
+
+function TradeQualityPanel({ s, spot }: { s: any; spot: number }) {
+  const { score, grade, color, factors } = tradeQuality(s, spot)
+  const barW = `${score}%`
+
+  return (
+    <div style={{ margin: '10px 0', padding: 10, borderRadius: 6, background: 'var(--bg3)', border: '1px solid var(--border)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 3, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Entry Quality</div>
+          <div style={{ height: 6, borderRadius: 3, background: 'var(--bg2)', overflow: 'hidden' }}>
+            <div style={{ height: '100%', width: barW, background: color, borderRadius: 3, transition: 'width 0.6s ease' }} />
+          </div>
+        </div>
+        <div style={{ textAlign: 'right', flexShrink: 0 }}>
+          <div className="mono" style={{ fontSize: 20, fontWeight: 700, color, lineHeight: 1 }}>{score}</div>
+          <div style={{ fontSize: 10, color, fontWeight: 600 }}>{grade}</div>
+        </div>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {factors.map((f, i) => (
+          <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'flex-start', fontSize: 11 }}>
+            <span style={{ color: f.good ? 'var(--up)' : 'var(--dn)', flexShrink: 0, width: 14 }}>{f.good ? '✓' : '✗'}</span>
+            <span style={{ color: 'var(--txt2)', flexShrink: 0, minWidth: 110 }}>{f.label}</span>
+            <span style={{ color: 'var(--txt3)', lineHeight: 1.4 }}>{f.detail}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ─── Signal card ─────────────────────────────────────────────────────────────
 
-function SignalRow({ s }: { s: any }) {
+function SignalRow({ s, spot = 0 }: { s: any; spot?: number }) {
   const [exp, setExp] = useState(false)
   const isLong = s.direction === 'long'
   const conf = Math.round((s.confidence_score ?? 0) * 100)
@@ -89,9 +207,33 @@ function SignalRow({ s }: { s: any }) {
         }}>{s.pattern_name?.replace(/_/g, ' ').toUpperCase()}</span>
 
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap' }}>
             <span style={{ fontWeight: 700, color: 'var(--txt)' }}>{s.underlying}</span>
             <span className={`badge ${isLong ? 'badge-up' : 'badge-dn'}`}>{s.direction?.toUpperCase()}</span>
+            {/* Contract: OPTIONS show strike+type, FUTURES show FUT — always visible */}
+            {s.option_type ? (
+              <span className="mono" style={{
+                fontSize: 11, fontWeight: 700, padding: '1px 6px', borderRadius: 3,
+                background: s.option_type === 'CE' ? 'rgba(41,98,255,0.12)' : 'rgba(233,30,99,0.10)',
+                color: s.option_type === 'CE' ? 'var(--blue)' : '#e91e63',
+                border: `1px solid ${s.option_type === 'CE' ? 'rgba(41,98,255,0.3)' : 'rgba(233,30,99,0.3)'}`,
+                whiteSpace: 'nowrap',
+              }}>
+                {(s.strike ?? 0).toLocaleString('en-IN')} {s.option_type}
+                {s.expiry_dte != null && <span style={{ fontWeight: 400, opacity: 0.75 }}> · {s.expiry_dte}d</span>}
+              </span>
+            ) : (
+              <span className="mono" style={{
+                fontSize: 11, fontWeight: 700, padding: '1px 6px', borderRadius: 3,
+                background: 'rgba(255,152,0,0.10)', color: 'var(--orange)',
+                border: '1px solid rgba(255,152,0,0.3)', whiteSpace: 'nowrap',
+              }}>FUT</span>
+            )}
+            {s.option_strategy && (
+              <span style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                {s.option_strategy}
+              </span>
+            )}
           </div>
           <div className="conf-bar" style={{ width: 80, marginTop: 5 }}>
             <div className="progress-fill" style={{ width: `${conf}%`, background: conf >= 75 ? 'var(--up)' : conf >= 55 ? 'var(--orange)' : 'var(--txt3)' }} />
@@ -116,7 +258,7 @@ function SignalRow({ s }: { s: any }) {
         {s.strike && (
           <div style={{ textAlign: 'right', minWidth: 110 }}>
             <div style={{ fontSize: 10, color: 'var(--txt3)' }}>Contract</div>
-            <div className="mono" style={{ fontSize: 11, fontWeight: 700, color: s.option_type === 'CE' ? 'var(--dn)' : 'var(--up)' }}>
+            <div className="mono" style={{ fontSize: 11, fontWeight: 700, color: s.option_type === 'CE' ? 'var(--blue)' : '#e91e63' }}>
               {s.strike?.toLocaleString('en-IN')} {s.option_type}
             </div>
             <div style={{ fontSize: 9, color: 'var(--txt3)' }}>{s.option_strategy?.toUpperCase()}</div>
@@ -167,6 +309,30 @@ function SignalRow({ s }: { s: any }) {
 
       {exp && (
         <div className="fade-up" style={{ padding: '0 12px 12px 25px' }}>
+          {/* Trade quality score */}
+          {s.option_type && <TradeQualityPanel s={s} spot={spot} />}
+          {/* Full instrument symbol — copyable */}
+          {s.instrument && s.instrument !== s.underlying && (
+            <div style={{ marginBottom: 8 }}>
+              <span style={{ fontSize: 10, color: 'var(--txt3)' }}>Trade: </span>
+              <span
+                className="mono"
+                title="Click to copy"
+                onClick={e => { e.stopPropagation(); navigator.clipboard?.writeText(s.instrument) }}
+                style={{
+                  fontSize: 12, fontWeight: 700, color: 'var(--txt)',
+                  cursor: 'copy', padding: '1px 6px', borderRadius: 3,
+                  background: 'var(--bg3)', border: '1px solid var(--border)',
+                  userSelect: 'all',
+                }}
+              >{s.instrument}</span>
+              {s.expiry_display && (
+                <span style={{ fontSize: 10, color: 'var(--txt3)', marginLeft: 6 }}>
+                  expires {s.expiry_display}
+                </span>
+              )}
+            </div>
+          )}
           <p style={{ fontSize: 11, color: 'var(--txt2)', lineHeight: 1.6, marginBottom: 8 }}>
             {s.explanation}
           </p>
@@ -179,6 +345,7 @@ function SignalRow({ s }: { s: any }) {
             {s.regime_volatility && <span className="badge badge-mute">{s.regime_volatility} vol</span>}
             {s.estimated_premium != null && <span className="badge badge-mute">Premium ₹{s.estimated_premium?.toFixed(0)}</span>}
             {s.max_loss != null && <span className="badge badge-dn">Max loss ₹{s.max_loss?.toFixed(0)}</span>}
+            {s.lot_size != null && <span className="badge badge-mute">Lot {s.lot_size}</span>}
             {s.vega != null && <span className="badge badge-blue">Vega {s.vega?.toFixed(2)}</span>}
             {s.max_pain_strike && <span className="badge badge-warn">Max pain {s.max_pain_strike?.toLocaleString('en-IN')}</span>}
           </div>
@@ -282,6 +449,13 @@ export default function Dashboard() {
   const wsRef = useRef<WebSocket | null>(null)
   const priceWsRef = useRef<WebSocket | null>(null)
 
+  // Request browser notification permission on mount
+  useEffect(() => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission()
+    }
+  }, [])
+
   // Sync mode from backend on mount
   useEffect(() => { syncFromBackend() }, [])
 
@@ -304,14 +478,17 @@ export default function Dashboard() {
   const { data: portfolio }   = useQuery({ queryKey: ['portfolio'],   queryFn: fetchPortfolio,   refetchInterval: 10_000 })
   const { data: trades }      = useQuery({ queryKey: ['trades'],      queryFn: () => fetchTrades('paper') })
   const { data: dataStatus }  = useQuery({ queryKey: ['dataStatus'],  queryFn: fetchDataStatus,  refetchInterval: 60_000, staleTime: 30_000 })
+  const { data: preMarket, isLoading: pmLoading } = useQuery({ queryKey: ['preMarket'], queryFn: fetchPreMarket, staleTime: 120_000, refetchInterval: 300_000 })
+  const { data: patternPerf } = useQuery({ queryKey: ['patternPerf'], queryFn: fetchPatternPerf, staleTime: 60_000 })
 
   // ── Mutations ──────────────────────────────────────────────────────────────
   const scanMutation = useMutation({
     mutationFn: () => { setScanning(true); return runSignals(selectedSym) },
     onSettled: () => { setScanning(false); qc.invalidateQueries({ queryKey: ['signals'] }) },
   })
+  const FOCUS_SYMS = ['NIFTY', 'BANKNIFTY']
   const scanAllMutation = useMutation({
-    mutationFn: () => { setScanningAll(true); return scanAll(undefined, ['15m', '1h', '4h', 'daily']) },
+    mutationFn: () => { setScanningAll(true); return scanAll(FOCUS_SYMS, ['15m', '1h', '4h', 'daily']) },
     onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['signals'] })
       setScanningAll(false)
@@ -336,6 +513,13 @@ export default function Dashboard() {
             setLiveSignals(prev => [sig, ...prev.slice(0, 99)])
             setToasts(prev => [...prev, { ...sig, _id: Date.now() }])
             qc.invalidateQueries({ queryKey: ['signals'] })
+            // Browser notification for high-confidence signals
+            if (sig.confidence_score >= 0.72 && 'Notification' in window && Notification.permission === 'granted') {
+              new Notification(`AlphaFO: ${sig.underlying} ${sig.direction.toUpperCase()}`, {
+                body: `${sig.pattern_name.replace(/_/g, ' ')} — ${Math.round(sig.confidence_score * 100)}% confidence\n${sig.instrument ?? ''}`,
+                icon: '/favicon.ico',
+              })
+            }
           } else if (msg.type === 'ping') {
             setWsConnected(true)
           }
@@ -415,7 +599,7 @@ export default function Dashboard() {
             onClick={() => scanAllMutation.mutate()}
             disabled={scanningAll}
           >
-            {scanningAll ? '⏳ Scanning…' : '⚡ Scan All TF'}
+            {scanningAll ? '⏳ Scanning…' : '⚡ Scan NF+BNF'}
           </button>
         </div>
 
@@ -571,7 +755,7 @@ export default function Dashboard() {
           )}
         </div>
 
-        <Tabs tabs={['Signals', 'Portfolio', 'Trades', 'Patterns']} active={mainTab} onChange={setMainTab} />
+        <Tabs tabs={['Signals', 'Portfolio', 'Trades', 'Patterns', 'Briefing']} active={mainTab} onChange={setMainTab} />
 
         <div className="scroll-y" style={{ flex: 1, background: 'var(--bg)' }}>
 
@@ -646,7 +830,7 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {filteredSignals.map((s: any) => <SignalRow key={s.id} s={s} />)}
+              {filteredSignals.map((s: any) => <SignalRow key={s.id} s={s} spot={livePrices[s.underlying]?.ltp ?? 0} />)}
             </div>
           )}
 
@@ -707,11 +891,25 @@ export default function Dashboard() {
               {pnlData.length > 0 && (
                 <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
                   <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Trade P&L History</div>
-                  <ResponsiveContainer width="100%" height={80}>
-                    <BarChart data={pnlData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-                      <Bar dataKey="pnl" radius={[2, 2, 0, 0]} />
-                      <ReferenceLine y={0} stroke="var(--border2)" />
-                      <Tooltip contentStyle={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11 }} formatter={(v: number) => [fmtINR(v), 'P&L']} />
+                  <ResponsiveContainer width="100%" height={90}>
+                    <BarChart data={pnlData} margin={{ top: 4, right: 8, bottom: 0, left: 48 }}>
+                      <YAxis
+                        tick={{ fontSize: 9, fill: 'var(--txt3)' }}
+                        tickLine={false} axisLine={false}
+                        tickFormatter={(v: number) => `₹${Math.abs(v) >= 1000 ? `${(v/1000).toFixed(0)}k` : v}`}
+                        width={44}
+                      />
+                      <ReferenceLine y={0} stroke="var(--border2)" strokeWidth={1} />
+                      <Tooltip
+                        contentStyle={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11 }}
+                        formatter={(v: number) => [fmtINR(v), 'P&L']}
+                        labelFormatter={(i: number) => `Trade #${i}`}
+                      />
+                      <Bar dataKey="pnl" radius={[2, 2, 0, 0]} maxBarSize={18}>
+                        {pnlData.map((d, idx) => (
+                          <Cell key={idx} fill={d.pnl >= 0 ? 'var(--up)' : 'var(--dn)'} fillOpacity={0.85} />
+                        ))}
+                      </Bar>
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
@@ -750,6 +948,191 @@ export default function Dashboard() {
                     })}
                   </tbody>
                 </table>
+              )}
+            </div>
+          )}
+
+          {/* ── Briefing ── */}
+          {mainTab === 'Briefing' && (
+            <div style={{ padding: 12 }}>
+              {pmLoading ? (
+                <div style={{ padding: 32, textAlign: 'center', color: 'var(--txt3)' }}>Loading briefing…</div>
+              ) : preMarket ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {/* Session header */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'var(--bg2)', borderRadius: 6, border: '1px solid var(--border)' }}>
+                    <span style={{ fontSize: 11, color: 'var(--txt2)' }}>{preMarket.session?.label}</span>
+                    <span style={{ fontSize: 11, color: 'var(--txt3)' }}>{preMarket.session?.time_ist}</span>
+                    {preMarket.session?.is_market_hours && <span className="badge badge-up" style={{ marginLeft: 'auto' }}>MARKET OPEN</span>}
+                  </div>
+
+                  {/* VIX + Market row */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                    {/* VIX */}
+                    <div className="tv-card" style={{ padding: 12 }}>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>India VIX</div>
+                      {preMarket.vix?.level != null ? (
+                        <>
+                          <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: preMarket.vix.level < 16 ? 'var(--up)' : preMarket.vix.level > 20 ? 'var(--dn)' : 'var(--orange)' }}>
+                            {preMarket.vix.level.toFixed(2)}
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--txt2)', marginTop: 4 }}>{preMarket.vix.signal}</div>
+                        </>
+                      ) : <div style={{ color: 'var(--txt3)', fontSize: 11 }}>—</div>}
+                    </div>
+
+                    {/* NIFTY */}
+                    {(['NIFTY', 'BANKNIFTY'] as const).map(sym => {
+                      const m = preMarket.market?.[sym]
+                      return (
+                        <div key={sym} className="tv-card" style={{ padding: 12 }}>
+                          <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{sym}</div>
+                          {m ? (
+                            <>
+                              <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                                <span className="mono" style={{ fontSize: 16, fontWeight: 700, color: 'var(--txt)' }}>{m.last.toLocaleString('en-IN')}</span>
+                                <span className={`mono ${m.chg_pct >= 0 ? 'up' : 'dn'}`} style={{ fontSize: 11 }}>{m.chg_pct >= 0 ? '+' : ''}{m.chg_pct.toFixed(2)}%</span>
+                              </div>
+                              <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 4 }}>
+                                <span style={{ color: m.trend === 'bullish' ? 'var(--up)' : m.trend === 'bearish' ? 'var(--dn)' : 'var(--txt2)', textTransform: 'uppercase', fontWeight: 700 }}>{m.trend}</span>
+                                {' · '}RSI {m.rsi} · HV {m.hv20}%
+                              </div>
+                            </>
+                          ) : <div style={{ color: 'var(--txt3)', fontSize: 11 }}>—</div>}
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {/* PCR + FII row */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                    {/* PCR */}
+                    <div className="tv-card" style={{ padding: 12 }}>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Put-Call Ratio</div>
+                      {Object.entries(preMarket.pcr ?? {}).map(([sym, d]: [string, any]) => (
+                        <div key={sym} style={{ marginBottom: 6 }}>
+                          <div style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                            <span style={{ fontSize: 10, color: 'var(--txt2)', fontWeight: 700 }}>{sym}</span>
+                            <span className="mono" style={{ fontSize: 14, fontWeight: 700, color: d.pcr > 1.0 ? 'var(--up)' : 'var(--dn)' }}>{d.pcr?.toFixed(3)}</span>
+                            {d.max_pain && <span style={{ fontSize: 10, color: 'var(--txt3)' }}>MP {d.max_pain.toLocaleString('en-IN')}</span>}
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--txt2)' }}>{d.signal}</div>
+                        </div>
+                      ))}
+                      {!Object.keys(preMarket.pcr ?? {}).length && <div style={{ color: 'var(--txt3)', fontSize: 11 }}>No PCR data yet</div>}
+                    </div>
+
+                    {/* FII */}
+                    <div className="tv-card" style={{ padding: 12 }}>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>FII F&O Net</div>
+                      {preMarket.fii ? (
+                        <>
+                          <div className="mono" style={{ fontSize: 18, fontWeight: 700, color: preMarket.fii.net_cr > 0 ? 'var(--up)' : 'var(--dn)' }}>
+                            {preMarket.fii.net_cr > 0 ? '+' : ''}{preMarket.fii.net_cr.toLocaleString('en-IN')} Cr
+                          </div>
+                          <div style={{ fontSize: 10, color: 'var(--txt2)', marginTop: 4 }}>{preMarket.fii.signal}</div>
+                          {preMarket.fii.date && <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 2 }}>as of {preMarket.fii.date}</div>}
+                        </>
+                      ) : <div style={{ color: 'var(--txt3)', fontSize: 11 }}>No FII data yet</div>}
+                    </div>
+                  </div>
+
+                  {/* Key levels */}
+                  {Object.keys(preMarket.key_levels ?? {}).length > 0 && (
+                    <div className="tv-card" style={{ padding: 12 }}>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Key Levels</div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                        {Object.entries(preMarket.key_levels).map(([sym, kl]: [string, any]) => (
+                          <div key={sym}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--blue)', marginBottom: 4 }}>{sym}</div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 8px', fontSize: 11 }}>
+                              {[
+                                ['R2', kl.resistance_2, 'var(--dn)'],
+                                ['R1', kl.resistance_1, 'var(--dn)'],
+                                ['ATM', kl.atm_strike, 'var(--txt)'],
+                                ['Pivot', kl.pivot, 'var(--orange)'],
+                                ['S1', kl.support_1, 'var(--up)'],
+                                ['S2', kl.support_2, 'var(--up)'],
+                              ].map(([lbl, val, col]) => (
+                                <div key={lbl as string} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                  <span style={{ color: 'var(--txt3)' }}>{lbl}</span>
+                                  <span className="mono" style={{ color: col as string, fontWeight: 600 }}>{(val as number).toLocaleString('en-IN')}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Recommended patterns */}
+                  {(preMarket.recommended_patterns ?? []).length > 0 && (
+                    <div className="tv-card" style={{ padding: 12 }}>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Best Patterns Today</div>
+                      {preMarket.recommended_patterns.map((p: any, i: number) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: i < preMarket.recommended_patterns.length - 1 ? '1px solid var(--border)' : 'none' }}>
+                          <span style={{ fontSize: 11, fontWeight: 700, minWidth: 70, color: 'var(--blue)' }}>{p.underlying}</span>
+                          <span className={`badge ${p.direction === 'long' ? 'badge-up' : 'badge-dn'}`} style={{ fontSize: 9 }}>{p.direction?.toUpperCase()}</span>
+                          <span style={{ flex: 1, fontSize: 11, color: 'var(--txt)' }}>{p.display_name}</span>
+                          <span style={{ fontSize: 10, color: 'var(--txt3)' }}>WR {(p.win_rate * 100).toFixed(0)}%</span>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--up)' }}>{p.alignment_score.toFixed(2)}★</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Paper trade summary */}
+                  {preMarket.paper_summary && (
+                    <div className="tv-card" style={{ padding: 12 }}>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Paper Trade Summary</div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8 }}>
+                        {[
+                          ['Open Trades', preMarket.paper_summary.open_trades, false],
+                          ['Unrealized P&L', fmtINR(preMarket.paper_summary.unrealized_pnl), preMarket.paper_summary.unrealized_pnl >= 0],
+                          ['Closed Today', preMarket.paper_summary.closed_today, false],
+                          ['Realized Today', fmtINR(preMarket.paper_summary.realized_today), preMarket.paper_summary.realized_today >= 0],
+                        ].map(([lbl, val, isUp]) => (
+                          <div key={lbl as string}>
+                            <div style={{ fontSize: 10, color: 'var(--txt3)' }}>{lbl}</div>
+                            <div className="mono" style={{ fontSize: 14, fontWeight: 700, color: typeof isUp === 'boolean' ? (isUp ? 'var(--up)' : 'var(--dn)') : 'var(--txt)' }}>{String(val)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Pattern performance leaderboard */}
+                  {(patternPerf?.patterns ?? []).length > 0 && (
+                    <div className="tv-card" style={{ padding: 12 }}>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Paper Trade Leaderboard</div>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                        <thead>
+                          <tr style={{ color: 'var(--txt3)', fontSize: 10 }}>
+                            <th style={{ textAlign: 'left', padding: '2px 0' }}>Symbol</th>
+                            <th style={{ textAlign: 'right' }}>Trades</th>
+                            <th style={{ textAlign: 'right' }}>WR%</th>
+                            <th style={{ textAlign: 'right' }}>P&L</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {patternPerf.patterns.map((p: any, i: number) => (
+                            <tr key={i} style={{ borderTop: '1px solid var(--border)' }}>
+                              <td style={{ padding: '4px 0', fontWeight: 700, color: 'var(--txt)' }}>{p.underlying}</td>
+                              <td className="mono" style={{ textAlign: 'right', color: 'var(--txt2)' }}>{p.total}</td>
+                              <td className="mono" style={{ textAlign: 'right', color: p.win_rate >= 0.55 ? 'var(--up)' : 'var(--dn)' }}>{(p.win_rate * 100).toFixed(0)}%</td>
+                              <td className="mono" style={{ textAlign: 'right', color: p.total_pnl >= 0 ? 'var(--up)' : 'var(--dn)', fontWeight: 600 }}>{fmtINR(p.total_pnl)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ padding: 32, textAlign: 'center', color: 'var(--txt3)', fontSize: 12 }}>
+                  Briefing data unavailable. Check backend connection.
+                </div>
               )}
             </div>
           )}

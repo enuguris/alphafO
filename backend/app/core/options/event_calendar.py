@@ -3,27 +3,16 @@ from datetime import date, timedelta
 from typing import List
 
 
-def _last_thursday(year: int, month: int) -> date:
-    """Return last Thursday of a given month."""
-    # Start from last day of month
-    if month == 12:
-        last_day = date(year + 1, 1, 1) - timedelta(days=1)
-    else:
-        last_day = date(year, month + 1, 1) - timedelta(days=1)
-    # Walk back to Thursday (weekday 3)
-    offset = (last_day.weekday() - 3) % 7
-    return last_day - timedelta(days=offset)
-
-
 def _build_events_for_year(year: int) -> List[dict]:
     """Build a list of major market events for the given year."""
+    from app.core.options.expiry import monthly_expiry
     events = []
 
-    # Monthly expiry: last Thursday of every month
+    # Monthly expiry for NIFTY (last Tuesday since Sep 2025) — the primary index
     for m in range(1, 13):
         events.append({
             "name": "NSE Monthly Expiry",
-            "date": _last_thursday(year, m),
+            "date": monthly_expiry(year, m, "NIFTY"),
             "type": "expiry",
         })
 

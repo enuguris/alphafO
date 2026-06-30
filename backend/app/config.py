@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     debug: bool = False
     secret_key: str = "change-me"
-    app_mode: AppMode = AppMode.TESTING
+    app_mode: AppMode = AppMode.LIVE
 
     # Database
     database_url: str = "postgresql+asyncpg://alphafO:password@localhost:5432/alphafO"

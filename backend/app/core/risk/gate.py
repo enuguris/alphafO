@@ -76,6 +76,11 @@ def record_pnl(realized_pnl: float) -> None:
     _r().incrbyfloat(DAILY_PNL_KEY, realized_pnl)
 
 
+def record_deployed(amount: float) -> None:
+    """Track capital deployed; call +amount on entry, -amount on close."""
+    _r().incrbyfloat(DAILY_DEPLOYED_KEY, amount)
+
+
 def get_daily_pnl() -> float:
     val = _r().get(DAILY_PNL_KEY)
     return float(val) if val else 0.0

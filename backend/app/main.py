@@ -8,8 +8,33 @@ from loguru import logger
 
 from app.config import settings
 from app.database import init_db
-from app.api.v1 import signals, trades, backtest, portfolio, data, settings as settings_router, chat, options as options_router, instruments as instruments_router
+from app.api.v1 import signals, trades, backtest, portfolio, data, settings as settings_router, chat, options as options_router, instruments as instruments_router, pattern_finder as pattern_finder_router, dashboard as dashboard_router, system as system_router
 from app.api.websocket import router as ws_router
+
+
+async def _subscribe_open_trade_tokens() -> None:
+    """Subscribe live option tokens for all open paper trades so MTM gets real prices."""
+    try:
+        from sqlalchemy import select
+        from app.database import AsyncSessionLocal
+        from app.models.trades import Trade, TradeStatus
+        from app.core.data.kite_ticker import ticker_service
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Trade.symbol).where(
+                    Trade.status == TradeStatus.OPEN,
+                    Trade.mode   == "paper",
+                    Trade.symbol != Trade.underlying,
+                )
+            )
+            symbols = [row[0] for row in result.all() if row[0]]
+
+        if symbols:
+            ticker_service.subscribe_option_tokens(symbols)
+            logger.info(f"Subscribed {len(symbols)} option tokens for open paper trades")
+    except Exception as e:
+        logger.warning(f"Could not subscribe open trade tokens: {e}")
 
 
 async def _load_kite_credentials_from_db() -> None:
@@ -37,6 +62,32 @@ async def _load_kite_credentials_from_db() -> None:
         logger.warning(f"Could not load Kite credentials from DB: {exc}")
 
 
+async def _sync_portfolio_heat_from_db() -> None:
+    """
+    After reset_daily_pnl clears Redis, re-seed DAILY_DEPLOYED_KEY from open
+    positions in the DB so the heat circuit breaker stays accurate across restarts.
+    """
+    try:
+        from sqlalchemy import select, func
+        from app.database import AsyncSessionLocal
+        from app.models.trades import Trade, TradeStatus, TradeMode
+        from app.core.risk.gate import record_deployed
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(func.sum(Trade.entry_price * Trade.quantity)).where(
+                    Trade.status == TradeStatus.OPEN,
+                    Trade.mode   == TradeMode.PAPER,
+                )
+            )
+            deployed = result.scalar() or 0.0
+        if deployed > 0:
+            record_deployed(float(deployed))
+            logger.info(f"Portfolio heat synced from DB: ₹{deployed:,.0f} deployed across open trades")
+    except Exception as exc:
+        logger.warning(f"Could not sync portfolio heat from DB: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting AlphaFO v{settings.app_version} — mode: {settings.app_mode}")
@@ -48,9 +99,13 @@ async def lifespan(app: FastAPI):
     ensure_stream_groups()
     ticker_service.start()
 
-    # Reset daily risk counters
+    # Reset daily risk counters, then re-sync heat from open DB positions
     from app.core.risk.gate import reset_daily_pnl
     reset_daily_pnl()
+    await _sync_portfolio_heat_from_db()
+
+    # Subscribe option tokens for any already-open paper trades
+    await _subscribe_open_trade_tokens()
 
     yield
     ticker_service.stop()
@@ -81,7 +136,10 @@ app.include_router(data.router, prefix="/api/v1/data", tags=["Market Data"])
 app.include_router(settings_router.router, prefix="/api/v1/settings", tags=["Settings"])
 app.include_router(chat.router,           prefix="/api/v1/chat",    tags=["Chat"])
 app.include_router(options_router.router,     prefix="/api/v1/options",     tags=["Options"])
-app.include_router(instruments_router.router, prefix="/api/v1/instruments", tags=["Instruments"])
+app.include_router(instruments_router.router,   prefix="/api/v1/instruments",     tags=["Instruments"])
+app.include_router(pattern_finder_router.router, prefix="/api/v1/pattern-finder", tags=["PatternFinder"])
+app.include_router(dashboard_router.router,      prefix="/api/v1/dashboard",      tags=["Dashboard"])
+app.include_router(system_router.router,         prefix="/api/v1/system",         tags=["System"])
 app.include_router(ws_router)
 
 

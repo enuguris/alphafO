@@ -1,6 +1,6 @@
 """Pattern: Expiry Week Theta Acceleration — sell OTM options."""
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from app.core.patterns.base import AbstractPattern, PatternSignal
 
 
@@ -18,26 +18,49 @@ class ExpiryWeekPattern(AbstractPattern):
         if options_chain is None or options_chain.empty:
             return signals
 
-        # Check if we are Mon/Tue of expiry week
-        today = datetime.utcnow()
-        if today.weekday() not in (0, 1):   # 0=Mon, 1=Tue
+        # Check if we are within 2 days BEFORE this underlying's expiry weekday (IST)
+        from datetime import timezone, timedelta as _td
+        from app.core.options.expiry import _expiry_weekday
+        ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+        exp_wd = _expiry_weekday(underlying)   # 1=Tue for NSE, 3=Thu for BSE/SENSEX
+        today_wd = ist_now.weekday()
+        # Fire on expiry day itself AND the trading day before
+        # For Tuesday expiry: fire Mon + Tue
+        # For Thursday expiry (SENSEX): fire Wed + Thu
+        # Clamp to weekdays only (no Sunday = 6)
+        prev_wd = (exp_wd - 1) % 7
+        if prev_wd == 6:   # skip Sunday
+            prev_wd = (exp_wd - 2) % 7
+        fire_days = {prev_wd, exp_wd}
+        if today_wd not in fire_days:
             return signals
 
-        current_price = ohlcv["close"].iloc[-1]
+        # Use chain ATM as anchor (chain is built from live spot, not OHLCV close)
         chain = options_chain.copy()
+        if chain.empty:
+            return signals
+        from app.core.options.strike_selector import STRIKE_STEPS, DEFAULT_STRIKE_STEP
+        step = STRIKE_STEPS.get(underlying.upper(), DEFAULT_STRIKE_STEP)
+        # Infer spot from chain mid-strike
+        chain_mid_idx = len(chain) // 2
+        current_price = float(chain.iloc[chain_mid_idx]["strike"])
 
-        # Find OTM call and put ~2% away
         otm_pct = 0.02
-        call_strike = round(current_price * (1 + otm_pct) / 50) * 50
-        put_strike = round(current_price * (1 - otm_pct) / 50) * 50
+        call_strike = round(current_price * (1 + otm_pct) / step) * step
+        put_strike = round(current_price * (1 - otm_pct) / step) * step
 
-        ce_row = chain[chain["strike"] == call_strike]
-        pe_row = chain[chain["strike"] == put_strike]
-        if ce_row.empty or pe_row.empty:
+        # Find closest available strikes if exact ones are missing
+        def closest_strike(target):
+            row = chain.iloc[(chain["strike"] - target).abs().argsort()[:1]]
+            return row.iloc[0] if not row.empty else None
+
+        ce_data = closest_strike(call_strike)
+        pe_data = closest_strike(put_strike)
+        if ce_data is None or pe_data is None:
             return signals
 
-        ce_premium = ce_row.iloc[0].get("ce_ltp", 0) or 0
-        pe_premium = pe_row.iloc[0].get("pe_ltp", 0) or 0
+        ce_premium = float(ce_data.get("ce_ltp", 0) or 0)
+        pe_premium = float(pe_data.get("pe_ltp", 0) or 0)
         total_premium = ce_premium + pe_premium
 
         if total_premium < 10:  # too little premium
@@ -72,11 +95,9 @@ class ExpiryWeekPattern(AbstractPattern):
 
     def _explain(self, underlying, cs, ps, ce, pe, total):
         return (
-            f"Expiry Week Theta Play — Selling {underlying} OTM strangle: "
-            f"{int(cs)} CE @ ₹{ce:.0f} + {int(ps)} PE @ ₹{pe:.0f} = ₹{total:.0f} total premium. "
-            f"Theta decay accelerates exponentially in the final 5 days — options lose 3–5x more per day "
-            f"vs. earlier in the week. Both strikes are ~2% OTM, giving 80%+ probability of expiring worthless. "
-            f"Target: collect 60% of premium. Exit immediately if spot breaches either short strike."
+            f"Expiry week: sell {underlying} {int(cs)} CE (₹{ce:.0f}) + {int(ps)} PE (₹{pe:.0f}) = ₹{total:.0f} collected. "
+            f"Both strikes are ~2% away — 80%+ chance they expire worthless. "
+            f"Time decay is 3–5x faster this week than earlier in the month. Exit if spot breaches either strike."
         )
 
     def why_it_works(self) -> str:

@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { api } from '../api/client'
+import { fetchAnthropicKeyStatus, saveAnthropicKey, deleteAnthropicKey } from '../api/client'
 import { useModeStore } from '../store/modeStore'
-import { useThemeStore } from '../store/themeStore'
+import { useThemeStore, THEMES } from '../store/themeStore'
 
 const RISK_PARAMS = [
   ['Max Risk Per Trade',   '1%',    'Capped at 1% of capital per position'],
@@ -26,7 +27,7 @@ interface TestResult { passed: boolean; summary: string; results: TestCheck[] }
 
 export default function Settings() {
   const { mode, setMode } = useModeStore()
-  const { theme, toggle } = useThemeStore()
+  const { theme, setTheme } = useThemeStore()
 
   // Kite state
   const [apiKey,       setApiKey]       = useState('')
@@ -44,6 +45,12 @@ export default function Settings() {
     api_key: string; has_secret: boolean; token_valid: boolean; token_date: string | null
   } | null>(null)
 
+  // Anthropic key state
+  const [anthropicKey,        setAnthropicKey]        = useState('')
+  const [anthropicHasKey,     setAnthropicHasKey]     = useState(false)
+  const [anthropicSaving,     setAnthropicSaving]     = useState(false)
+  const [anthropicStatus,     setAnthropicStatus]     = useState<Status>(null)
+
   useEffect(() => {
     api.get('/settings/kite-credentials')
       .then(r => {
@@ -51,7 +58,36 @@ export default function Settings() {
         if (r.data.api_key) setApiKey(r.data.api_key)
       })
       .catch(() => {})
+    fetchAnthropicKeyStatus()
+      .then(r => setAnthropicHasKey(r.has_key))
+      .catch(() => {})
   }, [])
+
+  const saveAnthropicKeyHandler = async () => {
+    if (!anthropicKey) return
+    setAnthropicSaving(true); setAnthropicStatus(null)
+    try {
+      await saveAnthropicKey(anthropicKey)
+      setAnthropicHasKey(true)
+      setAnthropicKey('')
+      setAnthropicStatus({ text: 'API key saved and encrypted in the database.', ok: true })
+    } catch (e: any) {
+      setAnthropicStatus({ text: e?.response?.data?.detail ?? 'Failed to save key.', ok: false })
+    } finally {
+      setAnthropicSaving(false)
+    }
+  }
+
+  const removeAnthropicKeyHandler = async () => {
+    if (!window.confirm('Remove the stored Anthropic API key?')) return
+    try {
+      await deleteAnthropicKey()
+      setAnthropicHasKey(false)
+      setAnthropicStatus({ text: 'API key removed.', ok: true })
+    } catch {
+      setAnthropicStatus({ text: 'Failed to remove key.', ok: false })
+    }
+  }
 
   const saveCreds = async () => {
     if (!apiKey || !apiSecret) return
@@ -117,21 +153,27 @@ export default function Settings() {
 
         {/* ── Appearance ── */}
         <section style={{ marginBottom: 20 }}>
-          <div className="section-title">Appearance</div>
+          <div className="section-title">Appearance — Theme</div>
           <div className="form-section">
             <div className="form-section-body">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div>
-                  <div style={{ fontWeight: 600, color: 'var(--txt)', marginBottom: 3 }}>
-                    {theme === 'dark' ? 'Dark Mode' : 'Light Mode'}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8 }}>
+                {THEMES.map(t => (
+                  <div
+                    key={t.id}
+                    className={`theme-card${theme === t.id ? ' active' : ''}`}
+                    onClick={() => setTheme(t.id)}
+                  >
+                    <div
+                      className="swatch"
+                      style={{
+                        background: `linear-gradient(135deg, ${t.bg} 50%, ${t.bg2} 50%)`,
+                        border: `2px solid ${t.accent}`,
+                      }}
+                    />
+                    <div className="t-name">{t.name}</div>
+                    <div className="t-desc">{t.desc}</div>
                   </div>
-                  <div style={{ fontSize: 11, color: 'var(--txt2)' }}>
-                    {theme === 'dark' ? 'TradingView dark terminal' : 'Screener.in light style'}
-                  </div>
-                </div>
-                <button onClick={toggle} className="tv-btn tv-btn-ghost" style={{ minWidth: 120, justifyContent: 'center' }}>
-                  {theme === 'dark' ? '☀ Light Mode' : '🌙 Dark Mode'}
-                </button>
+                ))}
               </div>
             </div>
           </div>
@@ -242,7 +284,7 @@ export default function Settings() {
                   disabled={generatingToken || !requestToken || !savedInfo?.has_secret}
                   className="tv-btn tv-btn-primary"
                 >
-                  {generatingToken ? 'Generating…' : 'Generate Token'}
+                  {generatingToken ? 'Saving Access Token…' : 'Save Request Token'}
                 </button>
               </div>
               {tokenStatus && (
@@ -343,15 +385,64 @@ export default function Settings() {
         <section style={{ marginBottom: 20 }}>
           <div className="section-title">AI Chat (Claude)</div>
           <div className="form-section">
-            <div className="form-section-body" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <p style={{ fontSize: 11, color: 'var(--txt2)', margin: 0 }}>
-                Powers the <strong style={{ color: 'var(--blue)' }}>✦ AI Chat</strong> panel. Add your key to <code style={{ fontFamily: 'monospace' }}>.env</code> and restart backend.
-              </p>
-              <div style={{ background: 'var(--bg3)', borderRadius: 4, padding: '10px 12px', fontFamily: 'monospace', fontSize: 12, color: 'var(--up)', border: '1px solid var(--border2)' }}>
-                ANTHROPIC_API_KEY=sk-ant-api03-...
+            <div className="form-section-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div>
+                  <div style={{ fontWeight: 600, color: 'var(--txt)', marginBottom: 3 }}>Anthropic API Key</div>
+                  <div style={{ fontSize: 11, color: 'var(--txt2)' }}>
+                    Powers the <strong style={{ color: 'var(--blue)' }}>✦ AI Chat</strong> panel.
+                    Stored <strong style={{ color: 'var(--txt)' }}>encrypted</strong> in the database — never in plain text.
+                  </div>
+                </div>
+                {anthropicHasKey && (
+                  <span className="badge badge-up">✓ Key saved</span>
+                )}
               </div>
+
+              <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                    API Key {anthropicHasKey && <span style={{ color: 'var(--up)' }}>(already saved — paste new to rotate)</span>}
+                  </div>
+                  <input
+                    type="password"
+                    className="tv-input mono"
+                    placeholder={anthropicHasKey ? '••••••••••••• (paste new key to rotate)' : 'sk-ant-api03-…'}
+                    value={anthropicKey}
+                    onChange={e => setAnthropicKey(e.target.value)}
+                  />
+                </div>
+                <button
+                  onClick={saveAnthropicKeyHandler}
+                  disabled={anthropicSaving || !anthropicKey}
+                  className="tv-btn tv-btn-primary"
+                >
+                  {anthropicSaving ? 'Saving…' : anthropicHasKey ? 'Rotate Key' : 'Save Key'}
+                </button>
+                {anthropicHasKey && (
+                  <button
+                    onClick={removeAnthropicKeyHandler}
+                    className="tv-btn"
+                    style={{ color: 'var(--dn)', border: '1px solid rgba(239,83,80,0.35)' }}
+                  >
+                    Remove
+                  </button>
+                )}
+              </div>
+
+              {anthropicStatus && (
+                <div style={{ fontSize: 11, padding: '7px 10px', borderRadius: 4,
+                  color: anthropicStatus.ok ? 'var(--up)' : 'var(--dn)',
+                  background: anthropicStatus.ok ? 'rgba(38,166,154,0.08)' : 'rgba(239,83,80,0.08)',
+                  border: `1px solid ${anthropicStatus.ok ? 'rgba(38,166,154,0.2)' : 'rgba(239,83,80,0.2)'}`,
+                }}>
+                  {anthropicStatus.text}
+                </div>
+              )}
+
               <div style={{ fontSize: 10, color: 'var(--txt3)' }}>
-                Get your key at <span style={{ color: 'var(--blue)' }}>console.anthropic.com</span> → API Keys. Model: claude-sonnet-4-6.
+                Get your key at <span style={{ color: 'var(--blue)' }}>console.anthropic.com</span> → API Keys.
+                Model: claude-haiku-4-5 (fast, cheap — ~₹0.08 per message).
               </div>
             </div>
           </div>

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from app.core.options.greeks import compute_greeks, RISK_FREE_RATE
+from app.core.options.greeks import compute_greeks, _bs_price, RISK_FREE_RATE
 
 
 STRIKE_STEPS = {
@@ -33,12 +33,18 @@ class ChainService:
         return self._synthetic_chain(underlying)
 
     def _synthetic_chain(self, underlying: str) -> pd.DataFrame:
-        """Generate a realistic synthetic options chain for testing."""
-        base_spots = {
-            "NIFTY": 24300, "BANKNIFTY": 52700, "FINNIFTY": 23400,
-            "MIDCPNIFTY": 12640, "HDFCBANK": 1840, "ICICIBANK": 1375,
-        }
-        spot = base_spots.get(underlying.upper(), 1500)
+        """Generate a realistic synthetic options chain centred on the live spot price."""
+        # Use live ticker snapshot so strikes are always near actual market price
+        spot = 0.0
+        try:
+            from app.core.data.kite_ticker import ticker_service
+            snap = ticker_service.get_snapshot()
+            spot = float(snap.get(underlying.upper(), {}).get("ltp", 0))
+        except Exception:
+            pass
+        if not spot or spot < 10:
+            from app.core.instruments import BASE_PRICES
+            spot = BASE_PRICES.get(underlying.upper(), 1500)
         step = STRIKE_STEPS.get(underlying.upper(), DEFAULT_STEP)
 
         rng = np.random.default_rng(abs(hash(underlying)) % (2**31))
@@ -68,8 +74,8 @@ class ChainService:
             try:
                 g_ce = compute_greeks(spot, k, T, iv_smile, "CE", RISK_FREE_RATE)
                 g_pe = compute_greeks(spot, k, T, iv_smile, "PE", RISK_FREE_RATE)
-                ce_ltp = max(0.05, g_ce.iv * spot * 0.1 * (1 + rng.uniform(-0.05, 0.05)))
-                pe_ltp = max(0.05, g_pe.iv * spot * 0.1 * (1 + rng.uniform(-0.05, 0.05)))
+                ce_ltp = max(0.05, _bs_price(spot, k, T, RISK_FREE_RATE, iv_smile, "CE") * (1 + rng.uniform(-0.02, 0.02)))
+                pe_ltp = max(0.05, _bs_price(spot, k, T, RISK_FREE_RATE, iv_smile, "PE") * (1 + rng.uniform(-0.02, 0.02)))
                 ce_delta = round(g_ce.delta, 4)
                 pe_delta = round(g_pe.delta, 4)
             except Exception:
@@ -92,8 +98,73 @@ class ChainService:
         return pd.DataFrame(rows)
 
     def _from_kite(self, underlying: str, kite_adapter) -> pd.DataFrame:
-        """Fetch live chain from Kite (stub — real implementation would call NSE API)."""
-        raise NotImplementedError("Live chain fetching not yet implemented")
+        """Fetch live options chain from Kite quote API using ATM±10 strikes."""
+        from app.core.options.expiry import available_expiries
+        from app.core.data.kite_ticker import ticker_service
+
+        snap = ticker_service.get_snapshot()
+        spot = float(snap.get(underlying.upper(), {}).get("ltp", 0))
+        if not spot or spot < 10:
+            raise ValueError(f"No live spot for {underlying}")
+
+        step = STRIKE_STEPS.get(underlying.upper(), DEFAULT_STEP)
+        atm = round(spot / step) * step
+        expiries = available_expiries(underlying)
+        if not expiries:
+            raise ValueError("No expiries available")
+
+        expiry_short = expiries[0]["short"]  # e.g. "02JUL26"
+        sym = underlying.upper()
+
+        strikes = [atm + (i - 10) * step for i in range(21)]
+        kite_syms = []
+        for k in strikes:
+            kite_syms.append(f"NFO:{sym}{expiry_short}{int(k)}CE")
+            kite_syms.append(f"NFO:{sym}{expiry_short}{int(k)}PE")
+
+        kite = kite_adapter._get_kite()
+        quotes = kite.quote(kite_syms)
+
+        rows = []
+        for k in strikes:
+            ce_key = f"NFO:{sym}{expiry_short}{int(k)}CE"
+            pe_key = f"NFO:{sym}{expiry_short}{int(k)}PE"
+            ce = quotes.get(ce_key, {})
+            pe = quotes.get(pe_key, {})
+
+            ce_iv_raw = ce.get("implied_volatility") or ce.get("iv", 0)
+            pe_iv_raw = pe.get("implied_volatility") or pe.get("iv", 0)
+            # Kite returns IV as percentage (e.g. 18.5), convert to fraction
+            ce_iv = (ce_iv_raw / 100) if ce_iv_raw > 2 else ce_iv_raw
+            pe_iv = (pe_iv_raw / 100) if pe_iv_raw > 2 else pe_iv_raw
+
+            try:
+                from app.core.options.greeks import compute_greeks, RISK_FREE_RATE
+                dte = expiries[0]["dte"]
+                T = max(dte, 1) / 365.0
+                g_ce = compute_greeks(spot, k, T, ce_iv or 0.18, "CE", RISK_FREE_RATE) if ce_iv else None
+                g_pe = compute_greeks(spot, k, T, pe_iv or 0.18, "PE", RISK_FREE_RATE) if pe_iv else None
+                ce_delta = round(g_ce.delta, 4) if g_ce else 0.5
+                pe_delta = round(g_pe.delta, 4) if g_pe else -0.5
+            except Exception:
+                ce_delta, pe_delta = 0.5, -0.5
+
+            rows.append({
+                "strike":   k,
+                "ce_oi":    ce.get("oi", 0) or 0,
+                "pe_oi":    pe.get("oi", 0) or 0,
+                "ce_iv":    round(ce_iv, 4) if ce_iv else 0.0,
+                "pe_iv":    round(pe_iv, 4) if pe_iv else 0.0,
+                "ce_ltp":   ce.get("last_price", 0) or 0,
+                "pe_ltp":   pe.get("last_price", 0) or 0,
+                "ce_delta": ce_delta,
+                "pe_delta": pe_delta,
+            })
+
+        df = pd.DataFrame(rows)
+        if df.empty or df["ce_oi"].sum() == 0:
+            raise ValueError("Empty chain from Kite (symbol format mismatch?)")
+        return df
 
     def get_iv_history(self, underlying: str) -> list:
         """Return 30 days of synthetic IV history (12-28%)."""

@@ -30,8 +30,16 @@ class MaxPainPattern(AbstractPattern):
         atr = self._atr(ohlcv)
         direction = "short" if deviation_pct > 0 else "long"
         entry = current_price
-        target = max_pain_strike
         stop_dist = 0.8 * atr
+
+        # Max pain is a gravitational pull — cap expected move at 5% to stay realistic
+        # Never target more than 5% away; if max_pain is further, use 50% of the gap
+        raw_gap_pct = abs(deviation_pct)
+        if raw_gap_pct > 5.0:
+            move_pct = min(raw_gap_pct * 0.5, 5.0)
+            target = (entry * (1 - move_pct / 100)) if direction == "short" else (entry * (1 + move_pct / 100))
+        else:
+            target = max_pain_strike
 
         if direction == "long":
             stop = entry - stop_dist
@@ -39,14 +47,16 @@ class MaxPainPattern(AbstractPattern):
             stop = entry + stop_dist
 
         exp_return = abs(target - entry) / entry * 100
+        # Confidence: starts at 0.55, scales with deviation up to 0.80 max (never 1.0)
+        raw_conf = min(0.80, 0.55 + abs(deviation_pct) / 20)
 
         signals.append(PatternSignal(
             pattern_name=self.name, pattern_version=self.version,
             symbol=underlying, underlying=underlying,
-            instrument=f"{underlying}_FUT",
-            direction=direction, entry_price=entry, target_price=target, stop_loss=stop,
+            instrument=underlying,
+            direction=direction, entry_price=entry, target_price=round(target, 2), stop_loss=stop,
             expected_return_pct=round(exp_return, 2),
-            confidence_score=self._regime_adj(min(1.0, 0.55 + abs(deviation_pct) / 10), context),
+            confidence_score=self._regime_adj(raw_conf, context),
             explanation=self._explain(underlying, current_price, max_pain_strike, deviation_pct, direction),
             trading_style="intraday",
             metadata={"max_pain_strike": max_pain_strike, "deviation_pct": round(deviation_pct, 2)},
@@ -89,13 +99,12 @@ class MaxPainPattern(AbstractPattern):
         return tr.rolling(period).mean().iloc[-1]
 
     def _explain(self, underlying, price, mp, dev, direction):
+        action = "Sell" if direction == "short" else "Buy"
+        side = "above" if dev > 0 else "below"
         return (
-            f"Max Pain Gravity — {underlying} is trading at {price:.0f}, which is {abs(dev):.1f}% "
-            f"{'above' if dev > 0 else 'below'} the Max Pain strike of {mp:.0f}. "
-            f"In expiry week, option writers (who have short gamma positions) delta-hedge in a way that "
-            f"naturally pulls price toward Max Pain. With {abs(dev):.1f}% gap to cover, a {direction} "
-            f"trade targeting the max pain level has a strong structural tailwind. "
-            f"This effect is strongest in the 48–72 hours before expiry."
+            f"{underlying} at ₹{price:.0f} is {abs(dev):.1f}% {side} Max Pain (₹{mp:.0f}). "
+            f"Option writers delta-hedge in a way that pulls price toward Max Pain near expiry. "
+            f"{action} — target Max Pain level. Works best in the 48–72 hours before expiry."
         )
 
     def why_it_works(self) -> str:

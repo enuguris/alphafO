@@ -10,7 +10,7 @@ class IVCrushPattern(AbstractPattern):
     description = "Sell options straddle before known events to capture IV crush"
     min_data_rows = 10
 
-    IV_ELEVATION_THRESHOLD = 1.3   # IV must be 30% above 20-day average
+    IV_ELEVATION_THRESHOLD = 1.15  # IV must be 15% above 20-day average
     DAYS_BEFORE_EVENT = 5
 
     def detect(self, ohlcv: pd.DataFrame, options_chain: pd.DataFrame | None = None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
@@ -27,9 +27,9 @@ class IVCrushPattern(AbstractPattern):
         if iv_ratio < self.IV_ELEVATION_THRESHOLD:
             return signals
 
-        # Use ATM strike for straddle
-        current_price = ohlcv["close"].iloc[-1]
+        # Use chain ATM (chain is anchored on live spot, not OHLCV close which may have drifted)
         chain = options_chain.copy()
+        current_price = ohlcv["close"].iloc[-1]
         chain["dist"] = (chain["strike"] - current_price).abs()
         atm = chain.nsmallest(1, "dist").iloc[0]
         atm_strike = atm["strike"]
@@ -53,7 +53,7 @@ class IVCrushPattern(AbstractPattern):
             target_price=target_premium,
             stop_loss=total_premium * 1.5,   # exit if premium doubles
             expected_return_pct=round((total_premium - target_premium) / current_price * 100, 2),
-            confidence_score=self._regime_adj(min(1.0, 0.5 + (iv_ratio - 1.3) * 0.5), context),
+            confidence_score=self._regime_adj(min(1.0, 0.6 + (iv_ratio - 1.15) * 0.4), context),
             explanation=self._explain(underlying, current_iv, avg_iv, iv_ratio, atm_strike, total_premium, breakeven_up, breakeven_down),
             trading_style="positional",
             metadata={"iv_ratio": round(iv_ratio, 2), "atm_strike": atm_strike, "total_premium": total_premium},
@@ -75,11 +75,10 @@ class IVCrushPattern(AbstractPattern):
 
     def _explain(self, underlying, curr_iv, avg_iv, ratio, strike, premium, be_up, be_dn):
         return (
-            f"IV Crush Setup — {underlying} IV is {curr_iv:.1f}% vs 20-day avg of {avg_iv:.1f}% ({ratio:.1f}x elevated). "
-            f"Selling ATM straddle at strike {strike:.0f} collects ₹{premium:.0f} total premium. "
-            f"Breakeven range: {be_dn:.0f} – {be_up:.0f}. "
-            f"After the event, IV typically collapses 30–50% regardless of direction. "
-            f"Target: collect 45% of premium as IV decays. Exit if premium exceeds 1.5x entry (risk control)."
+            f"{underlying} IV is {curr_iv:.1f}% — {ratio:.1f}x its normal level of {avg_iv:.1f}%. "
+            f"Sell ATM straddle at ₹{strike:.0f}, collecting ₹{premium:.0f} premium. "
+            f"Profit as long as {underlying} stays between ₹{be_dn:.0f}–₹{be_up:.0f} after the event. "
+            f"IV typically crashes 30–50% once the uncertainty resolves, regardless of which way price moves."
         )
 
     def why_it_works(self) -> str:

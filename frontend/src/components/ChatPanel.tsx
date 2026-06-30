@@ -30,8 +30,9 @@ export default function ChatPanel({ open, onClose }: { open: boolean; onClose: (
     try {
       const res = await api.post('/chat/', { messages: next })
       setMsgs(m => [...m, { role: 'assistant', content: res.data.content }])
-    } catch {
-      setMsgs(m => [...m, { role: 'assistant', content: 'Error reaching the server. Check your ANTHROPIC_API_KEY in .env.' }])
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail ?? e?.message ?? 'Unknown error'
+      setMsgs(m => [...m, { role: 'assistant', content: `Error: ${detail}` }])
     } finally {
       setLoading(false)
     }
@@ -40,7 +41,7 @@ export default function ChatPanel({ open, onClose }: { open: boolean; onClose: (
   if (!open) return null
 
   return (
-    <div className="flex flex-col border-l" style={{ width: 320, background: 'var(--bg2)', borderColor: 'var(--border)' }}>
+    <div className="flex flex-col border-l" style={{ width: 320, height: '100%', background: 'var(--bg2)', borderColor: 'var(--border)', flexShrink: 0 }}>
       {/* Header */}
       <div className="panel-hdr" style={{ justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -122,7 +123,7 @@ export default function ChatPanel({ open, onClose }: { open: boolean; onClose: (
 
       {/* Footer note */}
       <div style={{ padding: '5px 10px 8px', textAlign: 'center', fontSize: 10, color: 'var(--txt3)' }}>
-        Set ANTHROPIC_API_KEY in .env to enable
+        Set Anthropic API key in Settings → AI Chat
       </div>
     </div>
   )

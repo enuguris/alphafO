@@ -21,5 +21,6 @@ class Portfolio(Base):
     losing_trades: Mapped[int] = mapped_column(Integer, default=0)
     daily_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     weekly_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    total_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     last_updated: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

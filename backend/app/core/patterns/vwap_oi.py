@@ -15,11 +15,10 @@ class VWAPOIPattern(AbstractPattern):
             return signals
 
         df = ohlcv.copy()
-        # VWAP calculation
+        # Rolling 20-bar VWAP (more meaningful on daily data than cumulative from series start)
         df["tp"] = (df["high"] + df["low"] + df["close"]) / 3
-        df["cum_tpv"] = (df["tp"] * df["volume"]).cumsum()
-        df["cum_vol"] = df["volume"].cumsum()
-        df["vwap"] = df["cum_tpv"] / df["cum_vol"]
+        window = 20
+        df["vwap"] = (df["tp"] * df["volume"]).rolling(window).sum() / df["volume"].rolling(window).sum()
 
         prev = df.iloc[-2]
         curr = df.iloc[-1]
@@ -43,7 +42,7 @@ class VWAPOIPattern(AbstractPattern):
         signals.append(PatternSignal(
             pattern_name=self.name, pattern_version=self.version,
             symbol=underlying, underlying=underlying,
-            instrument=f"{underlying}_FUT",
+            instrument=underlying,
             direction="long", entry_price=entry, target_price=target, stop_loss=stop,
             expected_return_pct=round((target - entry) / entry * 100, 2),
             confidence_score=self._regime_adj(0.70, context),
@@ -70,10 +69,9 @@ class VWAPOIPattern(AbstractPattern):
 
     def _explain(self, underlying, price, vwap):
         return (
-            f"VWAP Reclaim — {underlying} has crossed back above VWAP at {vwap:.0f} (current: {price:.0f}). "
-            f"OI is rising, confirming new buying. VWAP is the institutional benchmark — "
-            f"once price reclaims it, algorithmic buyers who were waiting for a VWAP cross engage. "
-            f"Intraday target: previous session high. Stop: VWAP recrossed to the downside."
+            f"{underlying} (₹{price:.0f}) just crossed back above VWAP (₹{vwap:.0f}) with rising OI. "
+            f"Institutions use VWAP as their benchmark — a reclaim triggers algorithmic buy orders. "
+            f"Buy; stop if price falls back below VWAP."
         )
 
     def why_it_works(self) -> str:

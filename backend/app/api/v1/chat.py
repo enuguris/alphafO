@@ -1,7 +1,10 @@
 """AI Chat endpoint — proxies to Claude."""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
+from app.database import get_db
 
 router = APIRouter()
 
@@ -27,26 +30,39 @@ class ChatRequest(BaseModel):
     messages: list[Message]
 
 
+async def _resolve_api_key(db: AsyncSession) -> str | None:
+    """DB-stored key takes priority over .env so the UI setting wins."""
+    try:
+        from sqlalchemy import select
+        from app.models.kite_config import KiteConfig
+        from app.core.encryption import decrypt
+        result = await db.execute(select(KiteConfig).where(KiteConfig.id == 1))
+        cfg = result.scalar_one_or_none()
+        if cfg and cfg.anthropic_api_key_enc:
+            return decrypt(cfg.anthropic_api_key_enc)
+    except Exception:
+        pass
+    return settings.anthropic_api_key or None
+
+
 @router.post("/")
-async def chat(req: ChatRequest):
-    if not settings.anthropic_api_key:
-        # Return a helpful fallback when no API key is set
+async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
+    api_key = await _resolve_api_key(db)
+    if not api_key:
         return {
             "role": "assistant",
             "content": (
-                "The Anthropic API key is not configured. To enable AI chat:\n\n"
-                "1. Add `ANTHROPIC_API_KEY=your-key` to your `.env` file\n"
-                "2. Restart the backend container\n\n"
-                "Until then, I can still help you understand the dashboard — "
-                "what would you like to know about AlphaFO's patterns or signals?"
+                "No Anthropic API key configured.\n\n"
+                "Go to **Settings → AI Chat** and paste your key (from console.anthropic.com). "
+                "It will be stored encrypted in the database."
             ),
         }
 
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=[{"role": m.role, "content": m.content} for m in req.messages],

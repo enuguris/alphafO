@@ -9,7 +9,7 @@ class OIBuildupPattern(AbstractPattern):
     description = "Price breakout confirmed by significant OI increase — new money entering"
     min_data_rows = 30
 
-    OI_INCREASE_THRESHOLD = 0.15   # 15% OI increase in one session
+    OI_INCREASE_THRESHOLD = 0.03   # 3% OI increase confirms new money (realistic for index futures)
     BREAKOUT_LOOKBACK = 20         # periods for support/resistance calculation
 
     def detect(self, ohlcv: pd.DataFrame, options_chain=None, underlying: str = "", context: dict = {}) -> list[PatternSignal]:
@@ -43,7 +43,7 @@ class OIBuildupPattern(AbstractPattern):
             signals.append(PatternSignal(
                 pattern_name=self.name, pattern_version=self.version,
                 symbol=underlying, underlying=underlying,
-                instrument=f"{underlying}_FUT",
+                instrument=underlying,
                 direction="long", entry_price=entry, target_price=target, stop_loss=stop,
                 expected_return_pct=round((target - entry) / entry * 100, 2),
                 confidence_score=self._regime_adj(min(1.0, 0.6 + oi_chg_pct), context),
@@ -59,7 +59,7 @@ class OIBuildupPattern(AbstractPattern):
             signals.append(PatternSignal(
                 pattern_name=self.name, pattern_version=self.version,
                 symbol=underlying, underlying=underlying,
-                instrument=f"{underlying}_FUT",
+                instrument=underlying,
                 direction="short", entry_price=entry, target_price=target, stop_loss=stop,
                 expected_return_pct=round((entry - target) / entry * 100, 2),
                 confidence_score=self._regime_adj(min(1.0, 0.6 + oi_chg_pct), context),
@@ -88,15 +88,12 @@ class OIBuildupPattern(AbstractPattern):
     def _explain(self, underlying, direction, level, oi_chg_pct):
         if direction == "bullish":
             return (
-                f"OI Buildup Breakout — {underlying} has closed above the {self.BREAKOUT_LOOKBACK}-day resistance "
-                f"of {level:.0f} with OI rising {oi_chg_pct*100:.1f}%. This confirms new long positions entering, "
-                f"not just short covering. Breakouts on rising OI have historically sustained 3–5% before reverting. "
-                f"Broken resistance acts as new support. Stop just below that level."
+                f"{underlying} broke above ₹{level:.0f} resistance with open interest rising {oi_chg_pct*100:.1f}% — "
+                f"new buyers entering, not just short-covering. Buy the breakout; stop just below ₹{level:.0f}."
             )
         return (
-            f"OI Buildup Breakdown — {underlying} has closed below the {self.BREAKOUT_LOOKBACK}-day support "
-            f"of {level:.0f} with OI rising {oi_chg_pct*100:.1f}%. New short positions are entering with conviction. "
-            f"Breakdowns on rising OI tend to follow through 3–5%. Broken support acts as new resistance."
+            f"{underlying} broke below ₹{level:.0f} support with open interest rising {oi_chg_pct*100:.1f}% — "
+            f"fresh short positions building with conviction. Sell the breakdown; stop just above ₹{level:.0f}."
         )
 
     def why_it_works(self) -> str:

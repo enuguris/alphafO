@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchBacktests, runBacktest } from '../api/client'
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, ComposedChart } from 'recharts'
 
 const PATTERNS = [
   { key: 'gap_fill',       label: 'Gap Fill',       color: '#7b61ff' },
@@ -29,17 +29,53 @@ const fmtINR = (n?: number | null) =>
 const fmtPct = (n?: number | null) =>
   n == null ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
 
+function autoName(underlying: string, patterns: string[]) {
+  const pStr = patterns.length === PATTERNS.length ? 'all_patterns'
+    : patterns.length === 1 ? patterns[0]
+    : patterns.length <= 3 ? patterns.join('+')
+    : `${patterns.length}_patterns`
+  return `${underlying}_${pStr}`
+}
+
 export default function Backtest() {
   const qc = useQueryClient()
   const [group, setGroup] = useState('Indices')
   const [form, setForm] = useState({
     underlying: 'NIFTY',
-    start_date: '2023-01-01',
-    end_date:   '2024-01-01',
+    start_date: '2025-01-01',
+    end_date:   '2025-12-31',
     patterns:   PATTERNS.map(p => p.key),
-    name:       'My Backtest',
+    name:       autoName('NIFTY', PATTERNS.map(p => p.key)),
   })
   const [selected, setSelected] = useState<any>(null)
+
+  // Parse trades from report_json for the selected run
+  const trades: any[] = useMemo(() => {
+    if (!selected?.report_json) return []
+    try {
+      const r = JSON.parse(selected.report_json)
+      return r.trades ?? []
+    } catch { return [] }
+  }, [selected])
+
+  // Compute pattern breakdown from trades
+  const patternBreakdown = useMemo(() => {
+    if (!trades.length) return null
+    const byPattern: Record<string, { trades: number; wins: number; total_return: number }> = {}
+    for (const t of trades) {
+      const p = t.pattern ?? 'unknown'
+      if (!byPattern[p]) byPattern[p] = { trades: 0, wins: 0, total_return: 0 }
+      byPattern[p].trades++
+      if (t.return_pct >= 0) byPattern[p].wins++
+      byPattern[p].total_return += t.return_pct ?? 0
+    }
+    return Object.fromEntries(Object.entries(byPattern).map(([k, v]) => [k, {
+      trades: v.trades,
+      win_rate: v.wins / v.trades,
+      avg_return: v.total_return / v.trades,
+      net_pnl: v.total_return, // approximate, not real ₹ P&L
+    }]))
+  }, [trades])
 
   const { data } = useQuery({ queryKey: ['backtests'], queryFn: fetchBacktests })
   const mutation = useMutation({
@@ -47,16 +83,17 @@ export default function Backtest() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['backtests'] }),
   })
 
+  const setUnderlying = (u: string) =>
+    setForm(f => ({ ...f, underlying: u, name: autoName(u, f.patterns) }))
+
   const togglePattern = (k: string) =>
-    setForm(f => ({
-      ...f,
-      patterns: f.patterns.includes(k) ? f.patterns.filter(x => x !== k) : [...f.patterns, k],
-    }))
+    setForm(f => {
+      const next = f.patterns.includes(k) ? f.patterns.filter(x => x !== k) : [...f.patterns, k]
+      return { ...f, patterns: next, name: autoName(f.underlying, next) }
+    })
 
   const results: any[] = data?.results ?? []
   const currentGroup   = GROUPS.find(g => g.label === group)
-
-  const equityCurve = selected?.equity_curve?.map((v: number, i: number) => ({ i, v })) ?? []
 
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
@@ -86,7 +123,7 @@ export default function Backtest() {
                 <button
                   key={g.label}
                   className="tv-btn"
-                  onClick={() => { setGroup(g.label); setForm(f => ({ ...f, underlying: g.items[0] })) }}
+                  onClick={() => { setGroup(g.label); setUnderlying(g.items[0]) }}
                   style={{
                     padding: '2px 8px', fontSize: 10,
                     background: group === g.label ? 'rgba(41,98,255,0.15)' : 'transparent',
@@ -102,7 +139,7 @@ export default function Backtest() {
               className="tv-select"
               style={{ width: '100%' }}
               value={form.underlying}
-              onChange={e => setForm(f => ({ ...f, underlying: e.target.value }))}
+              onChange={e => setUnderlying(e.target.value)}
             >
               {currentGroup?.items.map(sym => (
                 <option key={sym} value={sym}>{sym}</option>
@@ -134,9 +171,9 @@ export default function Backtest() {
               <div style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Patterns</div>
               <div style={{ display: 'flex', gap: 6 }}>
                 <button className="tv-btn tv-btn-ghost" style={{ padding: '2px 7px', fontSize: 10 }}
-                  onClick={() => setForm(f => ({ ...f, patterns: PATTERNS.map(p => p.key) }))}>All</button>
+                  onClick={() => setForm(f => { const p = PATTERNS.map(x => x.key); return { ...f, patterns: p, name: autoName(f.underlying, p) } })}>All</button>
                 <button className="tv-btn tv-btn-ghost" style={{ padding: '2px 7px', fontSize: 10 }}
-                  onClick={() => setForm(f => ({ ...f, patterns: [] }))}>None</button>
+                  onClick={() => setForm(f => ({ ...f, patterns: [], name: autoName(f.underlying, []) }))}>None</button>
               </div>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -198,7 +235,7 @@ export default function Backtest() {
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8 }}>
                 {[
                   { label: 'Total Return',  val: fmtPct(selected.total_return_pct),  color: (selected.total_return_pct ?? 0) >= 0 ? 'var(--up)' : 'var(--dn)' },
-                  { label: 'Win Rate',      val: `${((selected.win_rate ?? 0) * 100).toFixed(1)}%`, color: (selected.win_rate ?? 0) >= 0.55 ? 'var(--up)' : 'var(--orange)' },
+                  { label: 'Win Rate',      val: `${(selected.win_rate ?? 0).toFixed(1)}%`, color: (selected.win_rate ?? 0) >= 55 ? 'var(--up)' : 'var(--orange)' },
                   { label: 'Max Drawdown',  val: `${(selected.max_drawdown_pct ?? 0).toFixed(1)}%`,  color: 'var(--dn)' },
                   { label: 'Sharpe',        val: (selected.sharpe_ratio ?? 0).toFixed(2),             color: 'var(--txt)' },
                   { label: 'Total Trades',  val: String(selected.total_trades ?? 0),                  color: 'var(--txt)' },
@@ -210,25 +247,95 @@ export default function Backtest() {
                 ))}
               </div>
 
-              {/* Equity curve */}
-              {equityCurve.length > 1 && (
-                <div className="tv-card" style={{ padding: 14 }}>
-                  <div className="section-title">Equity Curve</div>
-                  <ResponsiveContainer width="100%" height={140}>
-                    <LineChart data={equityCurve} margin={{ top: 4, right: 0, bottom: 0, left: 0 }}>
-                      <XAxis dataKey="i" hide />
-                      <YAxis hide domain={['auto', 'auto']} />
-                      <ReferenceLine y={100} stroke="var(--border2)" strokeDasharray="3 3" />
-                      <Tooltip contentStyle={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11 }}
-                        formatter={(v: number) => [`${v.toFixed(1)}`, 'Index']} />
-                      <Line type="monotone" dataKey="v" stroke="var(--blue)" strokeWidth={1.5} dot={false} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
+              {/* Entry / Exit chart */}
+              {trades.length > 0 && (() => {
+                // Build cumulative P&L and trade markers
+                let cumPct = 0
+                const equity = trades.map((t, i) => {
+                  cumPct += t.return_pct ?? 0
+                  return { i, date: t.date, cum: parseFloat(cumPct.toFixed(2)) }
+                })
+
+                const PATTERN_COLORS_MAP: Record<string, string> = {
+                  gap_fill: '#7b61ff', pcr_divergence: '#2962ff', mean_reversion: '#00bcd4',
+                  oi_buildup: '#ff9800', vwap_oi: '#26a69a', iv_crush: '#e91e63',
+                  max_pain: '#ff5722', expiry_week: '#9c27b0',
+                }
+
+                return (
+                  <div className="tv-card" style={{ padding: 14 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                      <div className="section-title" style={{ margin: 0 }}>Cumulative P&L with Entry / Exit Points</div>
+                      <span style={{ fontSize: 10, color: 'var(--txt3)' }}>{trades.length} signals</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <ComposedChart data={equity} margin={{ top: 8, right: 0, bottom: 0, left: 0 }}>
+                        <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--txt3)' }} tickLine={false} interval="preserveStartEnd" />
+                        <YAxis tick={{ fontSize: 10, fill: 'var(--txt3)' }} tickLine={false} axisLine={false}
+                          tickFormatter={v => `${v > 0 ? '+' : ''}${v.toFixed(1)}%`} width={55} />
+                        <ReferenceLine y={0} stroke="var(--border2)" strokeDasharray="3 3" />
+                        <Tooltip
+                          contentStyle={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 4, fontSize: 11 }}
+                          formatter={(v: any, name: string) => name === 'cum' ? [`${v > 0 ? '+' : ''}${v}%`, 'Cumulative P&L'] : [v, name]}
+                        />
+                        <Line type="monotone" dataKey="cum" stroke="var(--blue)" strokeWidth={1.5} dot={false} />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+
+                    {/* Trade log with entry/exit */}
+                    <div style={{ marginTop: 12, maxHeight: 240, overflowY: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                        <thead>
+                          <tr style={{ borderBottom: '1px solid var(--border)', color: 'var(--txt3)' }}>
+                            {['Date', 'Pattern', 'Direction', 'Entry ₹', 'Exit ₹', 'Return', 'Conf'].map(h => (
+                              <th key={h} style={{ padding: '4px 8px', textAlign: 'left', fontWeight: 600 }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {trades.map((t: any, i: number) => {
+                            const isWin = t.return_pct >= 0
+                            const patColor = PATTERN_COLORS_MAP[t.pattern] ?? 'var(--txt3)'
+                            return (
+                              <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                                <td style={{ padding: '5px 8px', color: 'var(--txt2)', whiteSpace: 'nowrap' }}>{t.date}</td>
+                                <td style={{ padding: '5px 8px' }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                    <div style={{ width: 6, height: 6, borderRadius: 1, background: patColor, flexShrink: 0 }} />
+                                    <span style={{ color: 'var(--txt)', fontSize: 10 }}>{t.pattern?.replace(/_/g, ' ')}</span>
+                                  </div>
+                                </td>
+                                <td style={{ padding: '5px 8px' }}>
+                                  <span style={{
+                                    fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 2,
+                                    background: t.direction === 'long' ? 'rgba(38,166,154,0.12)' : 'rgba(239,83,80,0.12)',
+                                    color: t.direction === 'long' ? 'var(--up)' : 'var(--dn)',
+                                  }}>{t.direction?.toUpperCase()}</span>
+                                </td>
+                                <td style={{ padding: '5px 8px', fontFamily: 'monospace', color: 'var(--txt)' }}>
+                                  {t.entry_price?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                                </td>
+                                <td style={{ padding: '5px 8px', fontFamily: 'monospace', color: 'var(--txt)' }}>
+                                  {t.exit_price?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                                </td>
+                                <td style={{ padding: '5px 8px', fontFamily: 'monospace', fontWeight: 700, color: isWin ? 'var(--up)' : 'var(--dn)' }}>
+                                  {t.return_pct >= 0 ? '+' : ''}{t.return_pct?.toFixed(2)}%
+                                </td>
+                                <td style={{ padding: '5px 8px', color: 'var(--txt2)' }}>
+                                  {t.confidence != null ? `${Math.round(t.confidence * 100)}%` : '—'}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )
+              })()}
 
               {/* Pattern breakdown */}
-              {selected.pattern_breakdown && (
+              {patternBreakdown && (
                 <div className="tv-card" style={{ overflow: 'hidden' }}>
                   <div className="panel-hdr">Pattern Breakdown</div>
                   <table className="tv-table">
@@ -242,7 +349,7 @@ export default function Backtest() {
                       </tr>
                     </thead>
                     <tbody>
-                      {Object.entries(selected.pattern_breakdown).map(([key, v]: any) => (
+                      {Object.entries(patternBreakdown!).map(([key, v]: any) => (
                         <tr key={key}>
                           <td style={{ textAlign: 'left' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -310,8 +417,8 @@ export default function Backtest() {
                         <td className={`mono ${(r.total_return_pct ?? 0) >= 0 ? 'up' : 'dn'}`} style={{ fontWeight: 600 }}>
                           {fmtPct(r.total_return_pct)}
                         </td>
-                        <td className={`mono ${(r.win_rate ?? 0) >= 0.55 ? 'up' : 'dn'}`}>
-                          {r.win_rate != null ? `${(r.win_rate * 100).toFixed(1)}%` : '—'}
+                        <td className={`mono ${(r.win_rate ?? 0) >= 55 ? 'up' : 'dn'}`}>
+                          {r.win_rate != null ? `${r.win_rate.toFixed(1)}%` : '—'}
                         </td>
                         <td className="mono dn">{r.max_drawdown_pct != null ? `${r.max_drawdown_pct.toFixed(1)}%` : '—'}</td>
                         <td className="mono">{r.sharpe_ratio?.toFixed(2) ?? '—'}</td>

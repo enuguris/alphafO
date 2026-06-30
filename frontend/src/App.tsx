@@ -3,18 +3,28 @@ import { Routes, Route, NavLink } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Backtest from './pages/Backtest'
 import PaperTrading from './pages/PaperTrading'
+import Positions from './pages/Positions'
 import Options from './pages/Options'
 import Settings from './pages/Settings'
 import ChatPanel from './components/ChatPanel'
+import PatternFinder from './pages/PatternFinder'
+import Report from './pages/Report'
+import SystemHealth from './pages/SystemHealth'
+import Architecture from './pages/Architecture'
 import { useModeStore } from './store/modeStore'
-import { useThemeStore } from './store/themeStore'
+import { useThemeStore, THEMES } from './store/themeStore'
 
 const NAV = [
-  { to: '/',         label: 'Dashboard' },
-  { to: '/options',  label: 'Options' },
-  { to: '/paper',    label: 'Paper Trading' },
-  { to: '/backtest', label: 'Backtest' },
-  { to: '/settings', label: 'Settings' },
+  { to: '/',                label: 'Dashboard' },
+  { to: '/options',         label: 'Options' },
+  { to: '/positions',       label: 'Positions' },
+  { to: '/pattern-finder',  label: 'Pattern Finder' },
+  { to: '/report',          label: 'Report' },
+  { to: '/paper',           label: 'Paper Trading' },
+  { to: '/backtest',        label: 'Backtest' },
+  { to: '/settings',        label: 'Settings' },
+  { to: '/system',          label: 'System' },
+  { to: '/architecture',    label: 'Architecture' },
 ]
 
 const MODE_COLOR: Record<string, string> = {
@@ -27,7 +37,10 @@ export default function App() {
   const mode = useModeStore(s => s.mode)
   const { theme, toggle } = useThemeStore()
   const [chatOpen, setChatOpen] = useState(false)
-  const isDark = theme === 'dark'
+  const themeInfo = THEMES.find(t => t.id === theme) ?? THEMES[0]
+  const THEME_ICONS: Record<string, string> = {
+    dark: '🌑', midnight: '🌌', 'high-contrast': '⬛', solarized: '🌊', light: '☀'
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden', background: 'var(--bg)' }}>
@@ -93,14 +106,15 @@ export default function App() {
             {mode.toUpperCase()}
           </span>
 
-          {/* Dark/Light toggle */}
+          {/* Theme cycle button */}
           <button
             onClick={toggle}
             className="tv-btn tv-btn-ghost"
-            style={{ padding: '4px 8px', fontSize: 14, gap: 0 }}
-            title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+            style={{ padding: '4px 10px', fontSize: 11, gap: 4 }}
+            title={`Current: ${themeInfo.name} — click to cycle themes`}
           >
-            {isDark ? '☀' : '🌙'}
+            <span style={{ fontSize: 13 }}>{THEME_ICONS[theme]}</span>
+            <span>{themeInfo.name}</span>
           </button>
 
           {/* AI Chat toggle */}
@@ -123,11 +137,16 @@ export default function App() {
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         <div style={{ flex: 1, overflow: 'auto' }}>
           <Routes>
-            <Route path="/"         element={<Dashboard />} />
-            <Route path="/options"  element={<Options />} />
-            <Route path="/backtest" element={<Backtest />} />
-            <Route path="/paper"    element={<PaperTrading />} />
-            <Route path="/settings" element={<Settings />} />
+            <Route path="/"           element={<Dashboard />} />
+            <Route path="/options"    element={<Options />} />
+            <Route path="/positions"  element={<Positions />} />
+            <Route path="/pattern-finder" element={<PatternFinder />} />
+            <Route path="/backtest"   element={<Backtest />} />
+            <Route path="/report"     element={<Report />} />
+            <Route path="/paper"      element={<PaperTrading />} />
+            <Route path="/settings"   element={<Settings />} />
+            <Route path="/system"     element={<SystemHealth />} />
+            <Route path="/architecture" element={<Architecture />} />
           </Routes>
         </div>
         <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} />

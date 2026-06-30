@@ -47,11 +47,13 @@ class MeanReversionPattern(AbstractPattern):
 
         if oi_direction == "long":
             target = entry + 2 * current_width * entry
-            stop = midband
+            # Stop: midband only valid if it's below entry; else use ATM - 0.5×ATR
+            stop = midband if midband < entry else entry - 0.5 * atr
             direction = "long"
         elif oi_direction == "short":
             target = entry - 2 * current_width * entry
-            stop = midband
+            # Stop: midband only valid if it's above entry; else use ATM + 0.5×ATR
+            stop = midband if midband > entry else entry + 0.5 * atr
             direction = "short"
         else:
             return signals  # need OI confirmation for direction
@@ -61,7 +63,7 @@ class MeanReversionPattern(AbstractPattern):
         signals.append(PatternSignal(
             pattern_name=self.name, pattern_version=self.version,
             symbol=underlying, underlying=underlying,
-            instrument=f"{underlying}_FUT",
+            instrument=underlying,
             direction=direction, entry_price=entry, target_price=target, stop_loss=stop,
             expected_return_pct=round(exp_ret, 2),
             confidence_score=self._regime_adj(0.68, context),
@@ -91,12 +93,12 @@ class MeanReversionPattern(AbstractPattern):
         return tr.rolling(period).mean().iloc[-1]
 
     def _explain(self, underlying, width, threshold, direction):
+        action = "Buy" if direction == "long" else "Sell"
+        squeeze_pct = round(width / threshold * 100)
         return (
-            f"BB Squeeze Breakout — {underlying} Bollinger Band width ({width:.4f}) is in the bottom "
-            f"{self.SQUEEZE_PERCENTILE}th percentile of the last 30 days (threshold: {threshold:.4f}). "
-            f"This tight consolidation precedes a volatility expansion. OI confirms {direction} direction. "
-            f"Target: 2x the band width from entry. Stop: midband (SMA-20). "
-            f"Hold for 2–4 sessions as volatility expands."
+            f"{underlying} is in a volatility squeeze — price range has tightened to the narrowest {self.SQUEEZE_PERCENTILE}% "
+            f"of the past month. Open interest shows fresh {direction} positions being built. "
+            f"{action} the breakout; hold 2–4 sessions as the squeeze resolves."
         )
 
     def why_it_works(self) -> str:

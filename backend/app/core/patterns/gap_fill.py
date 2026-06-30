@@ -41,7 +41,7 @@ class GapFillPattern(AbstractPattern):
         signals.append(PatternSignal(
             pattern_name=self.name, pattern_version=self.version,
             symbol=underlying, underlying=underlying,
-            instrument=f"{underlying}_FUT",
+            instrument=underlying,
             direction=direction, entry_price=entry, target_price=target, stop_loss=stop,
             expected_return_pct=round(exp_return, 2),
             confidence_score=self._regime_adj(0.65, context),
@@ -68,11 +68,10 @@ class GapFillPattern(AbstractPattern):
 
     def _explain(self, underlying, gap_pct, prev_close, curr_open, direction):
         gap_dir = "up" if gap_pct > 0 else "down"
+        action = "Sell" if direction == "short" else "Buy"
         return (
-            f"Gap Fill Setup — {underlying} gapped {gap_dir} {abs(gap_pct):.1f}% from {prev_close:.0f} to {curr_open:.0f}. "
-            f"Historically, 65–75% of NSE index gaps of this size fill within the same session when not driven by news. "
-            f"Fading the gap {direction} targeting previous close at {prev_close:.0f}. "
-            f"Intraday trade — exit at EOD if gap does not fill."
+            f"{underlying} opened {abs(gap_pct):.1f}% {gap_dir} at ₹{curr_open:.0f} vs yesterday's close of ₹{prev_close:.0f}. "
+            f"65–75% of gaps this size fill the same day. {action} the gap, target ₹{prev_close:.0f}. Exit by 3:20 PM if it doesn't fill."
         )
 
     def why_it_works(self) -> str:

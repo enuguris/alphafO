@@ -41,6 +41,10 @@ class RequestTokenIn(BaseModel):
     request_token: str
 
 
+class AnthropicKeyIn(BaseModel):
+    api_key: str
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.put("/mode")
@@ -205,6 +209,35 @@ async def generate_access_token(
         "token_date": cfg.token_date.isoformat(),
         "valid_until": "End of today (Kite tokens expire at midnight).",
     }
+
+
+@router.get("/anthropic-key")
+async def get_anthropic_key(db: AsyncSession = Depends(get_db)):
+    """Return whether an Anthropic key is saved (never expose the key itself)."""
+    cfg = await _get_or_create_config(db)
+    has_key = bool(cfg.anthropic_api_key_enc)
+    return {"has_key": has_key}
+
+
+@router.post("/anthropic-key")
+async def save_anthropic_key(body: AnthropicKeyIn, db: AsyncSession = Depends(get_db)):
+    """Encrypt and persist the Anthropic API key."""
+    key = body.api_key.strip()
+    if not key.startswith("sk-ant-"):
+        raise HTTPException(status_code=400, detail="Invalid key — Anthropic keys start with 'sk-ant-'")
+    cfg = await _get_or_create_config(db)
+    cfg.anthropic_api_key_enc = encrypt(key)
+    await db.commit()
+    return {"message": "Anthropic API key saved and encrypted."}
+
+
+@router.delete("/anthropic-key")
+async def delete_anthropic_key(db: AsyncSession = Depends(get_db)):
+    """Remove the stored Anthropic API key."""
+    cfg = await _get_or_create_config(db)
+    cfg.anthropic_api_key_enc = ""
+    await db.commit()
+    return {"message": "Anthropic API key removed."}
 
 
 @router.get("/kite-test")
