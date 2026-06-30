@@ -391,7 +391,7 @@ async def _auto_paper_trade(signals, db):
                 target_price = opt_target, stop_loss = opt_stop,
                 charges_entry = entry_charges, unrealized_pnl = 0.0,
                 status = TradeStatus.OPEN, entry_time = now,
-                notes = "spread_leg:main" if hedge_trade_data else None,
+                notes = f"{'spread_leg:main|' if hedge_trade_data else ''}pattern:{sig.pattern_name}",
                 capital_at_risk_pct = round((cost / portfolio.capital_current) * 100, 4),
             )
             db.add(trade)
@@ -412,7 +412,7 @@ async def _auto_paper_trade(signals, db):
                     target_price = 0.0, stop_loss = 0.0,
                     charges_entry = h_charges, unrealized_pnl = 0.0,
                     status = TradeStatus.OPEN, entry_time = now,
-                    notes = f"spread_leg:hedge|main_sym:{instrument_sym}",
+                    notes = f"spread_leg:hedge|main_sym:{instrument_sym}|pattern:{sig.pattern_name}",
                     capital_at_risk_pct = 0.0,
                 )
                 db.add(hedge)

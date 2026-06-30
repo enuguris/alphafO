@@ -30,6 +30,8 @@ def _trade_dict(t: Trade) -> dict:
         "last_mtm_at": t.last_mtm_at.isoformat() if t.last_mtm_at else None,
         "status": t.status, "exit_reason": t.exit_reason,
         "capital_at_risk_pct": t.capital_at_risk_pct, "notes": t.notes,
+        "is_hedge": bool(t.notes and t.notes.startswith("spread_leg:hedge")),
+        "pattern": (t.notes.split("pattern:")[-1].split("|")[0] if t.notes and "pattern:" in t.notes else None),
     }
 
 
