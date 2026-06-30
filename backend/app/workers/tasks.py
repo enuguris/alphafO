@@ -793,20 +793,23 @@ async def _do_mtm_update():
                     if trail_target < trade.target_price or trade.target_price <= 0:
                         trade.target_price = max(0.05, trail_target)
 
-            # Stop loss / target hit check
+            # Stop loss / target hit check.
+            # For paper-trading simulation we fill at the order price (stop/target),
+            # not at `current` — which can be far past the level if MTM polling
+            # was delayed. This matches real broker stop-order fill semantics.
             if trade.action == "BUY":
                 if current >= trade.target_price:
-                    await _close_trade(trade, current, "target_hit", db)
+                    await _close_trade(trade, trade.target_price, "target_hit", db)
                     continue
                 elif current <= trade.stop_loss:
-                    await _close_trade(trade, current, "stop_hit", db)
+                    await _close_trade(trade, trade.stop_loss, "stop_hit", db)
                     continue
             else:
                 if current <= trade.target_price:
-                    await _close_trade(trade, current, "target_hit", db)
+                    await _close_trade(trade, trade.target_price, "target_hit", db)
                     continue
                 elif current >= trade.stop_loss:
-                    await _close_trade(trade, current, "stop_hit", db)
+                    await _close_trade(trade, trade.stop_loss, "stop_hit", db)
                     continue
 
         await db.commit()
