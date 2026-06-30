@@ -271,6 +271,161 @@ function SignalRationale({ tradeId, entryPrice, stopLoss, targetPrice, entryTime
   )
 }
 
+// ── Charges breakdown (Zerodha NSE F&O rates) ────────────────────────────────
+
+function computeCharges(entryPrem: number, exitPrem: number, qty: number, action: string) {
+  const entryTurnover = entryPrem * qty
+  const exitTurnover  = exitPrem  * qty
+  const totalTurnover = entryTurnover + exitTurnover
+
+  const brokerageEntry = Math.min(20, entryTurnover * 0.0003)
+  const brokerageExit  = Math.min(20, exitTurnover  * 0.0003)
+  const brokerage = brokerageEntry + brokerageExit
+
+  const isBuy = action?.toUpperCase() === 'BUY'
+  const sttTurnover   = isBuy ? exitTurnover : entryTurnover
+  const stampTurnover = isBuy ? entryTurnover : exitTurnover
+
+  const stt        = sttTurnover   * 0.000125
+  const exchangeTxn = totalTurnover * 0.00053
+  const gst        = (brokerage + exchangeTxn) * 0.18
+  const sebi       = (totalTurnover / 1e7) * 10
+  const stampDuty  = stampTurnover  * 0.00003
+  const total      = brokerage + stt + exchangeTxn + gst + sebi + stampDuty
+
+  return { entryTurnover, exitTurnover, totalTurnover, brokerageEntry, brokerageExit,
+           brokerage, stt, sttTurnover, exchangeTxn, gst, sebi, stampDuty, stampTurnover, total }
+}
+
+function ChargesBreakdown({ t, currentPrice }: { t: any; currentPrice: number | null }) {
+  const isOpen = t.status === 'open'
+  const entryP = t.entry_price ?? 0
+  const exitP  = isOpen ? (currentPrice ?? entryP) : (t.exit_price ?? entryP)
+  const qty    = t.quantity ?? 1
+  const action = t.action ?? 'BUY'
+
+  // Use stored values for closed trades, computed for open
+  const stored = !isOpen && t.charges_total != null
+  const c = stored ? {
+    entryTurnover: entryP * qty,
+    exitTurnover: (t.exit_price ?? 0) * qty,
+    totalTurnover: (entryP + (t.exit_price ?? 0)) * qty,
+    brokerageEntry: NaN, brokerageExit: NaN,
+    brokerage: t.charges_brokerage ?? 0,
+    stt: t.charges_stt ?? 0, sttTurnover: NaN,
+    exchangeTxn: t.charges_txn ?? 0,
+    gst: t.charges_gst ?? 0,
+    sebi: t.charges_sebi ?? 0,
+    stampDuty: t.charges_stamp ?? 0, stampTurnover: NaN,
+    total: t.charges_total ?? 0,
+  } : computeCharges(entryP, exitP, qty, action)
+
+  const mono = (v: number | undefined) =>
+    v == null || isNaN(v) ? '—' : `₹${v.toFixed(2)}`
+
+  const chargeRow = (
+    name: string, amount: number, formula: string,
+    basis: string, color = 'var(--txt)'
+  ) => (
+    <tr key={name}>
+      <td style={{ padding: '5px 8px', fontWeight: 600, color, fontSize: 12 }}>{name}</td>
+      <td style={{ padding: '5px 8px', fontFamily: 'monospace', fontSize: 12, color, textAlign: 'right', fontWeight: 700 }}>{mono(amount)}</td>
+      <td style={{ padding: '5px 8px', fontSize: 10, color: 'var(--txt3)' }}>{formula}</td>
+      <td style={{ padding: '5px 8px', fontFamily: 'monospace', fontSize: 10, color: 'var(--txt3)', textAlign: 'right' }}>{basis}</td>
+    </tr>
+  )
+
+  const isBuy = action.toUpperCase() === 'BUY'
+
+  return (
+    <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 14 }}>
+      <div style={{ fontSize: 10, color: 'var(--blue)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700, marginBottom: 10 }}>
+        Brokerage & Statutory Charges
+        {isOpen && <span style={{ marginLeft: 8, fontSize: 9, color: 'var(--orange)', fontWeight: 400 }}>(estimated at current price)</span>}
+        <span style={{ marginLeft: 8, fontSize: 9, color: 'var(--txt3)', fontWeight: 400 }}>Zerodha NSE F&O rates 2025-26</span>
+      </div>
+
+      {/* Turnover summary */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
+        {[
+          ['Entry turnover', `₹${c.entryTurnover.toFixed(0)}`, `${mono(entryP)} × ${qty} units`],
+          ['Exit turnover',  `₹${c.exitTurnover.toFixed(0)}`,  `${mono(exitP)} × ${qty} units${isOpen ? ' (est.)' : ''}`],
+          ['Total turnover', `₹${c.totalTurnover.toFixed(0)}`, 'both legs combined'],
+        ].map(([label, val, sub]) => (
+          <div key={label as string} style={{ padding: '6px 10px', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 5, minWidth: 130 }}>
+            <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+            <div style={{ fontSize: 13, fontWeight: 700, fontFamily: 'monospace', color: 'var(--txt)' }}>{val}</div>
+            <div style={{ fontSize: 9, color: 'var(--txt3)', marginTop: 1 }}>{sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Charges table */}
+      <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 5 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ background: 'var(--bg)', borderBottom: '1px solid var(--border)' }}>
+              <th style={{ padding: '5px 8px', fontSize: 9, color: 'var(--txt3)', textAlign: 'left', fontWeight: 600, textTransform: 'uppercase' }}>Charge</th>
+              <th style={{ padding: '5px 8px', fontSize: 9, color: 'var(--txt3)', textAlign: 'right', fontWeight: 600, textTransform: 'uppercase' }}>Amount</th>
+              <th style={{ padding: '5px 8px', fontSize: 9, color: 'var(--txt3)', textAlign: 'left', fontWeight: 600, textTransform: 'uppercase' }}>Rate / Formula</th>
+              <th style={{ padding: '5px 8px', fontSize: 9, color: 'var(--txt3)', textAlign: 'right', fontWeight: 600, textTransform: 'uppercase' }}>Applied on</th>
+            </tr>
+          </thead>
+          <tbody style={{ background: 'var(--bg2)' }}>
+            {chargeRow(
+              'Brokerage (entry)', stored ? NaN : c.brokerageEntry,
+              'min(₹20, 0.03% × turnover) per order',
+              stored ? '—' : `min(₹20, ₹${(c.entryTurnover * 0.0003).toFixed(2)}) = ₹${c.brokerageEntry?.toFixed(2)}`
+            )}
+            {chargeRow(
+              'Brokerage (exit)', stored ? NaN : c.brokerageExit,
+              'min(₹20, 0.03% × turnover) per order',
+              stored ? '—' : `min(₹20, ₹${(c.exitTurnover * 0.0003).toFixed(2)}) = ₹${c.brokerageExit?.toFixed(2)}`
+            )}
+            {stored && chargeRow('Brokerage (total)', c.brokerage, 'min(₹20 per leg) × 2 legs', '—', 'var(--txt)')}
+            {chargeRow(
+              'STT', c.stt,
+              '0.0125% on sell-side premium only',
+              isBuy
+                ? `sell at exit: ₹${c.exitTurnover.toFixed(0)} × 0.0125%`
+                : `sell at entry: ₹${c.entryTurnover.toFixed(0)} × 0.0125%`
+            )}
+            {chargeRow(
+              'Exchange txn (NSE)', c.exchangeTxn,
+              '0.053% of total premium turnover',
+              `₹${c.totalTurnover.toFixed(0)} × 0.053%`
+            )}
+            {chargeRow(
+              'GST', c.gst,
+              '18% on (brokerage + exchange txn)',
+              `(₹${c.brokerage.toFixed(2)} + ₹${c.exchangeTxn.toFixed(2)}) × 18%`
+            )}
+            {chargeRow(
+              'SEBI charges', c.sebi,
+              '₹10 per crore of turnover',
+              `₹${c.totalTurnover.toFixed(0)} ÷ 1 Cr × ₹10`
+            )}
+            {chargeRow(
+              'Stamp duty', c.stampDuty,
+              '0.003% on buy-side leg only',
+              isBuy
+                ? `buy entry: ₹${c.entryTurnover.toFixed(0)} × 0.003%`
+                : `buy at exit: ₹${c.exitTurnover.toFixed(0)} × 0.003%`
+            )}
+            <tr style={{ borderTop: '2px solid var(--border)', background: 'var(--bg)' }}>
+              <td style={{ padding: '6px 8px', fontWeight: 700, fontSize: 13, color: 'var(--dn)' }}>TOTAL CHARGES</td>
+              <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: 13, fontWeight: 700, color: 'var(--dn)', textAlign: 'right' }}>{mono(c.total)}</td>
+              <td colSpan={2} style={{ padding: '6px 8px', fontSize: 10, color: 'var(--txt3)' }}>
+                = {(c.total / c.totalTurnover * 100).toFixed(3)}% of total turnover
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 // ── Trade detail panel ────────────────────────────────────────────────────────
 
 function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
@@ -360,20 +515,12 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
           {!isOpen && t.pnl_pct != null && !isHedge && row('Return on premium',
             <span style={{ fontFamily: 'monospace', color: (t.pnl_pct ?? 0) >= 0 ? 'var(--up)' : 'var(--dn)' }}>{fmtPct(t.pnl_pct)}</span>)}
           <div style={{ height: 6 }} />
-          {row('Entry charges paid', fmtPrem(t.charges_entry), true)}
-          {!isOpen && t.charges_total != null && <>
-            {row('Total charges', <span style={{ fontFamily: 'monospace', color: 'var(--dn)' }}>{fmtPrem(t.charges_total)}</span>)}
-            {(t.charges_brokerage ?? 0) > 0 && row('  ↳ Brokerage', fmtPrem(t.charges_brokerage), true)}
-            {(t.charges_stt ?? 0) > 0      && row('  ↳ STT', fmtPrem(t.charges_stt), true)}
-            {(t.charges_gst ?? 0) > 0      && row('  ↳ GST (18%)', fmtPrem(t.charges_gst), true)}
-            {(t.charges_txn ?? 0) > 0      && row('  ↳ Exchange txn', fmtPrem(t.charges_txn), true)}
-            {(t.charges_sebi ?? 0) > 0     && row('  ↳ SEBI turnover', fmtPrem(t.charges_sebi), true)}
-            {(t.charges_stamp ?? 0) > 0    && row('  ↳ Stamp duty', fmtPrem(t.charges_stamp), true)}
-          </>}
-          <div style={{ height: 6 }} />
           {row('Capital at risk', t.capital_at_risk_pct ? `${t.capital_at_risk_pct.toFixed(2)}% of portfolio` : '—')}
         </div>
       </div>
+      {/* Charges breakdown */}
+      <ChargesBreakdown t={t} currentPrice={currentPrice} />
+
       {/* Signal rationale + 5-min chart */}
       <SignalRationale
         tradeId={t.id}
