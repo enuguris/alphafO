@@ -49,7 +49,12 @@ export default function ChatPanel({ open, onClose }: { open: boolean; onClose: (
           <span>AlphaFO AI</span>
           <span className="badge badge-blue" style={{ marginLeft: 2 }}>Claude</span>
         </div>
-        <button onClick={onClose} className="tv-btn tv-btn-ghost" style={{ padding: '2px 7px', fontSize: 14 }}>×</button>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {msgs.length > 0 && (
+            <button onClick={() => setMsgs([])} className="tv-btn tv-btn-ghost" style={{ padding: '2px 7px', fontSize: 10, color: 'var(--txt3)' }} title="Clear conversation">⌫</button>
+          )}
+          <button onClick={onClose} className="tv-btn tv-btn-ghost" style={{ padding: '2px 7px', fontSize: 14 }}>×</button>
+        </div>
       </div>
 
       {/* Messages */}
