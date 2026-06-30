@@ -76,12 +76,17 @@ def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 def _safe_dict(obj) -> dict:
-    """Convert SQLAlchemy model to dict, replacing nan/inf with None for JSON safety."""
+    """Convert SQLAlchemy model to dict, replacing nan/inf with None for JSON safety.
+    Datetimes are serialized as UTC ISO strings with 'Z' suffix so browsers parse them correctly."""
     import math
+    from datetime import datetime as _dt
     d = {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
     for k, v in d.items():
         if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
             d[k] = None
+        elif isinstance(v, _dt):
+            # All datetimes stored as naive UTC — append Z so JS new Date() treats them as UTC
+            d[k] = v.isoformat() + 'Z'
     return d
 
 

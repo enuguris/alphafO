@@ -9,7 +9,10 @@ const fmtPrem = (n?: number | null) => n == null ? '—' : `₹${n?.toFixed(2)}`
 const fmtPct  = (n?: number | null) => n == null ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
 const fmtDt   = (iso?: string | null) => {
   if (!iso) return '—'
-  return new Date(iso).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
+  // Backend returns bare UTC strings (no Z). Append Z so the browser treats
+  // them as UTC and converts to local time (IST) rather than interpreting as local.
+  const utc = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z'
+  return new Date(utc).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 const dte = (expiry?: string) => {
   if (!expiry) return null
