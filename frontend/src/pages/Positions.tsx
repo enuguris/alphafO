@@ -70,15 +70,75 @@ function SummaryCard({ label, value, sub, color }: { label: string; value: strin
   )
 }
 
+// ── TradingView embedded chart ────────────────────────────────────────────────
+
+declare global { interface Window { TradingView: any } }
+
+function TradingViewChart({ symbol, tradeId }: { symbol: string; tradeId: number }) {
+  const containerId = `tv_${tradeId}_${symbol.replace(/[^a-zA-Z0-9]/g, '')}`
+  const wrapRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!wrapRef.current) return
+
+    // Determine theme to pass to TradingView widget
+    const appTheme = document.documentElement.getAttribute('data-theme') || 'dark'
+    const tvTheme = appTheme === 'light' || appTheme === 'solarized' ? 'light' : 'dark'
+
+    const initWidget = () => {
+      if (!wrapRef.current) return
+      wrapRef.current.innerHTML = ''
+      const inner = document.createElement('div')
+      inner.id = containerId
+      inner.style.height = '400px'
+      wrapRef.current.appendChild(inner)
+      // eslint-disable-next-line no-new
+      new window.TradingView.widget({
+        autosize: true,
+        symbol: `NSE:${symbol}`,
+        interval: '5',
+        timezone: 'Asia/Kolkata',
+        theme: tvTheme,
+        style: '1',
+        locale: 'en',
+        enable_publishing: false,
+        hide_top_toolbar: false,
+        hide_side_toolbar: true,
+        allow_symbol_change: false,
+        save_image: false,
+        container_id: containerId,
+        withdateranges: false,
+      })
+    }
+
+    if (window.TradingView) {
+      initWidget()
+    } else {
+      const script = document.createElement('script')
+      script.src = 'https://s3.tradingview.com/tv.js'
+      script.async = true
+      script.onload = initWidget
+      document.head.appendChild(script)
+    }
+
+    return () => { if (wrapRef.current) wrapRef.current.innerHTML = '' }
+  }, [symbol, containerId])
+
+  return (
+    <div style={{ border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden', marginTop: 14 }}>
+      <div ref={wrapRef} style={{ height: 400 }} />
+    </div>
+  )
+}
+
 // ── Signal rationale panel ────────────────────────────────────────────────────
 
-function SignalRationale({ tradeId, symbol, underlying }: {
-  tradeId: number; symbol?: string; underlying?: string
+function SignalRationale({ tradeId, symbol }: {
+  tradeId: number; symbol?: string
 }) {
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
-  const [copied, setCopied] = useState(false)
 
   useEffect(() => {
     setLoading(true)
@@ -87,21 +147,12 @@ function SignalRationale({ tradeId, symbol, underlying }: {
       .catch(() => { setErr('Failed to load rationale'); setLoading(false) })
   }, [tradeId])
 
-  const copySymbol = () => {
-    if (!symbol) return
-    navigator.clipboard?.writeText(symbol).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    })
-  }
-
   if (loading) return <div style={{ padding: '16px 0', color: 'var(--txt3)', fontSize: 12 }}>Loading rationale…</div>
   if (err) return <div style={{ padding: '8px 0', color: 'var(--dn)', fontSize: 12 }}>{err}</div>
   if (!data) return null
 
   const sig = data.signal || {}
   const sym = symbol || data.symbol || ''
-  const und = (underlying || sym.replace(/\d.*/, '')).toUpperCase()
 
   const PATTERN_LABELS: Record<string, string> = {
     mean_reversion: 'Mean Reversion', max_pain: 'Max Pain', gap_fill: 'Gap Fill',
@@ -118,27 +169,6 @@ function SignalRationale({ tradeId, symbol, underlying }: {
       <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>{label}</div>
       <div style={{ fontSize: 12, fontWeight: 700, color }}>{value}</div>
     </div>
-  )
-
-  // External chart links — all free, no login required for basic charts
-  const nseLnk    = `https://www.nseindia.com/option-chain?symbol=${und}`
-  const opstraLnk = `https://opstra.definedge.com/`
-  const sensibullLnk = `https://sensibull.com/`
-
-  const extBtn = (label: string, href: string, color: string) => (
-    <a href={href} target="_blank" rel="noopener noreferrer"
-      style={{
-        display: 'inline-flex', alignItems: 'center', gap: 5,
-        padding: '6px 12px', borderRadius: 5, fontSize: 11, fontWeight: 600,
-        background: 'var(--bg)', border: `1px solid ${color}44`,
-        color, textDecoration: 'none', cursor: 'pointer',
-        transition: 'background 0.15s'
-      }}
-      onMouseEnter={e => (e.currentTarget.style.background = `${color}18`)}
-      onMouseLeave={e => (e.currentTarget.style.background = 'var(--bg)')}
-    >
-      ↗ {label}
-    </a>
   )
 
   return (
@@ -164,31 +194,14 @@ function SignalRationale({ tradeId, symbol, underlying }: {
       {sig.explanation && (
         <div style={{
           padding: '10px 12px', background: 'var(--bg)', border: '1px solid var(--border)',
-          borderRadius: 5, fontSize: 12, color: 'var(--txt2)', lineHeight: 1.6, marginBottom: 14
+          borderRadius: 5, fontSize: 12, color: 'var(--txt2)', lineHeight: 1.6, marginBottom: 4
         }}>
           {sig.explanation}
         </div>
       )}
 
-      {/* External chart links */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 10, color: 'var(--txt3)' }}>View live option chart on:</span>
-        {extBtn('NSE Option Chain', nseLnk, 'var(--blue)')}
-        {extBtn('Opstra', opstraLnk, '#7c3aed')}
-        {extBtn('Sensibull', sensibullLnk, '#f59e0b')}
-        {/* Symbol copy — paste into any platform's search */}
-        {sym && (
-          <button onClick={copySymbol} className="tv-btn" style={{
-            fontSize: 11, padding: '5px 12px', background: copied ? 'rgba(38,166,154,0.15)' : 'var(--bg)',
-            color: copied ? 'var(--up)' : 'var(--txt2)', border: '1px solid var(--border)'
-          }}>
-            {copied ? '✓ Copied!' : `📋 Copy symbol: ${sym}`}
-          </button>
-        )}
-      </div>
-      <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 6 }}>
-        Copy the symbol above → paste into Opstra / Sensibull / TradingView / Zerodha search to view the 5-min option chart.
-      </div>
+      {/* Embedded TradingView 5-min chart for this option symbol */}
+      {sym && <TradingViewChart symbol={sym} tradeId={tradeId} />}
     </div>
   )
 }
@@ -444,7 +457,7 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
       <ChargesBreakdown t={t} currentPrice={currentPrice} />
 
       {/* Signal rationale */}
-      <SignalRationale tradeId={t.id} symbol={t.symbol} underlying={t.underlying} />
+      <SignalRationale tradeId={t.id} symbol={t.symbol} />
 
       <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
         <button onClick={onCollapse} className="tv-btn" style={{ fontSize: 11, padding: '3px 12px' }}>Collapse ▲</button>
