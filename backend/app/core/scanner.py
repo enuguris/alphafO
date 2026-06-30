@@ -465,6 +465,18 @@ async def scan_instrument(
                     except Exception:
                         pass
 
+                # Override BS-estimated premium with actual Kite chain LTP when available.
+                # This prevents mispricing when synthetic IV differs from market IV.
+                try:
+                    ltp_col = "ce_ltp" if opt.get("option_type") == "CE" else "pe_ltp"
+                    chain_row = chain_df[chain_df["strike"] == opt.get("strike")]
+                    if not chain_row.empty and ltp_col in chain_row.columns:
+                        chain_ltp = float(chain_row[ltp_col].iloc[0])
+                        if chain_ltp > 1.0:  # ignore synthetic 0.05 placeholders
+                            estimated_premium = round(chain_ltp, 2)
+                except Exception:
+                    pass
+
                 # Explanation: prepend expiry context so it reads naturally
                 exp_display = opt.get("expiry_display") or opt.get("expiry", {}).get("display", "")
                 exp_series  = opt.get("expiry_series")  or opt.get("expiry", {}).get("series", "")

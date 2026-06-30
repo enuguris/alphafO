@@ -32,19 +32,31 @@ class ChainService:
                 pass
         return self._synthetic_chain(underlying)
 
-    def _synthetic_chain(self, underlying: str) -> pd.DataFrame:
-        """Generate a realistic synthetic options chain centred on the live spot price."""
-        # Use live ticker snapshot so strikes are always near actual market price
-        spot = 0.0
+    def _get_live_spot(self, underlying: str) -> float:
+        """Get live spot price, preferring Redis (cross-process) over in-process ticker."""
+        try:
+            import redis as _redis_mod
+            from app.config import settings as _settings
+            _r = _redis_mod.from_url(_settings.redis_url, decode_responses=True)
+            val = _r.get(f"spot:{underlying.upper()}")
+            if val:
+                return float(val)
+        except Exception:
+            pass
         try:
             from app.core.data.kite_ticker import ticker_service
             snap = ticker_service.get_snapshot()
-            spot = float(snap.get(underlying.upper(), {}).get("ltp", 0))
+            ltp = float(snap.get(underlying.upper(), {}).get("ltp", 0))
+            if ltp > 10:
+                return ltp
         except Exception:
             pass
-        if not spot or spot < 10:
-            from app.core.instruments import BASE_PRICES
-            spot = BASE_PRICES.get(underlying.upper(), 1500)
+        from app.core.instruments import BASE_PRICES
+        return BASE_PRICES.get(underlying.upper(), 1500)
+
+    def _synthetic_chain(self, underlying: str) -> pd.DataFrame:
+        """Generate a realistic synthetic options chain centred on the live spot price."""
+        spot = self._get_live_spot(underlying)
         step = STRIKE_STEPS.get(underlying.upper(), DEFAULT_STEP)
 
         rng = np.random.default_rng(abs(hash(underlying)) % (2**31))
@@ -102,8 +114,7 @@ class ChainService:
         from app.core.options.expiry import available_expiries
         from app.core.data.kite_ticker import ticker_service
 
-        snap = ticker_service.get_snapshot()
-        spot = float(snap.get(underlying.upper(), {}).get("ltp", 0))
+        spot = self._get_live_spot(underlying)
         if not spot or spot < 10:
             raise ValueError(f"No live spot for {underlying}")
 
