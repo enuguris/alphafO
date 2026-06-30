@@ -50,9 +50,10 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - scan-all-1h, scan-eod, scan-premarket each write their **own** label key (not shared), passed via `task_label` kwarg in beat schedule
 
 ### Pattern classification
-- `BUY_PATTERNS = {"gap_fill", "oi_buildup", "vwap_oi", "pcr_divergence"}` — directional buys, pick ATM
-- `SELL_PATTERNS = {"iv_crush", "mean_reversion", "max_pain", "expiry_week"}` — premium sellers, pick OTM
-- `expiry_week` generates `direction="short"` (sells a strangle) — it belongs in SELL_PATTERNS, not BUY_PATTERNS
+- `BUY_PATTERNS = {"gap_fill", "oi_buildup", "vwap_oi", "pcr_divergence", "mean_reversion", "max_pain"}` — directional patterns, buy ATM in signal direction
+- `SELL_PATTERNS = {"iv_crush", "expiry_week"}` — direction-neutral premium sellers, sell OTM to collect theta
+- `mean_reversion` / `max_pain`: directional (buy CE for long, buy PE for short) — do NOT put in SELL_PATTERNS or signal contradicts itself
+- `expiry_week` generates `direction="short"` (strangle sell) — correctly in SELL_PATTERNS
 - `_EXPIRY_SAFE = {"max_pain", "expiry_week"}` — these patterns are whitelisted from the event-risk block
 
 ### MTM repricing in Celery
