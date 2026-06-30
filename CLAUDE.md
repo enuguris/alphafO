@@ -56,11 +56,33 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - `expiry_week` generates `direction="short"` (strangle sell) — correctly in SELL_PATTERNS
 - `_EXPIRY_SAFE = {"max_pain", "expiry_week"}` — these patterns are whitelisted from the event-risk block
 
+### Trade action determination
+- Auto-execution reads `sig.option_strategy` ("buy"/"sell") stored in the signals table — NOT `sig.direction`
+- `direction="long"` + BUY_PATTERN → BUY CE; `direction="short"` + BUY_PATTERN → BUY PE
+- `direction=any` + SELL_PATTERN → SELL (premium collection, direction-neutral)
+- Old signals with wrong `option_strategy` self-correct on the next scan (dedup expires+recreates)
+
+### Option pricing in signals
+- `estimated_premium` = actual Black-Scholes price using `_bs_price()` (not delta*spot*0.02 approximation)
+- Uses REAL expiry DTE from `selector.select()` (floored at 1 day) — not hardcoded dte=7
+- Minimum premium filter: signals with `estimated_premium < ₹50` skip auto-execution (illiquid)
+
+### Regime detection — real OHLCV
+- `build_ohlcv_from_bhav(underlying)` reads 253 cached bhav files → real FUTIDX closing prices
+- `_synthetic_ohlcv()` in options.py prefers bhav data, falls back to date-seeded random walk
+- IV column in bhav-based OHLCV is synthetic (18% default) — bhav files don't have IV data
+
 ### MTM repricing in Celery
 - Celery worker has no active KiteTicker WebSocket (separate process, no in-memory prices)
 - Reads spot from Redis `spot:{SYM}` key (written by FastAPI's KiteTicker on every tick)
+- BS fallback now reads ATM chain IV (not hardcoded 18%) for more accurate option repricing
 - Falls back to in-process snapshot, then `BASE_PRICES` as last resort
 - BASE_PRICES in instruments.py must be updated when NIFTY/BANKNIFTY levels shift significantly
+
+### Redis deployed capital drift
+- `record_deployed()` uses `incrbyfloat` which can drift due to floating-point imprecision
+- `reset_daily_pnl()` at 9:15 IST resets to 0 then re-seeds from actual open trades in DB
+- Manual fix: trigger `reset-daily-pnl` task from SystemHealth → Run button
 
 ### IV rank
 - `get_iv_history(underlying)` returns 252 synthetic daily IV values spanning realistic range
@@ -119,7 +141,9 @@ Run these after any change before committing:
 9. GET /api/v1/system/schedule → scan-all-1h/eod/premarket show SEPARATE last_run timestamps
 10. GET /api/v1/options/iv-rank/NIFTY → iv_rank between 0.1–0.9 (not stuck at 0 or 1)
 11. GET /api/v1/options/risk/status → capital_deployed should be ≥ 0 (not negative from float drift)
-12. After scan + 30s → GET /api/v1/trades/?mode=paper&status=OPEN should show new auto-executed trades
+12. After scan + 30s → GET /api/v1/trades/?mode=paper show new trades; check option_strategy matches action
+13. GET /api/v1/options/regime/NIFTY → uses real bhav data (trend based on 253 days of actual prices)
+14. Signals: max_pain/mean_reversion direction=short → option_type=PE, option_strategy=buy (not sell)
 ```
 
 ### FII data gotchas
