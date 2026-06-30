@@ -14,10 +14,21 @@ from app.workers.celery_app import celery_app
 
 def _run_async(coro):
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Dispose the async engine's connection pool before closing the loop.
+        # asyncpg connections are bound to the event loop they were created in;
+        # if we close the loop without disposing, the next task's new loop gets
+        # "RuntimeError: Event loop is closed" when the pool tries to reuse them.
+        try:
+            from app.database import engine
+            loop.run_until_complete(engine.dispose())
+        except Exception:
+            pass
         loop.close()
+        asyncio.set_event_loop(None)
 
 
 def _stamp_task_run(celery_task_name: str) -> None:

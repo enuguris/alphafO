@@ -49,25 +49,28 @@ async def list_trades(mode: str = "live", status: str | None = None,
 
 
 @router.post("/refresh-mtm")
-async def refresh_mtm(db: AsyncSession = Depends(get_db)):
+async def refresh_mtm():
     """Run MTM update inline and return all open trades with fresh prices."""
     from app.workers.tasks import _do_mtm_update
+    from app.database import AsyncSessionLocal
     await _do_mtm_update()
+    # Use a fresh session so we see the committed MTM values, not a stale snapshot
     from app.models.trades import TradeStatus
-    q = select(Trade).where(
-        Trade.status == TradeStatus.OPEN,
-    ).order_by(Trade.entry_time.desc())
-    trades = (await db.execute(q)).scalars().all()
-    total_unrealized = sum(
-        (t.unrealized_pnl or 0) for t in trades
-        if not (t.notes or "").startswith("spread_leg:hedge")
-    )
-    return {
-        "trades": [_trade_dict(t) for t in trades],
-        "total_unrealized_pnl": round(total_unrealized, 2),
-        "count": len(trades),
-        "refreshed_at": __import__("datetime").datetime.utcnow().isoformat(),
-    }
+    async with AsyncSessionLocal() as fresh_db:
+        q = select(Trade).where(
+            Trade.status == TradeStatus.OPEN,
+        ).order_by(Trade.entry_time.desc())
+        trades = (await fresh_db.execute(q)).scalars().all()
+        total_unrealized = sum(
+            (t.unrealized_pnl or 0) for t in trades
+            if not (t.notes or "").startswith("spread_leg:hedge")
+        )
+        return {
+            "trades": [_trade_dict(t) for t in trades],
+            "total_unrealized_pnl": round(total_unrealized, 2),
+            "count": len(trades),
+            "refreshed_at": __import__("datetime").datetime.utcnow().isoformat(),
+        }
 
 
 @router.post("/{signal_id}/execute")
