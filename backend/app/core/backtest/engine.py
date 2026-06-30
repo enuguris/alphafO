@@ -304,17 +304,19 @@ async def run_backtest(
     gross_losses = abs(sum(loser_pnls))
     result.profit_factor = round(gross_wins / gross_losses, 3) if gross_losses > 0 else (99.0 if gross_wins > 0 else 0.0)
 
-    # Max drawdown from equity curve
+    # Max drawdown from equity curve — skip periods where peak ≤ 0
+    # to avoid division-by-near-zero when the curve starts at 0 capital.
     if len(equity_curve) > 1:
         peak = equity_curve[0]
         max_dd = 0.0
         for val in equity_curve:
             if val > peak:
                 peak = val
-            dd = (peak - val) / (abs(peak) + 1e-9) * 100
-            if dd > max_dd:
-                max_dd = dd
-        result.max_drawdown_pct = round(max_dd, 2)
+            if peak > 0:
+                dd = (peak - val) / peak * 100
+                if dd > max_dd:
+                    max_dd = dd
+        result.max_drawdown_pct = round(min(max_dd, 100.0), 2)
 
     # Simplified Sharpe (annualised)
     if len(trade_pnls) >= 5:
