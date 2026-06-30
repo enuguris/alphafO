@@ -216,15 +216,18 @@ async def _auto_paper_trade(signals, db):
             pass  # if DB/import fails, allow trade through (fail-open for new patterns)
 
         # ── Event risk block ──────────────────────────────────────────────────
-        # Don't trade within 1 day of RBI MPC, FOMC, or monthly expiry
-        try:
-            from app.core.options.event_calendar import EventCalendar
-            from datetime import date as _today_dt
-            if EventCalendar().is_event_risk(_today_dt.today(), dte=1):
-                logger.info(f"Skipping {sig.pattern_name}/{sig.underlying}: event risk window (RBI/FOMC/expiry within 1 day)")
-                continue
-        except Exception:
-            pass
+        # Block near RBI/FOMC/expiry events — but NOT patterns that specifically
+        # exploit expiry mechanics (max_pain, expiry_week thrive near expiry).
+        _EXPIRY_SAFE = {"max_pain", "expiry_week"}
+        if sig.pattern_name not in _EXPIRY_SAFE:
+            try:
+                from app.core.options.event_calendar import EventCalendar
+                from datetime import date as _today_dt
+                if EventCalendar().is_event_risk(_today_dt.today(), dte=1):
+                    logger.info(f"Skipping {sig.pattern_name}/{sig.underlying}: event risk window (RBI/FOMC/expiry within 1 day)")
+                    continue
+            except Exception:
+                pass
 
         premium  = sig.estimated_premium
         quantity = sig.lot_size
@@ -935,7 +938,12 @@ async def _do_scan(symbols: list[str], timeframes: list[str]):
             broadcast_fn=manager.broadcast, db=db,
         )
         await _persist_and_broadcast(result["signals"], db, manager.broadcast)
-    return result
+    # Return only JSON-native types — numpy int64 values crash Celery's Redis result store
+    return {
+        "signals_found": int(len(result.get("signals", []))),
+        "symbols_scanned": int(len(symbols)),
+        "timeframes": list(timeframes),
+    }
 
 
 # ── Celery tasks ──────────────────────────────────────────────────────────────
