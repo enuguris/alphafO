@@ -37,9 +37,9 @@ def _trade_dict(t: Trade) -> dict:
 async def list_trades(mode: str = "live", status: str | None = None,
                       limit: int = 50, db: AsyncSession = Depends(get_db)):
     from app.models.trades import TradeMode, TradeStatus
-    q = select(Trade).where(Trade.mode == TradeMode(mode))
+    q = select(Trade).where(Trade.mode == TradeMode(mode.lower()))
     if status:
-        q = q.where(Trade.status == TradeStatus(status))
+        q = q.where(Trade.status == TradeStatus(status.lower()))
     q = q.order_by(Trade.entry_time.desc()).limit(limit)
     result = await db.execute(q)
     trades = result.scalars().all()

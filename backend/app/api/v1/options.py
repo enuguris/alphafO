@@ -90,18 +90,41 @@ async def get_iv_rank(underlying: str):
 
 @router.get("/chain/{underlying}")
 async def get_chain(underlying: str):
-    """Get options chain with Greeks for all strikes."""
+    """Get options chain with Greeks, IV rank, max pain, and regime in one call."""
     chain_svc = ChainService()
     chain_df = chain_svc.get_chain(underlying)
+    spot = _spot(underlying)
+
+    # IV rank
+    iv_history = chain_svc.get_iv_history(underlying)
+    ohlcv = _synthetic_ohlcv(underlying)
+    current_iv = float(ohlcv["iv"].iloc[-1])
+    iv_rank   = IVRankService.iv_rank(current_iv, iv_history)
+    iv_regime = IVRankService.iv_regime(iv_rank)
+
+    # Max pain
+    from app.core.options.max_pain import compute_max_pain
+    try:
+        mp_result   = compute_max_pain(chain_df[["strike", "ce_oi", "pe_oi"]])
+        max_pain    = mp_result.get("max_pain_strike")
+    except Exception:
+        max_pain = None
+
+    # Regime
+    regime = RegimeDetector().detect(ohlcv)
 
     # Convert to list of dicts, handle NaN
     records = chain_df.where(pd.notnull(chain_df), None).to_dict(orient="records")
 
     return {
         "underlying": underlying,
-        "spot": _spot(underlying),
+        "spot": spot,
         "chain": records,
         "total_strikes": len(records),
+        "iv_rank": round(iv_rank, 4),
+        "iv_regime": iv_regime,
+        "max_pain": max_pain,
+        "regime": regime,
     }
 
 

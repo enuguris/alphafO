@@ -117,5 +117,10 @@ celery_app.conf.update(
             "task": "workers.confirm_order_fills",
             "schedule": crontab(minute="*/2", hour="9-15", day_of_week="1-5"),
         },
+        # AI pre-market briefing via Claude Sonnet at 08:45 IST
+        "generate-briefing": {
+            "task": "workers.generate_briefing",
+            "schedule": crontab(minute="45", hour="8", day_of_week="1-5"),
+        },
     },
 )

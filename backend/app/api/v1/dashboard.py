@@ -316,6 +316,21 @@ async def pre_market_briefing(db: AsyncSession = Depends(get_db)):
         "is_market_hours": _time(9, 15) <= t <= _time(15, 30) and now_ist.weekday() < 5,
     }
 
+    # ── AI briefing from Redis (generated at 08:45 IST by generate_briefing task)
+    try:
+        import json, redis as redis_lib
+        from app.config import settings
+        _r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+        raw = _r.get("premarket_briefing")
+        if raw:
+            cached = json.loads(raw)
+            briefing["ai_briefing"] = cached.get("briefing")
+            briefing["ai_briefing_date"] = cached.get("date")
+        else:
+            briefing["ai_briefing"] = None
+    except Exception:
+        briefing["ai_briefing"] = None
+
     return briefing
 
 

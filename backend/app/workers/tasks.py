@@ -1266,6 +1266,111 @@ def run_nightly_backtests():
         logger.error(f"Nightly backtests failed: {exc}")
 
 
+@celery_app.task(name="workers.generate_briefing")
+def generate_briefing():
+    """
+    Pre-market AI briefing at 08:45 IST.
+    Gathers PCR, FII, India VIX, IV rank, and recommended patterns, then calls
+    Claude Sonnet 4.6 to generate a structured market briefing stored in Redis
+    so the Dashboard pre-market endpoint can serve it instantly.
+    """
+    async def _run():
+        import json
+        from datetime import date
+
+        # Collect market context
+        try:
+            from app.core.options.chain_service import ChainService
+            from app.core.options.iv_rank import IVRankService
+            from app.core.options.regime import RegimeDetector
+
+            chain_svc = ChainService()
+            context_parts: list[str] = []
+
+            for sym in ["NIFTY", "BANKNIFTY"]:
+                iv_hist = chain_svc.get_iv_history(sym)
+                chain_df = chain_svc.get_chain(sym)
+                # current IV proxy from chain ATM
+                atm_iv = float(chain_df["ce_iv"].dropna().mean()) if "ce_iv" in chain_df.columns else 18.0
+                iv_rank = IVRankService.iv_rank(atm_iv, iv_hist)
+                bias = IVRankService.strategy_bias(iv_rank)
+
+                # PCR from cache
+                pcr_val = "N/A"
+                try:
+                    from app.core.backtest.market_data import load_pcr_cache
+                    pcr_df = load_pcr_cache(sym)
+                    if pcr_df is not None and len(pcr_df) > 0:
+                        pcr_val = round(float(pcr_df["pcr"].iloc[-1]), 3)
+                except Exception:
+                    pass
+
+                context_parts.append(
+                    f"{sym}: IV rank={iv_rank:.1%}, strategy_bias={bias}, PCR={pcr_val}"
+                )
+
+            # VIX
+            try:
+                from app.core.backtest.market_data import fetch_india_vix
+                vix = fetch_india_vix()
+                context_parts.append(f"India VIX: {vix:.2f}")
+            except Exception:
+                pass
+
+            context = "\n".join(context_parts)
+            today = date.today().strftime("%A %d %b %Y")
+            prompt = (
+                f"Today is {today} — NSE F&O pre-market briefing.\n\n"
+                f"Market data:\n{context}\n\n"
+                "Write a concise pre-market briefing with these sections:\n"
+                "## Market Mood\n"
+                "## Key Levels (NIFTY & BANKNIFTY)\n"
+                "## Pattern Opportunities (3 bullets max)\n"
+                "## Risk Flags\n\n"
+                "Keep it under 250 words. Be specific — mention actual IV levels and PCR readings."
+            )
+
+            # Call Anthropic API
+            from sqlalchemy import select
+            from app.database import AsyncSessionLocal
+            from app.models.kite_config import KiteConfig
+            async with AsyncSessionLocal() as db:
+                cfg = (await db.execute(select(KiteConfig).limit(1))).scalar_one_or_none()
+                api_key = cfg.anthropic_api_key if cfg else None
+
+            if not api_key:
+                logger.warning("generate_briefing: Anthropic API key not set — skipping")
+                return
+
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            briefing_text = msg.content[0].text if msg.content else ""
+
+            # Store in Redis with 6h TTL
+            import redis as redis_lib
+            from app.config import settings
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+            r.setex(
+                "premarket_briefing",
+                21600,
+                json.dumps({"date": str(date.today()), "briefing": briefing_text}),
+            )
+            logger.info("generate_briefing: AI pre-market briefing stored in Redis")
+
+        except Exception as exc:
+            logger.error(f"generate_briefing: {exc}")
+
+    try:
+        _run_async(_run())
+    except Exception as exc:
+        logger.error(f"generate_briefing task failed: {exc}")
+
+
 @celery_app.task(name="workers.run_nightly_discovery")
 def run_nightly_discovery():
     """
