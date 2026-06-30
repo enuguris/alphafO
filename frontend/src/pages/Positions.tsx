@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { createChart, ColorType, CrosshairMode } from 'lightweight-charts'
+import { createChart } from 'lightweight-charts'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket } from '../api/client'
 
@@ -71,96 +71,96 @@ function SummaryCard({ label, value, sub, color }: { label: string; value: strin
   )
 }
 
-// ── TradingView embedded chart ────────────────────────────────────────────────
+// ── Embedded candlestick chart (lightweight-charts) ───────────────────────────
 
-declare global { interface Window { TradingView: any } }
-
-// ── Embedded candlestick chart (lightweight-charts, open-source TradingView lib) ──
-
-function UnderlyingChart({ bars, entryTime, entryPrice, strike, optionType, underlying }: {
+function UnderlyingChart({ bars, entryTime, strike, optionType }: {
   bars: { time: string; open: number; high: number; low: number; close: number }[]
   entryTime?: string | null
-  entryPrice?: number | null
   strike?: number | null
   optionType?: string | null
-  underlying?: string
 }) {
   const chartRef = useRef<HTMLDivElement>(null)
+  const [chartErr, setChartErr] = useState<string | null>(null)
 
   useEffect(() => {
     if (!chartRef.current || !bars.length) return
+    setChartErr(null)
 
-    const isDark = !['light', 'solarized'].includes(
-      document.documentElement.getAttribute('data-theme') || ''
-    )
-    const bg      = isDark ? '#131722' : '#ffffff'
-    const text    = isDark ? '#d1d4dc' : '#131722'
-    const grid    = isDark ? '#2a2e39' : '#e0e3eb'
-    const border  = isDark ? '#2a2e39' : '#e0e3eb'
-
-    const chart = createChart(chartRef.current, {
-      layout: { background: { type: ColorType.Solid, color: bg }, textColor: text },
-      grid: { vertLines: { color: grid }, horzLines: { color: grid } },
-      crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: border },
-      timeScale: { borderColor: border, timeVisible: true, secondsVisible: false },
-      width: chartRef.current.clientWidth,
-      height: 360,
-    })
-
-    // candlestick series
-    const series = chart.addCandlestickSeries({
-      upColor: '#26a69a', downColor: '#ef5350',
-      borderUpColor: '#26a69a', borderDownColor: '#ef5350',
-      wickUpColor: '#26a69a', wickDownColor: '#ef5350',
-    })
-
-    // convert ISO timestamps → Unix seconds (lightweight-charts needs seconds)
-    const data = bars.map(b => ({
-      time: Math.floor(new Date(b.time).getTime() / 1000) as any,
-      open: b.open, high: b.high, low: b.low, close: b.close,
-    })).sort((a, b) => a.time - b.time)
-
-    series.setData(data)
-
-    // strike price horizontal line
-    if (strike) {
-      const priceLine = series.createPriceLine({
-        price: strike,
-        color: '#f59e0b',
-        lineWidth: 1,
-        lineStyle: 2, // dashed
-        axisLabelVisible: true,
-        title: `Strike ${strike} ${optionType || ''}`,
-      })
-    }
-
-    // scroll chart to entry time
-    if (entryTime) {
-      const entryTs = Math.floor(new Date(entryTime).getTime() / 1000)
-      chart.timeScale().scrollToPosition(
-        data.findIndex(d => d.time >= entryTs) - Math.floor(data.length * 0.15),
-        false
+    let chart: ReturnType<typeof createChart> | null = null
+    try {
+      const isDark = !['light', 'solarized'].includes(
+        document.documentElement.getAttribute('data-theme') || ''
       )
-    } else {
-      chart.timeScale().fitContent()
-    }
+      const bg     = isDark ? '#131722' : '#ffffff'
+      const text   = isDark ? '#d1d4dc' : '#131722'
+      const grid   = isDark ? '#2a2e39' : '#e0e3eb'
+      const brd    = isDark ? '#2a2e39' : '#e0e3eb'
+      const w = chartRef.current.clientWidth || 600
 
-    const handleResize = () => {
-      if (chartRef.current) chart.applyOptions({ width: chartRef.current.clientWidth })
-    }
-    window.addEventListener('resize', handleResize)
+      chart = createChart(chartRef.current, {
+        layout: { background: { color: bg } as any, textColor: text },
+        grid: { vertLines: { color: grid }, horzLines: { color: grid } },
+        crosshair: { mode: 0 },  // 0 = Normal
+        rightPriceScale: { borderColor: brd },
+        timeScale: { borderColor: brd, timeVisible: true, secondsVisible: false },
+        width: w,
+        height: 360,
+      })
 
-    return () => {
-      window.removeEventListener('resize', handleResize)
-      chart.remove()
+      const series = chart.addCandlestickSeries({
+        upColor: '#26a69a', downColor: '#ef5350',
+        borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+        wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+      })
+
+      const cdata = bars
+        .map(b => ({
+          time: Math.floor(new Date(b.time).getTime() / 1000) as any,
+          open: b.open, high: b.high, low: b.low, close: b.close,
+        }))
+        .sort((a, b) => a.time - b.time)
+
+      series.setData(cdata)
+
+      if (strike) {
+        series.createPriceLine({
+          price: strike, color: '#f59e0b', lineWidth: 1,
+          lineStyle: 2, axisLabelVisible: true,
+          title: `Strike ${strike} ${optionType || ''}`,
+        } as any)
+      }
+
+      if (entryTime) {
+        const entryTs = Math.floor(new Date(entryTime).getTime() / 1000)
+        const idx = cdata.findIndex(d => d.time >= entryTs)
+        if (idx > 0) chart.timeScale().scrollToPosition(idx - Math.floor(cdata.length * 0.15), false)
+        else chart.timeScale().fitContent()
+      } else {
+        chart.timeScale().fitContent()
+      }
+
+      const onResize = () => {
+        if (chartRef.current && chart) chart.applyOptions({ width: chartRef.current.clientWidth })
+      }
+      window.addEventListener('resize', onResize)
+      return () => { window.removeEventListener('resize', onResize); chart?.remove() }
+
+    } catch (e: any) {
+      setChartErr(e?.message || 'Chart error')
     }
   }, [bars, entryTime, strike, optionType])
 
   if (!bars.length) return (
-    <div style={{ height: 120, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    <div style={{ height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center',
       color: 'var(--txt3)', fontSize: 12, border: '1px solid var(--border)', borderRadius: 6 }}>
-      No underlying data — Kite not connected or market closed on trade date
+      No data — Kite not connected (connect Kite to see live underlying chart)
+    </div>
+  )
+
+  if (chartErr) return (
+    <div style={{ height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: 'var(--dn)', fontSize: 12, border: '1px solid var(--border)', borderRadius: 6 }}>
+      Chart error: {chartErr}
     </div>
   )
 
