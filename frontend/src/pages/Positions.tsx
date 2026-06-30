@@ -129,7 +129,14 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
               {EXIT_LABEL[t.exit_reason] ?? t.exit_reason}
             </span>)}
           {row('Target price', fmtPrem(t.target_price), true)}
-          {row('Stop loss', fmtPrem(t.stop_loss), true)}
+          {row('Stop loss',
+            <span style={{ fontFamily: 'monospace' }}>
+              {fmtPrem(t.stop_loss)}
+              {t.notes?.includes('trail_stop:') && (
+                <span title="Trailing stop active — stop raised to lock in 50% of peak gain" style={{ marginLeft: 5, fontSize: 10, color: 'var(--up)', fontWeight: 700 }}>⟳ TRAILING</span>
+              )}
+            </span>
+          )}
           {t.last_mtm_at && row('Last MTM refresh', fmtDt(t.last_mtm_at))}
         </div>
 

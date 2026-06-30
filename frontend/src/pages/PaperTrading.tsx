@@ -114,11 +114,20 @@ export default function PaperTrading() {
                   <th>P&L</th>
                   <th>Return</th>
                   <th style={{ textAlign: 'left' }}>Pattern</th>
+                  <th style={{ textAlign: 'left' }}>Exit</th>
                 </tr></thead>
                 <tbody>
                   {closed.map((t: any) => {
                     const pnl = t.pnl ?? 0
                     const ret = t.entry_price ? (pnl / t.entry_price * 100).toFixed(1) : null
+                    const exitLabel: Record<string, string> = {
+                      target_hit: 'Target', stop_hit: 'Stop', manual: 'Manual',
+                      eod_close: 'EOD', expiry: 'Expiry', trailing_stop: 'Trail Stop',
+                    }
+                    const exitColor: Record<string, string> = {
+                      target_hit: 'var(--up)', stop_hit: 'var(--dn)', manual: 'var(--txt2)',
+                      eod_close: 'var(--txt3)', expiry: 'var(--txt3)', trailing_stop: 'var(--up)',
+                    }
                     return (
                       <tr key={t.id}>
                         <td style={{ textAlign: 'left', fontWeight: 700, color: 'var(--txt)' }}>{t.symbol}</td>
@@ -128,6 +137,9 @@ export default function PaperTrading() {
                         <td className={`mono ${pnl >= 0 ? 'up' : 'dn'}`} style={{ fontWeight: 600 }}>{pnl >= 0 ? '+' : ''}{fmtINR(pnl)}</td>
                         <td className={`mono ${pnl >= 0 ? 'up' : 'dn'}`}>{ret ? `${pnl >= 0 ? '+' : ''}${ret}%` : '—'}</td>
                         <td style={{ textAlign: 'left', color: 'var(--txt2)', fontSize: 11 }}>{t.pattern?.replace(/_/g, ' ')}</td>
+                        <td style={{ textAlign: 'left', fontSize: 10, color: t.exit_reason ? exitColor[t.exit_reason] ?? 'var(--txt3)' : 'var(--txt3)' }}>
+                          {t.exit_reason ? (exitLabel[t.exit_reason] ?? t.exit_reason) : '—'}
+                        </td>
                       </tr>
                     )
                   })}

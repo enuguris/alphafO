@@ -67,6 +67,10 @@ export const fetchSystemSchedule = () => api.get('/system/schedule').then(r => r
 export const runTask             = (name: string) => api.post(`/system/run-task/${name}`).then(r => r.data)
 export const purgeDashboard      = () => api.delete('/dashboard/purge-junk-trades').then(r => r.data)
 
+export const fetchRiskStatus  = () => api.get('/options/risk/status').then(r => r.data)
+export const haltTrading      = (reason: string) => api.post('/options/risk/halt', { reason }).then(r => r.data)
+export const resumeTrading    = () => api.post('/options/risk/resume').then(r => r.data)
+
 // ── WebSocket helpers ─────────────────────────────────────────────────────
 const WS_BASE = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
 

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { api } from '../api/client'
-import { fetchAnthropicKeyStatus, saveAnthropicKey, deleteAnthropicKey } from '../api/client'
+import { fetchAnthropicKeyStatus, saveAnthropicKey, deleteAnthropicKey, fetchRiskStatus, haltTrading, resumeTrading } from '../api/client'
 import { useModeStore } from '../store/modeStore'
 import { useThemeStore, THEMES } from '../store/themeStore'
 
@@ -45,6 +45,11 @@ export default function Settings() {
     api_key: string; has_secret: boolean; token_valid: boolean; token_date: string | null
   } | null>(null)
 
+  // Risk controls state
+  const [riskStatus,   setRiskStatus]   = useState<{ halted: boolean; daily_pnl: number; capital_deployed: number; capital: number } | null>(null)
+  const [riskBusy,     setRiskBusy]     = useState(false)
+  const [haltReason,   setHaltReason]   = useState('manual halt from UI')
+
   // Anthropic key state
   const [anthropicKey,        setAnthropicKey]        = useState('')
   const [anthropicHasKey,     setAnthropicHasKey]     = useState(false)
@@ -60,6 +65,9 @@ export default function Settings() {
       .catch(() => {})
     fetchAnthropicKeyStatus()
       .then(r => setAnthropicHasKey(r.has_key))
+      .catch(() => {})
+    fetchRiskStatus()
+      .then(r => setRiskStatus(r))
       .catch(() => {})
   }, [])
 
@@ -129,6 +137,25 @@ export default function Settings() {
     } finally {
       setTesting(false)
     }
+  }
+
+  const doHalt = async () => {
+    if (!window.confirm(`Halt all automated trading?\nReason: "${haltReason}"`)) return
+    setRiskBusy(true)
+    try {
+      await haltTrading(haltReason)
+      const r = await fetchRiskStatus()
+      setRiskStatus(r)
+    } finally { setRiskBusy(false) }
+  }
+
+  const doResume = async () => {
+    setRiskBusy(true)
+    try {
+      await resumeTrading()
+      const r = await fetchRiskStatus()
+      setRiskStatus(r)
+    } finally { setRiskBusy(false) }
   }
 
   const generateToken = async () => {
@@ -442,7 +469,50 @@ export default function Settings() {
 
               <div style={{ fontSize: 10, color: 'var(--txt3)' }}>
                 Get your key at <span style={{ color: 'var(--blue)' }}>console.anthropic.com</span> → API Keys.
-                Model: claude-haiku-4-5 (fast, cheap — ~₹0.08 per message).
+                Chat model: claude-haiku-4-5 (fast, ~₹0.08/msg). Briefing model: claude-sonnet-4-6.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ── Risk Controls ── */}
+        <section style={{ marginBottom: 20 }}>
+          <div className="section-title">Risk Controls</div>
+          <div className="form-section">
+            <div className="form-section-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {riskStatus && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 4 }}>
+                  {[
+                    { label: 'Daily P&L', val: `₹${riskStatus.daily_pnl.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`, color: riskStatus.daily_pnl >= 0 ? 'var(--up)' : 'var(--dn)' },
+                    { label: 'Deployed', val: `₹${riskStatus.capital_deployed.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`, color: 'var(--txt)' },
+                    { label: 'Status', val: riskStatus.halted ? '⚠ HALTED' : '✓ Active', color: riskStatus.halted ? 'var(--dn)' : 'var(--up)' },
+                  ].map(({ label, val, color }) => (
+                    <div key={label} style={{ background: 'var(--bg)', borderRadius: 5, padding: '8px 10px', border: '1px solid var(--border)' }}>
+                      <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 3 }}>{label}</div>
+                      <div style={{ fontFamily: 'monospace', fontWeight: 700, color }}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Halt reason</div>
+                  <input
+                    className="tv-input"
+                    value={haltReason}
+                    onChange={e => setHaltReason(e.target.value)}
+                    placeholder="manual halt from UI"
+                  />
+                </div>
+                <button onClick={doHalt} disabled={riskBusy || riskStatus?.halted} className="tv-btn" style={{ color: 'var(--dn)', border: '1px solid rgba(239,83,80,0.35)', whiteSpace: 'nowrap' }}>
+                  ⏹ Halt Trading
+                </button>
+                <button onClick={doResume} disabled={riskBusy || !riskStatus?.halted} className="tv-btn tv-btn-primary" style={{ whiteSpace: 'nowrap' }}>
+                  ▶ Resume Trading
+                </button>
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--txt3)' }}>
+                Halt stops all auto-execution immediately. Resume clears the halt flag. Kill switch (permanent) requires Redis key deletion.
               </div>
             </div>
           </div>
