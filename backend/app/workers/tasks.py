@@ -282,7 +282,17 @@ async def _auto_paper_trade(signals, db):
 
         premium  = sig.estimated_premium
         quantity = sig.lot_size
-        action   = "BUY" if sig.direction == "long" else "SELL"
+        # Use stored option_strategy (buy/sell) to determine action.
+        # Directional BUY_PATTERNS use BUY regardless of market direction
+        # (short direction → buy a PE; long direction → buy a CE).
+        # Premium-selling SELL_PATTERNS always use SELL.
+        if sig.option_strategy in ("sell", "SELL"):
+            action = "SELL"
+        elif sig.option_strategy in ("buy", "BUY"):
+            action = "BUY"
+        else:
+            # Fallback: direction-based (old behaviour)
+            action = "BUY" if sig.direction == "long" else "SELL"
 
         # ── Hedge leg for SELL positions (cap max loss via spread) ─────────────
         hedge_trade_data = None
@@ -902,7 +912,7 @@ async def _do_expiry_settlement():
             logger.info("Expiry settlement: no trades to settle")
             return
 
-        # Get spot prices for settlement
+        # Get spot prices for settlement — try Kite first, then Redis ticker cache
         spot_prices: dict[str, float] = {}
         try:
             from kiteconnect import KiteConnect
@@ -918,7 +928,21 @@ async def _do_expiry_settlement():
                     except Exception:
                         pass
         except Exception as e:
-            logger.warning(f"Expiry settlement: could not fetch spot prices: {e}")
+            logger.warning(f"Expiry settlement: could not fetch Kite prices: {e}")
+
+        # Fallback: Redis spot cache written by ticker service
+        if not spot_prices:
+            try:
+                import redis as _redis_lib
+                from app.config import settings as _s
+                _r = _redis_lib.from_url(_s.redis_url, decode_responses=True)
+                for t in trades:
+                    u = t.underlying.upper()
+                    val = _r.get(f"spot:{u}")
+                    if val:
+                        spot_prices[u] = float(val)
+            except Exception:
+                pass
 
         for trade in trades:
             spot = spot_prices.get(trade.underlying, 0)
