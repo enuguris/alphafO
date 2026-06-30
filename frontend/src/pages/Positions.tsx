@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { createChart, ColorType, CrosshairMode } from 'lightweight-charts'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket } from '../api/client'
 
@@ -74,90 +75,103 @@ function SummaryCard({ label, value, sub, color }: { label: string; value: strin
 
 declare global { interface Window { TradingView: any } }
 
-// underlying → TradingView continuous futures symbol (1! = front-month, always has data)
-function tvUnderlying(sym?: string): string {
-  if (!sym) return 'NSE:NIFTY1!'
-  const u = sym.replace(/\d.*/, '').toUpperCase()
-  if (u === 'BANKNIFTY') return 'NSE:BANKNIFTY1!'
-  if (u === 'FINNIFTY')  return 'NSE:FINNIFTY1!'
-  return 'NSE:NIFTY1!'
-}
+// ── Embedded candlestick chart (lightweight-charts, open-source TradingView lib) ──
 
-function TradingViewChart({ symbol, tradeId, strike, optionType }: {
-  symbol: string; tradeId: number; strike?: number | null; optionType?: string | null
+function UnderlyingChart({ bars, entryTime, entryPrice, strike, optionType, underlying }: {
+  bars: { time: string; open: number; high: number; low: number; close: number }[]
+  entryTime?: string | null
+  entryPrice?: number | null
+  strike?: number | null
+  optionType?: string | null
+  underlying?: string
 }) {
-  const tvSym = tvUnderlying(symbol)
-  const containerId = `tv_${tradeId}_${tvSym.replace(/[^a-zA-Z0-9]/g, '')}`
-  const wrapRef = useRef<HTMLDivElement>(null)
+  const chartRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    if (!wrapRef.current) return
-    const appTheme = document.documentElement.getAttribute('data-theme') || 'dark'
-    const tvTheme = appTheme === 'light' || appTheme === 'solarized' ? 'light' : 'dark'
+    if (!chartRef.current || !bars.length) return
 
-    const initWidget = () => {
-      if (!wrapRef.current) return
-      wrapRef.current.innerHTML = ''
-      const inner = document.createElement('div')
-      inner.id = containerId
-      inner.style.height = '380px'
-      wrapRef.current.appendChild(inner)
-      // eslint-disable-next-line no-new
-      new window.TradingView.widget({
-        autosize: true,
-        symbol: tvSym,
-        interval: '5',
-        timezone: 'Asia/Kolkata',
-        theme: tvTheme,
-        style: '1',
-        locale: 'en',
-        enable_publishing: false,
-        hide_top_toolbar: false,
-        hide_side_toolbar: true,
-        allow_symbol_change: false,
-        save_image: false,
-        container_id: containerId,
-        withdateranges: false,
+    const isDark = !['light', 'solarized'].includes(
+      document.documentElement.getAttribute('data-theme') || ''
+    )
+    const bg      = isDark ? '#131722' : '#ffffff'
+    const text    = isDark ? '#d1d4dc' : '#131722'
+    const grid    = isDark ? '#2a2e39' : '#e0e3eb'
+    const border  = isDark ? '#2a2e39' : '#e0e3eb'
+
+    const chart = createChart(chartRef.current, {
+      layout: { background: { type: ColorType.Solid, color: bg }, textColor: text },
+      grid: { vertLines: { color: grid }, horzLines: { color: grid } },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: border },
+      timeScale: { borderColor: border, timeVisible: true, secondsVisible: false },
+      width: chartRef.current.clientWidth,
+      height: 360,
+    })
+
+    // candlestick series
+    const series = chart.addCandlestickSeries({
+      upColor: '#26a69a', downColor: '#ef5350',
+      borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+      wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+    })
+
+    // convert ISO timestamps → Unix seconds (lightweight-charts needs seconds)
+    const data = bars.map(b => ({
+      time: Math.floor(new Date(b.time).getTime() / 1000) as any,
+      open: b.open, high: b.high, low: b.low, close: b.close,
+    })).sort((a, b) => a.time - b.time)
+
+    series.setData(data)
+
+    // strike price horizontal line
+    if (strike) {
+      const priceLine = series.createPriceLine({
+        price: strike,
+        color: '#f59e0b',
+        lineWidth: 1,
+        lineStyle: 2, // dashed
+        axisLabelVisible: true,
+        title: `Strike ${strike} ${optionType || ''}`,
       })
     }
 
-    if (window.TradingView) {
-      initWidget()
+    // scroll chart to entry time
+    if (entryTime) {
+      const entryTs = Math.floor(new Date(entryTime).getTime() / 1000)
+      chart.timeScale().scrollToPosition(
+        data.findIndex(d => d.time >= entryTs) - Math.floor(data.length * 0.15),
+        false
+      )
     } else {
-      const existing = document.querySelector('script[src="https://s3.tradingview.com/tv.js"]')
-      if (existing) {
-        existing.addEventListener('load', initWidget)
-      } else {
-        const script = document.createElement('script')
-        script.src = 'https://s3.tradingview.com/tv.js'
-        script.async = true
-        script.onload = initWidget
-        document.head.appendChild(script)
-      }
+      chart.timeScale().fitContent()
     }
 
-    return () => { if (wrapRef.current) wrapRef.current.innerHTML = '' }
-  }, [tvSym, containerId])
+    const handleResize = () => {
+      if (chartRef.current) chart.applyOptions({ width: chartRef.current.clientWidth })
+    }
+    window.addEventListener('resize', handleResize)
 
-  return (
-    <div style={{ marginTop: 12 }}>
-      {/* subtitle so user knows this is the underlying, not the option itself */}
-      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 4 }}>
-        <span style={{ color: 'var(--blue)', fontWeight: 600 }}>{tvSym}</span>
-        {' '}— underlying index · 5-min candles · IST
-        {strike && <span style={{ marginLeft: 8, color: 'var(--txt2)' }}>option strike: <strong style={{ color: 'var(--orange)' }}>₹{strike}</strong> {optionType}</span>}
-      </div>
-      <div style={{ border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
-        <div ref={wrapRef} style={{ height: 380 }} />
-      </div>
+    return () => {
+      window.removeEventListener('resize', handleResize)
+      chart.remove()
+    }
+  }, [bars, entryTime, strike, optionType])
+
+  if (!bars.length) return (
+    <div style={{ height: 120, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: 'var(--txt3)', fontSize: 12, border: '1px solid var(--border)', borderRadius: 6 }}>
+      No underlying data — Kite not connected or market closed on trade date
     </div>
   )
+
+  return <div ref={chartRef} style={{ width: '100%', borderRadius: 6, overflow: 'hidden', border: '1px solid var(--border)' }} />
 }
 
 // ── Signal rationale panel ────────────────────────────────────────────────────
 
-function SignalRationale({ tradeId, symbol, strike, optionType }: {
+function SignalRationale({ tradeId, symbol, strike, optionType, entryTime, entryPrice }: {
   tradeId: number; symbol?: string; strike?: number | null; optionType?: string | null
+  entryTime?: string | null; entryPrice?: number | null
 }) {
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(false)
@@ -223,8 +237,25 @@ function SignalRationale({ tradeId, symbol, strike, optionType }: {
         </div>
       )}
 
-      {/* Embedded TradingView 5-min chart (underlying index — always available) */}
-      {sym && <TradingViewChart symbol={sym} tradeId={tradeId} strike={strike} optionType={optionType} />}
+      {/* Embedded candlestick chart — underlying 5-min bars from Kite */}
+      <div style={{ marginTop: 12 }}>
+        <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6 }}>
+          <span style={{ color: 'var(--blue)', fontWeight: 600 }}>{(data.underlying || '').toUpperCase() || sym?.replace(/\d.*/, '')}</span>
+          {' '}underlying · 5-min · IST
+          {data.underlying_source === 'kite'
+            ? <span style={{ marginLeft: 6, color: 'var(--up)' }}>● live Kite data</span>
+            : <span style={{ marginLeft: 6, color: 'var(--txt3)' }}>○ Kite not connected</span>}
+          {strike && <span style={{ marginLeft: 10 }}>strike <strong style={{ color: 'var(--orange)' }}>₹{strike}</strong> {optionType} shown as dashed line</span>}
+        </div>
+        <UnderlyingChart
+          bars={data.underlying_bars || []}
+          entryTime={entryTime || data.entry_time}
+          entryPrice={entryPrice}
+          strike={strike}
+          optionType={optionType}
+          underlying={data.underlying}
+        />
+      </div>
     </div>
   )
 }
@@ -480,7 +511,7 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
       <ChargesBreakdown t={t} currentPrice={currentPrice} />
 
       {/* Signal rationale */}
-      <SignalRationale tradeId={t.id} symbol={t.symbol} strike={t.strike} optionType={t.option_type} />
+      <SignalRationale tradeId={t.id} symbol={t.symbol} strike={t.strike} optionType={t.option_type} entryTime={t.entry_time} entryPrice={t.entry_price} />
 
       <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
         <button onClick={onCollapse} className="tv-btn" style={{ fontSize: 11, padding: '3px 12px' }}>Collapse ▲</button>

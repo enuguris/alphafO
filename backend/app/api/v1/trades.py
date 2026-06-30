@@ -194,17 +194,49 @@ async def trade_chart(trade_id: int, db: AsyncSession = Depends(get_db)):
             except Exception:
                 pass
 
+    # ── Underlying index OHLCV (real 5-min candles via Kite) ───────────────────
+    # Fixed NSE index instrument tokens (permanent, do not change)
+    KITE_INDEX_TOKENS: dict[str, int] = {"NIFTY": 256265, "BANKNIFTY": 260105, "FINNIFTY": 257801}
+    underlying_bars: list[dict] = []
+    if entry_time and trade.underlying:
+        token = KITE_INDEX_TOKENS.get(trade.underlying.upper())
+        if token:
+            try:
+                from app.core.data.kite_adapter import KiteAdapter
+                adapter = KiteAdapter()
+                if adapter.is_configured():
+                    from_dt2 = entry_time - timedelta(hours=2)
+                    to_dt2   = (trade.exit_time or datetime.utcnow()) + timedelta(hours=1)
+                    df2 = adapter.get_historical(token, from_dt2.date(), to_dt2.date(), "5minute")
+                    if df2 is not None and not df2.empty:
+                        for _, row in df2.iterrows():
+                            ts = row.get("timestamp") or row.name
+                            t_iso = (ts.isoformat().replace("+00:00", "") + "Z") if hasattr(ts, "isoformat") else str(ts)
+                            underlying_bars.append({
+                                "time": t_iso,
+                                "open": float(row["open"]), "high": float(row["high"]),
+                                "low": float(row["low"]),   "close": float(row["close"]),
+                            })
+            except Exception:
+                pass
+
     return {
-        "trade_id":   trade_id,
-        "symbol":     trade.symbol,
-        "entry_price": trade.entry_price,
-        "stop_loss":  trade.stop_loss,
-        "target_price": trade.target_price,
-        "entry_time": (trade.entry_time.isoformat() + "Z") if trade.entry_time else None,
-        "exit_time":  (trade.exit_time.isoformat() + "Z") if trade.exit_time else None,
-        "signal":     signal_data,
-        "chart":      chart,
-        "chart_source": "kite" if any(c for c in chart) and "fetched" in dir() and fetched else "bs_estimated",
+        "trade_id":       trade_id,
+        "symbol":         trade.symbol,
+        "underlying":     trade.underlying,
+        "strike":         trade.strike,
+        "option_type":    trade.option_type,
+        "entry_price":    trade.entry_price,
+        "stop_loss":      trade.stop_loss,
+        "target_price":   trade.target_price,
+        "entry_time":     (trade.entry_time.isoformat() + "Z") if trade.entry_time else None,
+        "exit_time":      (trade.exit_time.isoformat() + "Z") if trade.exit_time else None,
+        "signal":         signal_data,
+        "underlying_bars": underlying_bars,
+        "underlying_source": "kite" if underlying_bars else "unavailable",
+        # legacy option price chart kept for reference
+        "chart":          chart,
+        "chart_source":   "kite" if any(c for c in chart) and "fetched" in dir() and fetched else "bs_estimated",
     }
 
 
