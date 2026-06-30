@@ -33,10 +33,12 @@ def _spot(underlying: str) -> float:
 
 
 def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
-    """Minimal OHLCV for regime detection."""
+    """Minimal OHLCV for regime detection — seed includes today's date so regime varies day-to-day."""
     import numpy as np
     from datetime import datetime
-    rng = np.random.default_rng(abs(hash(underlying)) % (2**31))
+    today_ord = datetime.today().toordinal()
+    seed = abs(hash(f"{underlying}_{today_ord}")) % (2**31)
+    rng = np.random.default_rng(seed)
     base = _spot(underlying)
     close = base + np.cumsum(rng.normal(0, base * 0.006, rows))
     open_ = close * (1 + rng.normal(0, 0.003, rows))
@@ -59,7 +61,16 @@ def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
 async def get_regime(underlying: str):
     """Detect current market regime for an underlying."""
     ohlcv = _synthetic_ohlcv(underlying)
-    regime = RegimeDetector().detect(ohlcv)
+    # Pass real VIX if available so volatility regime reflects actual market fear
+    vix_level = 0.0
+    try:
+        from app.core.backtest.market_data import fetch_india_vix
+        vix_df = fetch_india_vix(days=5)
+        if vix_df is not None and not vix_df.empty:
+            vix_level = float(vix_df.iloc[-1]["vix"])
+    except Exception:
+        pass
+    regime = RegimeDetector().detect(ohlcv, india_vix=vix_level)
     return {"underlying": underlying, "regime": regime}
 
 
