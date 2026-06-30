@@ -1187,6 +1187,29 @@ def cleanup_stale_signals():
         logger.error(f"Signal cleanup failed: {exc}")
 
 
+async def _sync_deployed_from_db() -> None:
+    """Re-seed DAILY_DEPLOYED_KEY from actual open trades in DB (corrects Redis drift)."""
+    try:
+        from sqlalchemy import select, func
+        from app.database import AsyncSessionLocal
+        from app.models.trades import Trade, TradeStatus, TradeMode
+        from app.core.risk.gate import record_deployed
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(func.sum(Trade.entry_price * Trade.quantity)).where(
+                    Trade.status == TradeStatus.OPEN,
+                    Trade.mode   == TradeMode.PAPER,
+                )
+            )
+            deployed = result.scalar() or 0.0
+        if deployed > 0:
+            record_deployed(float(deployed))
+            logger.info(f"Portfolio heat re-seeded from DB: ₹{deployed:,.0f}")
+    except Exception as exc:
+        logger.warning(f"Could not re-seed portfolio heat from DB: {exc}")
+
+
 # ── Daily P&L reset ───────────────────────────────────────────────────────────
 
 @celery_app.task(name="workers.reset_daily_pnl")
@@ -1199,6 +1222,8 @@ def reset_daily_pnl():
     try:
         from app.core.risk.gate import reset_daily_pnl as _reset
         _reset()
+        # Re-seed deployed capital from actual open trades (handles Redis drift)
+        _run_async(_sync_deployed_from_db())
         logger.info("Daily P&L counter reset for new trading day")
         _stamp_task_run("workers.reset_daily_pnl")
     except Exception as exc:
