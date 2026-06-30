@@ -20,6 +20,17 @@ def _run_async(coro):
         loop.close()
 
 
+def _stamp_task_run(celery_task_name: str) -> None:
+    """Write task_last_run:<name> = ISO timestamp to Redis so /system/schedule shows it."""
+    try:
+        import redis as redis_lib
+        from app.config import settings
+        r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+        r.set(f"task_last_run:{celery_task_name}", datetime.utcnow().isoformat(), ex=7 * 86400)
+    except Exception:
+        pass
+
+
 # ── Signal persistence ────────────────────────────────────────────────────────
 
 async def _persist_and_broadcast(signals: list[dict], db, broadcast_fn):
@@ -35,15 +46,25 @@ async def _persist_and_broadcast(signals: list[dict], db, broadcast_fn):
             logger.debug(f"Skipping unenriched signal: {s.get('pattern_name')} {s.get('underlying')} — no contract")
             continue
 
-        cutoff = datetime.utcnow() - timedelta(hours=1)
-        # Dedup by underlying+pattern+direction+option_type within the last hour.
+        # Expire any active signal for this pattern that points the opposite direction.
+        await db.execute(
+            __import__("sqlalchemy", fromlist=["update"]).update(Signal)
+            .where(and_(
+                Signal.underlying   == s["underlying"],
+                Signal.pattern_name == s["pattern_name"],
+                Signal.direction    != s["direction"],
+                Signal.status       == SignalStatus.ACTIVE,
+            ))
+            .values(status=SignalStatus.EXPIRED)
+        )
+        # Skip if an ACTIVE signal with the same key already exists (no time limit).
         # Include option_type so a CE and PE on the same pattern are distinct signals.
         q = select(Signal).where(and_(
             Signal.underlying    == s["underlying"],
             Signal.pattern_name  == s["pattern_name"],
             Signal.direction     == s["direction"],
             Signal.option_type   == s.get("option_type"),
-            Signal.created_at    >= cutoff,
+            Signal.status        == SignalStatus.ACTIVE,
         ))
         if (await db.execute(q)).scalars().first():
             continue
@@ -921,6 +942,7 @@ def eod_close_intraday():
     logger.info("EOD intraday close starting")
     try:
         _run_async(_do_eod_close_intraday())
+        _stamp_task_run("workers.eod_close_intraday")
     except Exception as exc:
         logger.error(f"EOD close failed: {exc}")
 
@@ -955,7 +977,9 @@ def scan_priority_instruments(self, timeframes: list[str] | None = None):
     tfs = timeframes or ["15m", "1h"]
     logger.info(f"Priority scan: {len(symbols)} symbols × {tfs}")
     try:
-        return _run_async(_do_scan(symbols, tfs))
+        result = _run_async(_do_scan(symbols, tfs))
+        _stamp_task_run("workers.scan_priority_instruments")
+        return result
     except Exception as exc:
         logger.error(f"Priority scan failed: {exc}")
         raise self.retry(exc=exc, countdown=60)
@@ -968,7 +992,9 @@ def scan_all_instruments(self, timeframes: list[str] | None = None):
     tfs = timeframes or ["1h", "4h", "daily"]
     logger.info(f"Full scan: {len(symbols)} symbols × {tfs}")
     try:
-        return _run_async(_do_scan(symbols, tfs))
+        result = _run_async(_do_scan(symbols, tfs))
+        _stamp_task_run("workers.scan_all_instruments")
+        return result
     except Exception as exc:
         logger.error(f"Full scan failed: {exc}")
         raise self.retry(exc=exc, countdown=120)
@@ -985,6 +1011,7 @@ def mtm_update():
     logger.info("MTM update starting")
     try:
         _run_async(_do_mtm_update())
+        _stamp_task_run("workers.mtm_update")
     except Exception as exc:
         logger.error(f"MTM update failed: {exc}")
 
@@ -995,6 +1022,7 @@ def expiry_settlement():
     logger.info("Expiry settlement starting")
     try:
         _run_async(_do_expiry_settlement())
+        _stamp_task_run("workers.expiry_settlement")
     except Exception as exc:
         logger.error(f"Expiry settlement failed: {exc}")
 
@@ -1020,6 +1048,7 @@ def sync_market_data(underlying: str = "NIFTY"):
         fetch_fii_fo_data()
 
         logger.info(f"Market data sync: {total_pcr} PCR dates bootstrapped for {len(syms)} symbols")
+        _stamp_task_run("workers.sync_market_data")
         return {"status": "ok", "pcr_added": total_pcr, "timestamp": datetime.utcnow().isoformat()}
     except Exception as exc:
         logger.error(f"Market data sync failed: {exc}")
@@ -1071,6 +1100,7 @@ def cleanup_stale_signals():
     """Remove stale/corrupted signals older than 48h."""
     try:
         _run_async(_do_cleanup_stale_signals())
+        _stamp_task_run("workers.cleanup_stale_signals")
     except Exception as exc:
         logger.error(f"Signal cleanup failed: {exc}")
 
@@ -1088,6 +1118,7 @@ def reset_daily_pnl():
         from app.core.risk.gate import reset_daily_pnl as _reset
         _reset()
         logger.info("Daily P&L counter reset for new trading day")
+        _stamp_task_run("workers.reset_daily_pnl")
     except Exception as exc:
         logger.error(f"Daily P&L reset failed: {exc}")
 
@@ -1107,6 +1138,7 @@ def reset_weekly_pnl():
 
     try:
         _run_async(_run())
+        _stamp_task_run("workers.reset_weekly_pnl")
     except Exception as exc:
         logger.error(f"Weekly P&L reset failed: {exc}")
 
@@ -1206,6 +1238,7 @@ def confirm_order_fills():
     """Confirm pending live order fills and cancel stale limit orders."""
     try:
         _run_async(_do_confirm_order_fills())
+        _stamp_task_run("workers.confirm_order_fills")
     except Exception as exc:
         logger.error(f"Order fill confirmation failed: {exc}")
 
@@ -1270,6 +1303,7 @@ def run_nightly_backtests():
 
     try:
         _run_async(_run())
+        _stamp_task_run("workers.run_nightly_backtests")
     except Exception as exc:
         logger.error(f"Nightly backtests failed: {exc}")
 
@@ -1375,6 +1409,7 @@ def generate_briefing():
 
     try:
         _run_async(_run())
+        _stamp_task_run("workers.generate_briefing")
     except Exception as exc:
         logger.error(f"generate_briefing task failed: {exc}")
 
@@ -1396,5 +1431,6 @@ def run_nightly_discovery():
 
     try:
         _run_async(_run())
+        _stamp_task_run("workers.run_nightly_discovery")
     except Exception as exc:
         logger.error(f"Nightly discovery failed: {exc}")

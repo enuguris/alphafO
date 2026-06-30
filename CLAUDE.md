@@ -15,10 +15,10 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 ## Key Architecture Decisions
 
 ### Signal pipeline
-1. Celery `scan_signals` task (every 5 min) calls `scanner.scan_all()` which runs all 8 patterns
-2. Signals deduped by `(underlying, pattern_name, direction, option_type)` within 1 hour window in DB
-3. Signals with confidence ≥ 0.82 (real Kite) or ≥ 0.72 (synthetic) auto-execute as paper trades
-4. `is_synthetic` detection: `signal.explanation.startswith("[")` — real signals always start with `[Weekly/Monthly expiry ...]`
+1. Celery `scan-priority-15m` task (every 15 min) calls `scanner.scan_all()` which runs all 8 patterns
+2. Signals deduped by `(underlying, pattern_name, direction, option_type)` — **no time limit**: skip if ACTIVE signal with same key already exists
+3. Direction flip: when a new scan produces a signal in the opposite direction for the same pattern, all existing ACTIVE signals for that pattern bucket are expired first
+4. Signals with confidence ≥ 0.82 (real Kite) or ≥ 0.72 (synthetic) auto-execute as paper trades
 5. Age gate: skip signals > 2h old for auto-execution
 
 ### Risk gate (Redis)
@@ -40,10 +40,11 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - Applied via `document.documentElement.setAttribute('data-theme', theme)`
 - CSS vars in `frontend/src/index.css` under `[data-theme="..."]` selectors
 
-### Celery Beat — 14 tasks
+### Celery Beat — 15 tasks
 - See `backend/app/workers/celery_app.py` for full schedule
-- Key tasks: `scan-signals` (*/5min), `mtm-update` (*/2min), `eod-close-intraday` (15:20 IST Mon-Fri)
-- Manual trigger via `POST /api/v1/system/run-task/{task_name}`
+- Key tasks: `scan-priority-15m` (*/15min), `mtm-update` (*/2min), `eod-close-intraday` (15:20 IST Mon-Fri), `generate-briefing` (08:45 IST Mon-Fri)
+- Manual trigger via `POST /api/v1/system/run-task/{task_name}` — use beat schedule name (with hyphens, not underscores)
+- `task_last_run:<celery_task_name>` Redis key written after each task succeeds — shown in /system/schedule
 
 ---
 
@@ -82,11 +83,22 @@ Run these after any change before committing:
 2. GET /api/v1/signals/             → returns only NIFTY/BANKNIFTY signals, no nan/inf in response
 3. GET /api/v1/portfolio/?mode=paper → capital > 0, deployed >= 0
 4. GET /api/v1/dashboard/report     → summary has sharpe_ratio, max_drawdown_pct fields
-5. GET /api/v1/dashboard/pre-market → pcr_nifty and pcr_banknifty not null
-6. POST /api/v1/system/run-task/scan_signals → {"queued": true}
+5. GET /api/v1/dashboard/pre-market → pcr.NIFTY.pcr and pcr.BANKNIFTY.pcr not null; fii.date not "0"
+6. POST /api/v1/system/run-task/scan-priority-15m → {"queued": true}   ← use hyphens!
 7. Frontend: all 10 nav tabs render without error (check browser console)
 8. Frontend: theme cycle works — click theme button, all 5 themes render correctly
+9. GET /api/v1/system/schedule → after any task runs, last_run field should be populated
 ```
+
+### FII data gotchas
+- `fii_fo.csv` cache path inside container: `/app/market_data/fii_fo.csv`
+- NSE CSV has a title row before column headers — `_parse_fii_csv` skips the first line
+- `fii_data["date"]` must use `latest.get("date")` not `latest.name` (pandas index)
+
+### Sharpe ratio caveat
+- Requires ≥ 2 trading days of closed trades (exits with `exit_time` set) to compute
+- With < 10 days of data the number is statistically meaningless — UI shows `sample_days` alongside
+- A very negative Sharpe (-30 to -40) with < 5 days simply means both trading days were losses
 
 ---
 

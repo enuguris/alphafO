@@ -129,8 +129,8 @@ export default function Report() {
         <StatCard
           label="Sharpe Ratio"
           value={s.sharpe_ratio != null ? s.sharpe_ratio.toFixed(2) : '—'}
-          color={s.sharpe_ratio == null ? undefined : s.sharpe_ratio >= 1 ? 'var(--up)' : s.sharpe_ratio >= 0 ? 'var(--orange)' : 'var(--dn)'}
-          sub="Annualised (252d)"
+          color={s.sharpe_ratio == null ? undefined : (s.sharpe_sample_days ?? 0) < 10 ? 'var(--txt3)' : s.sharpe_ratio >= 1 ? 'var(--up)' : s.sharpe_ratio >= 0 ? 'var(--orange)' : 'var(--dn)'}
+          sub={(s.sharpe_sample_days ?? 0) < 10 ? `${s.sharpe_sample_days ?? 0} days — low confidence` : 'Annualised (252d)'}
         />
         <StatCard
           label="Max Drawdown"

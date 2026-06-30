@@ -166,7 +166,7 @@ async def pre_market_briefing(db: AsyncSession = Depends(get_db)):
             fii_data = {
                 "net_cr": round(net, 0),
                 "signal": fii_signal,
-                "date": str(latest.name)[:10] if hasattr(latest, "name") else None,
+                "date": str(latest.get("date", ""))[:10],
             }
     except Exception:
         pass
@@ -502,6 +502,7 @@ async def trading_report(db: AsyncSession = Depends(get_db)):
     max_drawdown_pct = round(pf_row.max_drawdown_pct or 0, 2) if pf_row else 0
 
     summary["sharpe_ratio"]       = sharpe
+    summary["sharpe_sample_days"] = len(daily_returns)
     summary["max_consec_losses"]  = max_consec_losses
     summary["avg_hold_hours"]     = avg_hold_hours
     summary["max_drawdown_pct"]   = max_drawdown_pct
