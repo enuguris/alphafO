@@ -123,8 +123,16 @@ _FII_URL = "https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{d
 
 
 def _parse_fii_csv(text: str) -> Optional[dict]:
+    """
+    NSE fao_participant_oi CSV has a title row before the actual column headers,
+    so we skip the first line before handing the text to DictReader.
+    """
     try:
-        reader = csv.DictReader(io.StringIO(text))
+        lines = text.splitlines()
+        # Drop the first line (title: "Participant wise Open Interest...") so
+        # DictReader sees the real column headers as row 0.
+        body = "\n".join(lines[1:])
+        reader = csv.DictReader(io.StringIO(body))
         for row in reader:
             client = row.get("Client Type", "").strip().upper()
             if "FII" in client or "FPI" in client or "FOREIGN" in client:

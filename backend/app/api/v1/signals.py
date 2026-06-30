@@ -139,12 +139,24 @@ async def scan_all(
     created = []
     valid_until = datetime.utcnow() + timedelta(hours=24)
     for s in result["signals"]:
-        cutoff = datetime.utcnow() - timedelta(hours=1)
+        # Expire any active signal for the same pattern+underlying with a different direction
+        # (e.g. max_pain flipped from long to short) before inserting the new one.
+        await db.execute(
+            __import__("sqlalchemy", fromlist=["update"]).update(Signal)
+            .where(and_(
+                Signal.underlying == s["underlying"],
+                Signal.pattern_name == s["pattern_name"],
+                Signal.direction != s["direction"],
+                Signal.status == SignalStatus.ACTIVE,
+            ))
+            .values(status=SignalStatus.EXPIRED)
+        )
+        # Skip if an ACTIVE signal with the same key already exists (no time limit).
         dup_q = select(Signal).where(and_(
             Signal.underlying == s["underlying"],
             Signal.pattern_name == s["pattern_name"],
             Signal.direction == s["direction"],
-            Signal.created_at >= cutoff,
+            Signal.status == SignalStatus.ACTIVE,
         ))
         dup = (await db.execute(dup_q)).scalars().first()
         if dup:
@@ -316,14 +328,15 @@ async def run_signals(
             "event_warning": event_warning,
         }
 
-    # ── 9. Expire old signals — only for pattern+direction combos being replaced ──
-    new_combos = {(s.pattern_name, s.direction) for s in raw_signals}
-    if new_combos:
-        from sqlalchemy import tuple_ as sql_tuple
+    # ── 9. Expire all active signals for the same underlying+pattern (any direction) ──
+    # A new scan result supersedes whatever direction was signalled before, so we
+    # expire the whole pattern bucket to avoid contradictory signals accumulating.
+    new_pattern_names = {s.pattern_name for s in raw_signals}
+    if new_pattern_names:
         old_q = select(Signal).where(
             Signal.underlying == underlying,
             Signal.status == SignalStatus.ACTIVE,
-            sql_tuple(Signal.pattern_name, Signal.direction).in_(list(new_combos)),
+            Signal.pattern_name.in_(list(new_pattern_names)),
         )
         old_result = await db.execute(old_q)
         for old_sig in old_result.scalars().all():
