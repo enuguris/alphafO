@@ -606,8 +606,24 @@ async def _auto_paper_trade(signals, db):
     ]
     if option_symbols:
         try:
-            from app.core.data.kite_ticker import ticker_service
+            from app.core.data.kite_ticker import ticker_service, _token_to_sym
             ticker_service.subscribe_option_tokens(option_symbols)
+            # After subscription, _token_to_sym is populated — store tokens on trades for chart lookup
+            sym_to_token = {sym: tok for tok, sym in _token_to_sym.items()}
+            async with AsyncSessionLocal() as _db2:
+                from app.models.trades import Trade as _T2, TradeStatus as _TS3
+                _open = await _db2.execute(
+                    select(_T2).where(_T2.status == TradeStatus.OPEN, _T2.instrument_token.is_(None))
+                )
+                updated = 0
+                for _tr in _open.scalars().all():
+                    tok = sym_to_token.get(_tr.symbol)
+                    if tok:
+                        _tr.instrument_token = tok
+                        updated += 1
+                if updated:
+                    await _db2.commit()
+                    logger.info(f"Stored instrument tokens for {updated} open trades")
         except Exception as e:
             logger.warning(f"Option token subscription failed: {e}")
 

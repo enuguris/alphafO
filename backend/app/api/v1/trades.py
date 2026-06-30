@@ -1,4 +1,5 @@
 """Trade API endpoints."""
+from loguru import logger
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -259,23 +260,103 @@ async def trade_chart(trade_id: int, db: AsyncSession = Depends(get_db)):
             except Exception:
                 pass
 
+    # ── Option OHLCV — real Kite NFO data first, BS fallback ────────────────────
+    option_bars: list[dict] = []
+    option_source = "unavailable"
+
+    if entry_time and trade.symbol and trade.strike and trade.option_type:
+        # Tier 1: real Kite 5-min for the option instrument itself
+        try:
+            from app.core.data.kite_adapter import KiteAdapter
+            adapter2 = KiteAdapter()
+            if adapter2.is_configured():
+                # Resolve option instrument token from:
+                # 1. trade.instrument_token (stored at trade creation — preferred)
+                # 2. in-memory _token_to_sym map (populated when ticker subscribes option)
+                # kite.instruments("NFO") and kite.quote() are NOT used here:
+                #   — instruments() is rate-limited to ~1/day
+                #   — quote() returns empty for weekly option symbols
+                from app.core.data.kite_ticker import _token_to_sym
+                opt_token = trade.instrument_token or next(
+                    (tok for tok, sym in _token_to_sym.items() if sym == trade.symbol), None
+                )
+                if opt_token:
+                    from_opt = entry_time - timedelta(hours=2)
+                    to_opt   = (trade.exit_time or datetime.utcnow()) + timedelta(hours=1)
+                    df_opt = adapter2.get_historical(opt_token, from_opt.date(), to_opt.date(), "5minute")
+                    if df_opt is not None and not df_opt.empty:
+                        for _, row in df_opt.iterrows():
+                            ts = row.get("timestamp") or row.name
+                            try:
+                                ts_utc = ts.tz_convert("UTC") if hasattr(ts, "tz_convert") else ts
+                                t_iso = ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except Exception:
+                                t_iso = str(ts)
+                            option_bars.append({
+                                "time":  t_iso,
+                                "open":  round(float(row["open"]),  2),
+                                "high":  round(float(row["high"]),  2),
+                                "low":   round(float(row["low"]),   2),
+                                "close": round(float(row["close"]), 2),
+                            })
+                        if option_bars:
+                            option_source = "kite_5min"
+        except Exception as _opt_ex:
+            logger.warning(f"[chart] Kite option fetch failed: {_opt_ex}")
+
+        # Tier 2: BS estimate from real underlying — approximate, ~₹30-50 overestimate
+        # (entry_price itself is a BS estimate so calibration to it is also wrong)
+        if not option_bars and underlying_bars and trade.expiry_date:
+            try:
+                from app.core.options.greeks import _bs_price, RISK_FREE_RATE
+                import math as _math
+                expiry_dt = datetime.strptime(str(trade.expiry_date)[:10], "%Y-%m-%d")
+                K = float(trade.strike)
+                opt_type = trade.option_type
+                iv = 0.18
+                if signal_data.get("iv_at_signal"):
+                    raw = float(signal_data["iv_at_signal"])
+                    iv = raw / 100 if raw > 2 else raw
+                iv = max(0.05, min(iv, 2.0))
+                for bar in underlying_bars:
+                    try:
+                        bar_dt = datetime.strptime(bar["time"][:19], "%Y-%m-%dT%H:%M:%S")
+                        dte_days = max(0.25, (expiry_dt - bar_dt).total_seconds() / 86400)
+                        T = dte_days / 365.0
+                        opt_o = _bs_price(bar["open"],  K, T, RISK_FREE_RATE, iv, opt_type)
+                        opt_h = _bs_price(bar["high"],  K, T, RISK_FREE_RATE, iv, opt_type)
+                        opt_l = _bs_price(bar["low"],   K, T, RISK_FREE_RATE, iv, opt_type)
+                        opt_c = _bs_price(bar["close"], K, T, RISK_FREE_RATE, iv, opt_type)
+                        if any(_math.isnan(x) or _math.isinf(x) for x in [opt_o, opt_h, opt_l, opt_c]):
+                            continue
+                        option_bars.append({
+                            "time":  bar["time"],
+                            "open":  round(opt_o, 2), "high": round(opt_h, 2),
+                            "low":   round(opt_l, 2), "close": round(opt_c, 2),
+                        })
+                    except Exception:
+                        continue
+                if option_bars:
+                    option_source = "bs_estimated"
+            except Exception:
+                pass
+
     return {
-        "trade_id":       trade_id,
-        "symbol":         trade.symbol,
-        "underlying":     trade.underlying,
-        "strike":         trade.strike,
-        "option_type":    trade.option_type,
-        "entry_price":    trade.entry_price,
-        "stop_loss":      trade.stop_loss,
-        "target_price":   trade.target_price,
-        "entry_time":     (trade.entry_time.isoformat() + "Z") if trade.entry_time else None,
-        "exit_time":      (trade.exit_time.isoformat() + "Z") if trade.exit_time else None,
-        "signal":         signal_data,
-        "underlying_bars": underlying_bars,
+        "trade_id":         trade_id,
+        "symbol":           trade.symbol,
+        "underlying":       trade.underlying,
+        "strike":           trade.strike,
+        "option_type":      trade.option_type,
+        "entry_price":      trade.entry_price,
+        "stop_loss":        trade.stop_loss,
+        "target_price":     trade.target_price,
+        "entry_time":       (trade.entry_time.isoformat() + "Z") if trade.entry_time else None,
+        "exit_time":        (trade.exit_time.isoformat() + "Z") if trade.exit_time else None,
+        "signal":           signal_data,
+        "option_bars":      option_bars,
+        "option_source":    option_source,     # "kite_5min" | "bs_estimated" | "unavailable"
+        "underlying_bars":  underlying_bars,
         "underlying_source": underlying_source,
-        # legacy option price chart kept for reference
-        "chart":          chart,
-        "chart_source":   "kite" if any(c for c in chart) and "fetched" in dir() and fetched else "bs_estimated",
     }
 
 

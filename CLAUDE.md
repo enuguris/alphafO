@@ -12,6 +12,17 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 
 ---
 
+## Timezone Rule — IST Everywhere
+- **All timestamps displayed to the user MUST be in IST (UTC+5:30)** — NSE market hours are 09:15–15:30 IST
+- Backend stores datetimes in UTC in the DB (standard practice), but any API response or log meant for human reading must convert to IST before display
+- Frontend: always format timestamps with `+05:30` offset or use `toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })`
+- Charts (lightweight-charts): shift Unix timestamps by +19800 seconds (5.5 hours) before passing to the series, OR use `localization.timeFormatter` to display IST labels
+- **Never display raw UTC times to the user** — "04:00" on a chart means nothing to an NSE trader; "09:30 IST" does
+- Celery beat schedule times in `celery_app.py` are already expressed in IST (e.g. 09:15, 15:20) via `timezone = "Asia/Kolkata"` — do not convert these
+- If you see times like 03:45, 04:00 on an NSE chart it means IST offset was not applied (UTC bleed-through) — fix by adding 19800s to the timestamp
+
+---
+
 ## Key Architecture Decisions
 
 ### Signal pipeline
@@ -84,6 +95,24 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - `record_deployed()` uses `incrbyfloat` which can drift due to floating-point imprecision
 - `reset_daily_pnl()` at 9:15 IST resets to 0 then re-seeds from actual open trades in DB
 - Manual fix: trigger `reset-daily-pnl` task from SystemHealth → Run button
+
+### Kite option token resolution — rate limit and quote limitation
+- `kite.instruments("NFO")` is rate-limited to **~1 call/day** — NEVER call this on-demand in API handlers
+- `kite.quote("NFO:NIFTY07JUL2623900CE")` returns empty dict for weekly option symbols (Kite quirk)
+- The only reliable way to get a specific option's instrument token without hitting rate limits:
+  1. `trade.instrument_token` — stored in DB at trade creation time (preferred — fix tasks.py to store it)
+  2. `_token_to_sym` in-memory dict in `kite_ticker.py` — populated when ticker subscribes option at trade open
+- Without the token, real option OHLCV (`historical_data()`) is impossible
+- Chart falls back to BS-estimated option prices from real underlying spot (shape correct, level ~₹30-50 off)
+
+### BS option pricing — paper trade entry_price is a BS estimate, not real LTP
+- Paper trades are auto-executed using BS-estimated premium (`_bs_price`), NOT actual Kite option chain LTP
+- This means `trade.entry_price` is already a BS approximation and will be ~₹30–50 above real market price
+- **Do NOT back-solve IV to match `entry_price`** — that anchors the chart to a wrong value and makes it worse
+- The real fix is in `tasks.py` auto-execute: when Kite is connected, read actual chain LTP for the option
+  and store that as `entry_price` instead of BS estimate. Until then, charts will be approximate.
+- `iv_at_signal` is the best available IV for chart rendering — use it, accept the ~₹30–50 overestimate
+- Calibration (brentq back-solve) only works when `entry_price` itself came from real market data
 
 ### IV rank
 - `get_iv_history(underlying)` returns 252 synthetic daily IV values spanning realistic range

@@ -115,7 +115,7 @@ function UnderlyingChart({ bars, entryTime, strike, optionType }: {
 
       const cdata = bars
         .map(b => ({
-          time: Math.floor(new Date(b.time).getTime() / 1000) as any,
+          time: (Math.floor(new Date(b.time).getTime() / 1000) + 19800) as any,
           open: b.open, high: b.high, low: b.low, close: b.close,
         }))
         .sort((a, b) => a.time - b.time)
@@ -131,7 +131,7 @@ function UnderlyingChart({ bars, entryTime, strike, optionType }: {
       }
 
       if (entryTime) {
-        const entryTs = Math.floor(new Date(entryTime).getTime() / 1000)
+        const entryTs = Math.floor(new Date(entryTime).getTime() / 1000) + 19800
         const idx = cdata.findIndex(d => d.time >= entryTs)
         if (idx > 0) chart.timeScale().scrollToPosition(idx - Math.floor(cdata.length * 0.15), false)
         else chart.timeScale().fitContent()
@@ -176,6 +176,7 @@ function SignalRationale({ tradeId, symbol, strike, optionType, entryTime, entry
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
+  const [showUnderlying, setShowUnderlying] = useState(false)
 
   useEffect(() => {
     setLoading(true)
@@ -237,27 +238,53 @@ function SignalRationale({ tradeId, symbol, strike, optionType, entryTime, entry
         </div>
       )}
 
-      {/* Embedded candlestick chart — underlying 5-min bars from Kite */}
-      <div style={{ marginTop: 12 }}>
-        <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6 }}>
-          <span style={{ color: 'var(--blue)', fontWeight: 600 }}>{(data.underlying || '').toUpperCase() || sym?.replace(/\d.*/, '')}</span>
-          {' '}underlying · 5-min · IST
-          {data.underlying_source === 'kite_5min'
-            ? <span style={{ marginLeft: 6, color: 'var(--up)' }}>● 5-min · Kite</span>
-            : data.underlying_source === 'yfinance_5min'
-            ? <span style={{ marginLeft: 6, color: 'var(--up)' }}>● 5-min · Yahoo Finance</span>
-            : <span style={{ marginLeft: 6, color: 'var(--txt3)' }}>○ no data</span>}
-          {strike && <span style={{ marginLeft: 10 }}>strike <strong style={{ color: 'var(--orange)' }}>₹{strike}</strong> {optionType} shown as dashed line</span>}
-        </div>
-        <UnderlyingChart
-          bars={data.underlying_bars || []}
-          entryTime={entryTime || data.entry_time}
-          entryPrice={entryPrice}
-          strike={strike}
-          optionType={optionType}
-          underlying={data.underlying}
-        />
-      </div>
+      {/* Option price chart (BS from real underlying) with toggle to raw index */}
+      {(() => {
+        const optBars = data.option_bars    || []
+        const undBars = data.underlying_bars || []
+        const bars    = showUnderlying ? undBars : optBars
+        const optSrc  = data.option_source === 'kite_5min'    ? { label: '5-min · Kite (real)', color: 'var(--up)' }
+                      : data.option_source === 'bs_estimated' ? { label: 'BS estimated · approximate', color: 'var(--orange)' }
+                      : null
+        const undSrc  = data.underlying_source === 'kite_5min'     ? '5-min · Kite'
+                      : data.underlying_source === 'yfinance_5min' ? '5-min · Yahoo Finance' : ''
+        return (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 10, color: 'var(--txt3)' }}>
+                {showUnderlying
+                  ? <><span style={{ color: 'var(--blue)', fontWeight: 600 }}>{(data.underlying || '').toUpperCase()}</span>{' underlying index'}</>
+                  : <><span style={{ color: 'var(--blue)', fontWeight: 600 }}>{sym}</span>{' option premium'}</>}
+                {!showUnderlying && optSrc && <span style={{ marginLeft: 6, color: optSrc.color }}>● {optSrc.label}</span>}
+                {showUnderlying && undSrc && <span style={{ marginLeft: 6, color: 'var(--up)' }}>● {undSrc}</span>}
+                {!showUnderlying && entryPrice != null && (
+                  <span style={{ marginLeft: 8 }}>
+                    entry <strong style={{ color: 'var(--orange)' }}>₹{entryPrice.toFixed(0)}</strong>
+                    {data.stop_loss   && <> · stop <strong style={{ color: 'var(--dn)' }}>₹{data.stop_loss.toFixed(0)}</strong></>}
+                    {data.target_price && <> · target <strong style={{ color: 'var(--up)' }}>₹{data.target_price.toFixed(0)}</strong></>}
+                  </span>
+                )}
+                {showUnderlying && strike && (
+                  <span style={{ marginLeft: 8 }}>strike <strong style={{ color: 'var(--orange)' }}>₹{strike}</strong> {optionType}</span>
+                )}
+              </span>
+              {undBars.length > 0 && (
+                <button onClick={() => setShowUnderlying(v => !v)} className="tv-btn"
+                  style={{ fontSize: 10, padding: '2px 8px' }}>
+                  {showUnderlying ? 'Show option premium ↑' : `Show ${(data.underlying || 'NIFTY').toUpperCase()} chart ↓`}
+                </button>
+              )}
+            </div>
+            <UnderlyingChart
+              bars={bars}
+              entryTime={entryTime || data.entry_time}
+              entryPrice={showUnderlying ? undefined : entryPrice}
+              strike={showUnderlying ? strike : undefined}
+              optionType={optionType}
+            />
+          </div>
+        )
+      })()}
     </div>
   )
 }
