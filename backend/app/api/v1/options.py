@@ -69,8 +69,20 @@ async def get_iv_rank(underlying: str):
     chain_svc = ChainService()
     iv_history = chain_svc.get_iv_history(underlying)
 
-    ohlcv = _synthetic_ohlcv(underlying)
-    current_iv = float(ohlcv["iv"].iloc[-1])
+    # Derive current IV from ATM chain rather than random synthetic value
+    spot = _spot(underlying)
+    chain_df = chain_svc.get_chain(underlying)
+    try:
+        atm_strike = min(chain_df["strike"].unique(), key=lambda s: abs(s - spot))
+        atm_row = chain_df[chain_df["strike"] == atm_strike].iloc[0]
+        ce_iv = float(atm_row.get("ce_iv") or 0)
+        pe_iv = float(atm_row.get("pe_iv") or 0)
+        raw_iv = (ce_iv + pe_iv) / 2 if (ce_iv > 0 and pe_iv > 0) else max(ce_iv, pe_iv)
+        current_iv = raw_iv * 100 if raw_iv < 2.0 else raw_iv
+        if current_iv <= 0:
+            current_iv = float(_synthetic_ohlcv(underlying)["iv"].iloc[-1])
+    except Exception:
+        current_iv = float(_synthetic_ohlcv(underlying)["iv"].iloc[-1])
 
     iv_rank = IVRankService.iv_rank(current_iv, iv_history)
     iv_pct = IVRankService.iv_percentile(current_iv, iv_history)
@@ -95,10 +107,20 @@ async def get_chain(underlying: str):
     chain_df = chain_svc.get_chain(underlying)
     spot = _spot(underlying)
 
-    # IV rank
+    # IV rank — use ATM chain IV rather than random synthetic value
     iv_history = chain_svc.get_iv_history(underlying)
-    ohlcv = _synthetic_ohlcv(underlying)
-    current_iv = float(ohlcv["iv"].iloc[-1])
+    try:
+        atm_strike = min(chain_df["strike"].unique(), key=lambda s: abs(s - spot))
+        atm_row = chain_df[chain_df["strike"] == atm_strike].iloc[0]
+        ce_iv = float(atm_row.get("ce_iv") or 0)
+        pe_iv = float(atm_row.get("pe_iv") or 0)
+        raw_iv = (ce_iv + pe_iv) / 2 if (ce_iv > 0 and pe_iv > 0) else max(ce_iv, pe_iv)
+        # Chain stores IV as fraction (0.18); IVRankService expects percentage (18.0)
+        current_iv = raw_iv * 100 if raw_iv < 2.0 else raw_iv
+        if current_iv <= 0:
+            current_iv = float(_synthetic_ohlcv(underlying)["iv"].iloc[-1])
+    except Exception:
+        current_iv = float(_synthetic_ohlcv(underlying)["iv"].iloc[-1])
     iv_rank   = IVRankService.iv_rank(current_iv, iv_history)
     iv_regime = IVRankService.iv_regime(iv_rank)
 
@@ -111,6 +133,7 @@ async def get_chain(underlying: str):
         max_pain = None
 
     # Regime
+    ohlcv = _synthetic_ohlcv(underlying)
     regime = RegimeDetector().detect(ohlcv)
 
     # Convert to list of dicts, handle NaN

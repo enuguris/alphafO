@@ -112,19 +112,25 @@ async def pre_market_briefing(db: AsyncSession = Depends(get_db)):
 
     briefing["market"] = spot_data
 
-    # ── 3. PCR from latest market data cache ─────────────────────────────────
+    # ── 3. PCR + max-pain from live options chain (always fresh) ─────────────
     pcr_data = {}
     try:
-        from app.core.backtest.market_data import fetch_pcr_maxpain
-        import asyncio
+        from app.core.options.chain_service import ChainService
+        from app.core.options.max_pain import compute_max_pain
+
+        chain_svc = ChainService()
         for sym in ["NIFTY", "BANKNIFTY"]:
-            pcr_df = await asyncio.get_event_loop().run_in_executor(
-                None, fetch_pcr_maxpain, sym
-            )
-            if pcr_df is not None and not pcr_df.empty:
-                latest = pcr_df.iloc[-1]
-                pcr = float(latest.get("pcr", 0))
-                max_pain = float(latest.get("max_pain", 0))
+            try:
+                chain_df = chain_svc.get_chain(sym)
+                if chain_df.empty:
+                    continue
+                # PCR = total PE OI / total CE OI
+                total_pe = float(chain_df["pe_oi"].sum())
+                total_ce = float(chain_df["ce_oi"].sum())
+                pcr = round(total_pe / total_ce, 3) if total_ce > 0 else 0.0
+                # Max pain from live OI
+                mp_result = compute_max_pain(chain_df[["strike", "ce_oi", "pe_oi"]])
+                max_pain = mp_result.get("max_pain_strike")
                 if pcr > 0:
                     if pcr > 1.3:
                         pcr_signal = "Put heavy — market expects support, bullish bias"
@@ -135,10 +141,12 @@ async def pre_market_briefing(db: AsyncSession = Depends(get_db)):
                     else:
                         pcr_signal = "Call heavy — market expects resistance, bearish bias"
                     pcr_data[sym] = {
-                        "pcr": round(pcr, 3),
+                        "pcr": pcr,
                         "max_pain": round(max_pain, 0) if max_pain else None,
                         "signal": pcr_signal,
                     }
+            except Exception:
+                pass
     except Exception:
         pass
 
