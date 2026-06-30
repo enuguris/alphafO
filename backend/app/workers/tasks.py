@@ -155,12 +155,42 @@ async def _auto_paper_trade(signals, db):
 
     def _hedge_premium(underlying: str, spot: float, hedge_strike: float,
                        opt_type: str, expiry_date_iso: str) -> float:
-        """Compute hedge leg premium via Black-Scholes."""
+        """
+        Hedge leg premium — prefer chain LTP (real market price) over Black-Scholes.
+        Using BS with a fixed sigma causes a systematic overestimate when real IV is low,
+        which made hedge premiums appear MORE expensive than the main leg.
+        """
+        # 1. Try live chain LTP first
+        try:
+            from app.core.options.chain_service import ChainService
+            import pandas as _pd
+            chain = ChainService().get_chain(underlying)
+            ltp_col = "ce_ltp" if opt_type == "CE" else "pe_ltp"
+            row = chain.iloc[(chain["strike"] - hedge_strike).abs().argsort()[:1]].iloc[0]
+            ltp = float(row.get(ltp_col, 0) or 0)
+            if ltp >= 0.05:
+                return round(ltp, 2)
+        except Exception:
+            pass
+        # 2. Fall back to Black-Scholes with a more realistic IV estimate
         try:
             from datetime import date as _date
+            from app.core.options.chain_service import ChainService
+            from app.core.options.iv_rank import IVRankService
+            iv_hist = ChainService().get_iv_history(underlying)
+            chain = ChainService().get_chain(underlying)
+            try:
+                atm_row = chain.iloc[(chain["strike"] - spot).abs().argsort()[:1]].iloc[0]
+                raw_iv = float(atm_row.get("ce_iv") or 0)
+                sigma = raw_iv * 100 if raw_iv < 2 else raw_iv
+                sigma = sigma / 100.0 if sigma > 2.0 else sigma
+                if sigma < 0.08 or sigma > 0.80:
+                    sigma = 0.15
+            except Exception:
+                sigma = 0.15
             dte = max(1, (_date.fromisoformat(expiry_date_iso) - _date.today()).days)
             T = dte / 365.0
-            return round(max(0.05, _bs_price(spot, hedge_strike, T, _RF, 0.18, opt_type)), 2)
+            return round(max(0.05, _bs_price(spot, hedge_strike, T, _RF, sigma, opt_type)), 2)
         except Exception:
             return 0.0
 
