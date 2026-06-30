@@ -23,10 +23,12 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 
 ### Risk gate (Redis)
 - `DAILY_PNL_KEY` — running daily P&L, halts at -2% of capital
-- `DAILY_DEPLOYED_KEY` — total deployed capital, caps at 3% portfolio heat
+- `DAILY_DEPLOYED_KEY` — total deployed capital, caps at 3% portfolio heat (= ₹15,000 on ₹5L capital)
 - `TRADING_HALTED_KEY` — boolean, set by circuit breakers
 - `KILL_SWITCH_KEY` — permanent halt until manually reset
+- `spot:{SYM}` — KiteTicker writes current LTP on every tick (TTL=1h); Celery MTM reads from here (cross-process, no in-memory state in worker)
 - On startup: `_sync_portfolio_heat_from_db()` reloads deployed capital from open trades in DB
+- **Risk params in `.env` are PERCENTAGES** (3.0 = 3%), not fractions. `gate.py` divides by 100. Wrong values cause cap of ₹150 instead of ₹15,000.
 
 ### Trade lifecycle
 - Status enum (Python + DB): `OPEN → CLOSED | CANCELLED | PENDING | EXPIRED`
@@ -44,7 +46,33 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - See `backend/app/workers/celery_app.py` for full schedule
 - Key tasks: `scan-priority-15m` (*/15min), `mtm-update` (*/2min), `eod-close-intraday` (15:20 IST Mon-Fri), `generate-briefing` (08:45 IST Mon-Fri)
 - Manual trigger via `POST /api/v1/system/run-task/{task_name}` — use beat schedule name (with hyphens, not underscores)
-- `task_last_run:<celery_task_name>` Redis key written after each task succeeds — shown in /system/schedule
+- `task_last_run:<label>` Redis key written after each task succeeds — shown in /system/schedule
+- scan-all-1h, scan-eod, scan-premarket each write their **own** label key (not shared), passed via `task_label` kwarg in beat schedule
+
+### Pattern classification
+- `BUY_PATTERNS = {"gap_fill", "oi_buildup", "vwap_oi", "pcr_divergence"}` — directional buys, pick ATM
+- `SELL_PATTERNS = {"iv_crush", "mean_reversion", "max_pain", "expiry_week"}` — premium sellers, pick OTM
+- `expiry_week` generates `direction="short"` (sells a strangle) — it belongs in SELL_PATTERNS, not BUY_PATTERNS
+- `_EXPIRY_SAFE = {"max_pain", "expiry_week"}` — these patterns are whitelisted from the event-risk block
+
+### MTM repricing in Celery
+- Celery worker has no active KiteTicker WebSocket (separate process, no in-memory prices)
+- Reads spot from Redis `spot:{SYM}` key (written by FastAPI's KiteTicker on every tick)
+- Falls back to in-process snapshot, then `BASE_PRICES` as last resort
+- BASE_PRICES in instruments.py must be updated when NIFTY/BANKNIFTY levels shift significantly
+
+### IV rank
+- `get_iv_history(underlying)` returns 252 synthetic daily IV values spanning realistic range
+- NIFTY: base=15.5%, lo≈10%, hi≈31% (lo=base*0.65, hi=base*2.0)
+- Current IV comes from ATM chain (`chain_service.get_chain(underlying)`) not random synthetic
+- IV fraction→percentage: `current_iv = raw_iv * 100 if raw_iv < 2.0 else raw_iv`
+- `high_ivr = iv_rank >= 0.6`; low IVR → buy options; high IVR → sell OTM options
+
+### Hedge leg (credit spread)
+- SELL trades get an OTM BUY hedge to cap max loss
+- Guard: `hedge_prem < premium * 0.85` — if hedge costs ≥85% of main, skip hedge (avoid debit spread)
+- `_hedge_premium()` tries live chain LTP first, then BS with ATM chain IV (not fixed sigma=0.18)
+- Trades 53+54 opened before this fix may show debit spread P&L (closed, can't retrofix)
 
 ---
 
@@ -81,13 +109,16 @@ Run these after any change before committing:
 ```
 1. GET /api/v1/system/health        → all 6 components green (db, redis, kite, ticker, celery, market_data)
 2. GET /api/v1/signals/             → returns only NIFTY/BANKNIFTY signals, no nan/inf in response
-3. GET /api/v1/portfolio/?mode=paper → capital > 0, deployed >= 0
+3. GET /api/v1/portfolio/?mode=paper → capital > 0, capital field present (alias for capital_current)
 4. GET /api/v1/dashboard/report     → summary has sharpe_ratio, max_drawdown_pct fields
-5. GET /api/v1/dashboard/pre-market → pcr.NIFTY.pcr and pcr.BANKNIFTY.pcr not null; fii.date not "0"
+5. GET /api/v1/dashboard/pre-market → pcr.NIFTY.pcr and pcr.BANKNIFTY.pcr not null; fii.net_cr present
 6. POST /api/v1/system/run-task/scan-priority-15m → {"queued": true}   ← use hyphens!
 7. Frontend: all 10 nav tabs render without error (check browser console)
 8. Frontend: theme cycle works — click theme button, all 5 themes render correctly
-9. GET /api/v1/system/schedule → after any task runs, last_run field should be populated
+9. GET /api/v1/system/schedule → scan-all-1h/eod/premarket show SEPARATE last_run timestamps
+10. GET /api/v1/options/iv-rank/NIFTY → iv_rank between 0.1–0.9 (not stuck at 0 or 1)
+11. GET /api/v1/options/risk/status → capital_deployed should be ≥ 0 (not negative from float drift)
+12. After scan + 30s → GET /api/v1/trades/?mode=paper&status=OPEN should show new auto-executed trades
 ```
 
 ### FII data gotchas
@@ -96,9 +127,18 @@ Run these after any change before committing:
 - `fii_data["date"]` must use `latest.get("date")` not `latest.name` (pandas index)
 
 ### Sharpe ratio caveat
-- Requires ≥ 2 trading days of closed trades (exits with `exit_time` set) to compute
-- With < 10 days of data the number is statistically meaningless — UI shows `sample_days` alongside
-- A very negative Sharpe (-30 to -40) with < 5 days simply means both trading days were losses
+- Requires ≥ 10 trading days of closed trades (exits with `exit_time` set) to compute
+- Capped at ±10 to prevent extreme values from tiny samples
+- A very negative Sharpe with < 5 days simply means both trading days were losses — statistically meaningless
+
+### asyncio in FastAPI async handlers
+- Always use `asyncio.get_running_loop()` not deprecated `asyncio.get_event_loop()` (Python 3.10+)
+- `get_event_loop()` raises DeprecationWarning inside FastAPI async context and may return wrong loop
+
+### Backtest max_drawdown_pct
+- Equity curve starts at `[0.0]`. Skip drawdown when `peak <= 0` to avoid division by near-zero
+- Values in DB table `pattern_backtests` capped at 100.0 (were overflowing to 296 quadrillion before fix)
+- DB table name is `pattern_backtests` not `pattern_backtest_runs`
 
 ---
 
@@ -130,8 +170,8 @@ backend/app/
 │   ├── kite_config.py     # KiteConfig
 │   └── discovered_pattern.py  # DiscoveredPattern, PatternBacktestRun
 ├── workers/
-│   ├── celery_app.py      # Beat schedule (14 tasks)
-│   └── tasks.py           # All task implementations
+│   ├── celery_app.py      # Beat schedule (15 tasks), task_label kwarg for unique last_run keys
+│   └── tasks.py           # All task implementations, _hedge_premium (chain LTP first, then BS)
 └── main.py                # FastAPI app, lifespan, WS hub, _sync_portfolio_heat_from_db
 
 frontend/src/
