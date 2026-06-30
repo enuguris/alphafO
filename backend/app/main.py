@@ -94,6 +94,18 @@ async def lifespan(app: FastAPI):
     await init_db()
     await _load_kite_credentials_from_db()
 
+    # Restore persisted app_mode from Redis (survives restarts)
+    try:
+        import redis as redis_lib
+        _r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+        _saved_mode = _r.get("alphafO:app_mode")
+        if _saved_mode:
+            from app.config import AppMode
+            settings.app_mode = AppMode(_saved_mode)
+            logger.info(f"App mode restored from Redis: {settings.app_mode}")
+    except Exception as exc:
+        logger.warning(f"Could not restore app_mode from Redis: {exc}")
+
     # Start tick data service (real via Kite Ticker, or simulated fallback)
     from app.core.data.kite_ticker import ticker_service, ensure_stream_groups
     ensure_stream_groups()

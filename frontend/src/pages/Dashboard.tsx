@@ -1066,6 +1066,21 @@ export default function Dashboard() {
                     </div>
                   )}
 
+                  {/* AI Briefing from Claude (generated at 08:45 IST) */}
+                  {preMarket?.ai_briefing && (
+                    <div className="tv-card" style={{ padding: 14, borderLeft: '3px solid #c084fc' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                        <span style={{ fontSize: 10, color: '#c084fc', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.07em' }}>✦ AI Pre-Market Briefing</span>
+                        {preMarket.ai_briefing_date && (
+                          <span style={{ fontSize: 9, color: 'var(--txt3)', marginLeft: 'auto' }}>{preMarket.ai_briefing_date}</span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 12, color: 'var(--txt2)', lineHeight: 1.75, whiteSpace: 'pre-wrap' }}>
+                        {preMarket.ai_briefing}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Recommended patterns */}
                   {(preMarket.recommended_patterns ?? []).length > 0 && (
                     <div className="tv-card" style={{ padding: 12 }}>

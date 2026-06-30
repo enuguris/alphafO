@@ -17,6 +17,7 @@ interface HealthData {
   }
 }
 
+interface DataStatus { mode: string; source_label: string; market_open: boolean; market_time_ist: string; kite_configured: boolean; ltp_sample: { ltp?: number; error?: string } | null }
 interface Trade { id: number; underlying: string; symbol: string; action: string; entry_price: number; unrealized_pnl: number | null; stop_loss: number; notes: string | null }
 interface LogEntry { ts: string; msg: string; kind: 'trade' | 'signal' | 'scan' | 'risk' | 'info' | 'error' }
 
@@ -40,14 +41,32 @@ export default function LiveStatus({ onClose }: { onClose: () => void }) {
   const [health,   setHealth]   = useState<HealthData | null>(null)
   const [trades,   setTrades]   = useState<Trade[]>([])
   const [sigCount, setSigCount] = useState<number | null>(null)
-  const [status,   setStatus]   = useState<{ mode: string; source_label: string; market_open: boolean; market_time_ist: string } | null>(null)
+  const [status,   setStatus]   = useState<DataStatus | null>(null)
   const [portfolio, setPortfolio] = useState<{ capital_current: number; daily_pnl: number; weekly_pnl: number; deployed_capital: number } | null>(null)
+  const [notifPerm, setNotifPerm] = useState<NotificationPermission>('default')
+  const prevHalted = useRef(false)
   const [log, setLog]           = useState<LogEntry[]>([])
   const [scanning, setScanning] = useState(false)
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date())
   const prevTradeIds = useRef<Set<number>>(new Set())
   const prevSigCount = useRef<number | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
+
+  // Request browser notification permission on mount
+  useEffect(() => {
+    if ('Notification' in window) {
+      setNotifPerm(Notification.permission)
+      if (Notification.permission === 'default') {
+        Notification.requestPermission().then(p => setNotifPerm(p))
+      }
+    }
+  }, [])
+
+  const pushNotif = useCallback((title: string, body: string, icon = '📊') => {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      new Notification(`AlphaFO ${icon} ${title}`, { body, icon: '/favicon.ico', silent: false })
+    }
+  }, [])
 
   const addLog = useCallback((msg: string, kind: LogEntry['kind'] = 'info') => {
     const ts = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -74,7 +93,9 @@ export default function LiveStatus({ onClose }: { onClose: () => void }) {
       const currentIds = new Set(newTrades.map((x: Trade) => x.id))
       newTrades.forEach((tr: Trade) => {
         if (!prevTradeIds.current.has(tr.id)) {
-          addLog(`New trade: ${tr.underlying} ${tr.symbol} ${tr.action} @ ₹${tr.entry_price}`, 'trade')
+          const msg = `${tr.underlying} ${tr.symbol} ${tr.action} @ ₹${tr.entry_price}`
+          addLog(`New trade: ${msg}`, 'trade')
+          pushNotif('Trade Opened', msg, '📈')
         }
       })
       prevTradeIds.current = currentIds
@@ -83,14 +104,24 @@ export default function LiveStatus({ onClose }: { onClose: () => void }) {
       // Detect new signals
       const cnt = s.count ?? 0
       if (prevSigCount.current !== null && cnt > prevSigCount.current) {
-        addLog(`${cnt - prevSigCount.current} new signal(s) — total active: ${cnt}`, 'signal')
+        const diff = cnt - prevSigCount.current
+        addLog(`${diff} new signal(s) — total active: ${cnt}`, 'signal')
+        if (diff > 0) pushNotif('New Signals', `${diff} new signal(s) generated`, '🔔')
       }
       prevSigCount.current = cnt
       setSigCount(cnt)
 
-      // Risk alerts
-      if (h?.components?.redis?.trading_halted) {
+      // Risk alerts — only fire notification on state change
+      const halted = h?.components?.redis?.trading_halted
+      if (halted && !prevHalted.current) {
         addLog('⚠ TRADING HALTED — daily loss limit hit', 'risk')
+        pushNotif('Trading Halted', 'Daily loss limit reached — all auto-trading stopped', '🚨')
+      }
+      prevHalted.current = !!halted
+
+      // Kite token stale warning
+      if (st?.kite_configured === false) {
+        addLog('Kite token missing/expired — running on synthetic data', 'risk')
       }
     } catch {
       addLog('Refresh error — backend unreachable', 'error')
@@ -165,6 +196,37 @@ export default function LiveStatus({ onClose }: { onClose: () => void }) {
       </div>
 
       <div style={{ flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 0 }}>
+
+        {/* ── Kite token warning ── */}
+        {status?.kite_configured === false && (
+          <div style={{
+            background: 'rgba(255,82,82,0.10)', borderBottom: '1px solid #ff525244',
+            padding: '8px 14px', display: 'flex', gap: 8, alignItems: 'flex-start',
+          }}>
+            <span style={{ fontSize: 15, flexShrink: 0 }}>⚠</span>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#ff5252' }}>Kite Token Expired</div>
+              <div style={{ fontSize: 10, color: 'var(--txt2)', marginTop: 2 }}>
+                Go to Settings → paste today's request_token to restore live data.
+                Running on synthetic prices until then.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Browser notification prompt ── */}
+        {notifPerm === 'default' && (
+          <div style={{
+            background: 'rgba(156,113,255,0.08)', borderBottom: '1px solid #9c71ff33',
+            padding: '7px 14px', display: 'flex', alignItems: 'center', gap: 8,
+          }}>
+            <span style={{ fontSize: 11, color: '#9c71ff', flex: 1 }}>Enable notifications for trade alerts?</span>
+            <button className="tv-btn" style={{ fontSize: 10, padding: '3px 10px' }}
+              onClick={() => Notification.requestPermission().then(p => setNotifPerm(p))}>
+              Allow
+            </button>
+          </div>
+        )}
 
         {/* ── Mode + market ── */}
         <Section label="SESSION">

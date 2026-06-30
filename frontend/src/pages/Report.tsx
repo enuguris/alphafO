@@ -45,6 +45,65 @@ export default function Report() {
   return (
     <div className="scroll-y" style={{ flex: 1, padding: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
 
+      {/* Live trading gate */}
+      {(() => {
+        const closed   = s.total_trades ?? 0
+        const winRate  = s.win_rate ?? 0
+        const drawdown = s.max_drawdown_pct ?? 0
+        const needTrades   = 60
+        const needWinRate  = 0.55
+        const maxDrawdown  = 10
+        const t1 = closed >= needTrades
+        const t2 = winRate >= needWinRate
+        const t3 = drawdown <= maxDrawdown
+        const unlocked = t1 && t2 && t3
+        return (
+          <div className="tv-card" style={{
+            padding: 14,
+            borderLeft: `3px solid ${unlocked ? '#26c6a0' : '#ffab40'}`,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+              <span style={{ fontSize: 11, fontWeight: 800, color: 'var(--txt)' }}>Live Trading Gate</span>
+              <span style={{
+                marginLeft: 'auto', fontSize: 10, fontWeight: 700, padding: '2px 9px', borderRadius: 3,
+                background: unlocked ? 'rgba(38,198,160,0.12)' : 'rgba(255,171,64,0.12)',
+                color: unlocked ? '#26c6a0' : '#ffab40',
+                border: `1px solid ${unlocked ? '#26c6a044' : '#ffab4044'}`,
+              }}>
+                {unlocked ? '✓ UNLOCKED' : 'LOCKED'}
+              </span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
+              {[
+                { label: 'Closed trades', val: closed, need: needTrades, unit: '', met: t1, fmt: (v: number) => String(v) },
+                { label: 'Win rate',      val: winRate * 100, need: needWinRate * 100, unit: '%', met: t2, fmt: (v: number) => v.toFixed(1) + '%' },
+                { label: 'Max drawdown',  val: drawdown, need: maxDrawdown, unit: '%', met: t3, fmt: (v: number) => v.toFixed(1) + '%', reverse: true },
+              ].map(g => (
+                <div key={g.label}>
+                  <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 4 }}>{g.label}</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: g.met ? '#26c6a0' : 'var(--txt)' }}>
+                    {g.fmt(g.val)}
+                  </div>
+                  <div style={{ marginTop: 5, height: 4, borderRadius: 2, background: 'var(--border)', overflow: 'hidden' }}>
+                    <div style={{
+                      height: '100%', borderRadius: 2,
+                      background: g.met ? '#26c6a0' : '#ffab40',
+                      width: `${Math.min(100, g.reverse
+                        ? Math.max(0, (1 - g.val / (g.need * 2)) * 100)
+                        : (g.val / g.need) * 100)}%`,
+                      transition: 'width 0.4s',
+                    }} />
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 3 }}>
+                    {g.met ? '✓ met' : `need ${g.reverse ? '≤' : '≥'}${g.fmt(g.need)}`}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <div>

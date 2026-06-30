@@ -47,9 +47,18 @@ class AnthropicKeyIn(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+_MODE_REDIS_KEY = "alphafO:app_mode"
+
 @router.put("/mode")
 async def set_mode(update: ModeUpdate):
     settings.app_mode = update.mode
+    # Persist to Redis so the mode survives container restarts
+    try:
+        import redis as redis_lib
+        from app.config import settings as _s
+        redis_lib.from_url(_s.redis_url, decode_responses=True).set(_MODE_REDIS_KEY, update.mode.value)
+    except Exception:
+        pass
     return {"mode": settings.app_mode, "message": f"Switched to {update.mode} mode"}
 
 
