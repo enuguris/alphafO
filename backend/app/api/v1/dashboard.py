@@ -157,7 +157,7 @@ async def pre_market_briefing(db: AsyncSession = Depends(get_db)):
     try:
         from app.core.backtest.market_data import fetch_fii_fo_data
         import asyncio
-        fii_df = await asyncio.get_event_loop().run_in_executor(None, fetch_fii_fo_data)
+        fii_df = await asyncio.get_running_loop().run_in_executor(None, fetch_fii_fo_data)
         if fii_df is not None and not fii_df.empty:
             latest = fii_df.iloc[-1]
             net = float(latest.get("fii_net_idx", 0))
@@ -479,12 +479,14 @@ async def trading_report(db: AsyncSession = Depends(get_db)):
     daily_returns = list(daily_pnl_pre.values())
 
     sharpe = 0.0
-    if len(daily_returns) >= 2:
+    if len(daily_returns) >= 10:
         avg_r = sum(daily_returns) / len(daily_returns)
         variance = sum((r - avg_r) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
         std_r = math.sqrt(variance) if variance > 0 else 0
         if std_r > 0:
-            sharpe = round((avg_r / std_r) * math.sqrt(252), 2)
+            # Cap at ±10 — values beyond that are statistical noise with small samples
+            raw = (avg_r / std_r) * math.sqrt(252)
+            sharpe = round(max(-10.0, min(10.0, raw)), 2)
 
     # Max consecutive losses
     sorted_by_exit = sorted(trades, key=lambda t: t.exit_time or datetime.min)

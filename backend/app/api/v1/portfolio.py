@@ -15,7 +15,9 @@ async def get_portfolio(mode: str = "paper", db: AsyncSession = Depends(get_db))
     portfolio = result.scalar_one_or_none()
     if not portfolio:
         return {"message": f"No {mode} portfolio found. Start paper trading to create one."}
-    return portfolio.__dict__
+    data = {k: v for k, v in portfolio.__dict__.items() if not k.startswith("_")}
+    data["capital"] = data.get("capital_current")  # frontend alias
+    return data
 
 
 @router.get("/pnl")
