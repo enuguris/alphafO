@@ -47,6 +47,7 @@ async def get_schedule():
         "reset-daily-pnl":        "Reset daily P&L counter at 09:15",
         "reset-weekly-pnl":       "Reset weekly P&L every Monday at 09:15",
         "confirm-order-fills":    "Confirm Kite live order fills (every 2 min)",
+        "generate-briefing":      "AI pre-market briefing via Claude Sonnet at 08:45",
     }
 
     tasks_out = []
