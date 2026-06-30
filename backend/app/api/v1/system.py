@@ -60,19 +60,20 @@ async def get_schedule():
                 f"dow={sched._orig_day_of_week}"
             )
 
-        # Last-run: Celery stores result metadata under celery-task-meta-<task_name>
-        # We use a simpler custom key written by each task
+        # Last-run: written by each task via _stamp_task_run()
         last_run = None
         task_name = cfg.get("task", "")
+        # Per-schedule label takes priority (scan-all-1h/eod/premarket all share the same task)
+        task_label = cfg.get("kwargs", {}).get("task_label") or task_name
         if r:
-            # Try standard Celery result key pattern
-            key = f"task_last_run:{task_name}"
-            val = r.get(key)
-            if val:
-                try:
-                    last_run = datetime.fromisoformat(val).isoformat()
-                except Exception:
-                    last_run = val
+            for key_candidate in [f"task_last_run:{task_label}", f"task_last_run:{task_name}"]:
+                val = r.get(key_candidate)
+                if val:
+                    try:
+                        last_run = datetime.fromisoformat(val).isoformat()
+                    except Exception:
+                        last_run = val
+                    break
 
         tasks_out.append({
             "name":        name,

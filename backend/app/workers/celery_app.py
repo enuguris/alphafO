@@ -37,7 +37,7 @@ celery_app.conf.update(
                 hour="9-15",
                 day_of_week="1-5",
             ),
-            "kwargs": {"timeframes": ["1h", "4h", "daily"]},
+            "kwargs": {"timeframes": ["1h", "4h", "daily"], "task_label": "workers.scan_all_instruments_1h"},
         },
         # End-of-day full scan at 15:35 IST
         "scan-eod": {
@@ -47,7 +47,7 @@ celery_app.conf.update(
                 hour="15",
                 day_of_week="1-5",
             ),
-            "kwargs": {"timeframes": ["daily", "4h"]},
+            "kwargs": {"timeframes": ["daily", "4h"], "task_label": "workers.scan_all_instruments_eod"},
         },
         # Pre-market setup at 9:00 IST
         "scan-premarket": {
@@ -57,7 +57,7 @@ celery_app.conf.update(
                 hour="9",
                 day_of_week="1-5",
             ),
-            "kwargs": {"timeframes": ["daily"]},
+            "kwargs": {"timeframes": ["daily"], "task_label": "workers.scan_all_instruments_premarket"},
         },
         # MTM repricing every minute during market hours
         "mtm-update": {

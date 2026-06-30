@@ -1027,14 +1027,17 @@ def scan_priority_instruments(self, timeframes: list[str] | None = None):
 
 
 @celery_app.task(name="workers.scan_all_instruments", bind=True, max_retries=2)
-def scan_all_instruments(self, timeframes: list[str] | None = None):
+def scan_all_instruments(self, timeframes: list[str] | None = None, task_label: str | None = None):
     from app.core.instruments import priority_scan_list
     symbols = priority_scan_list()   # respects TESTING_FOCUS when set
     tfs = timeframes or ["1h", "4h", "daily"]
     logger.info(f"Full scan: {len(symbols)} symbols × {tfs}")
     try:
         result = _run_async(_do_scan(symbols, tfs))
+        # Stamp both the generic key and the caller-specific label (for beat schedule tracking)
         _stamp_task_run("workers.scan_all_instruments")
+        if task_label:
+            _stamp_task_run(task_label)
         return result
     except Exception as exc:
         logger.error(f"Full scan failed: {exc}")

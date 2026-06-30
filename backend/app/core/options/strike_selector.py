@@ -12,8 +12,8 @@ STRIKE_STEPS = {
 DEFAULT_STRIKE_STEP = 50
 
 # Patterns that prefer premium selling vs directional buying
-BUY_PATTERNS  = {"gap_fill", "oi_buildup", "expiry_week", "vwap_oi", "pcr_divergence"}
-SELL_PATTERNS = {"iv_crush", "mean_reversion", "max_pain"}
+BUY_PATTERNS  = {"gap_fill", "oi_buildup", "vwap_oi", "pcr_divergence"}
+SELL_PATTERNS = {"iv_crush", "mean_reversion", "max_pain", "expiry_week"}
 
 
 def _round_to_step(price: float, step: int) -> int:
