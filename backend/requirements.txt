@@ -47,3 +47,5 @@ factory-boy==3.3.0
 python-dateutil==2.9.0.post0
 pytz==2024.1
 loguru==0.7.2
+
+yfinance>=0.2

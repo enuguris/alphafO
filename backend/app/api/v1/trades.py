@@ -194,11 +194,13 @@ async def trade_chart(trade_id: int, db: AsyncSession = Depends(get_db)):
             except Exception:
                 pass
 
-    # ── Underlying index OHLCV (real 5-min candles via Kite) ───────────────────
-    # Fixed NSE index instrument tokens (permanent, do not change)
+    # ── Underlying OHLCV — try Kite 5-min first, fall back to bhav daily ────────
     KITE_INDEX_TOKENS: dict[str, int] = {"NIFTY": 256265, "BANKNIFTY": 260105, "FINNIFTY": 257801}
     underlying_bars: list[dict] = []
+    underlying_source = "unavailable"
+
     if entry_time and trade.underlying:
+        # 1) Try Kite 5-min historical (requires active Kite session)
         token = KITE_INDEX_TOKENS.get(trade.underlying.upper())
         if token:
             try:
@@ -211,12 +213,49 @@ async def trade_chart(trade_id: int, db: AsyncSession = Depends(get_db)):
                     if df2 is not None and not df2.empty:
                         for _, row in df2.iterrows():
                             ts = row.get("timestamp") or row.name
-                            t_iso = (ts.isoformat().replace("+00:00", "") + "Z") if hasattr(ts, "isoformat") else str(ts)
+                            try:
+                                # Kite returns IST-aware timestamps — convert to UTC
+                                ts_utc = ts.tz_convert("UTC") if hasattr(ts, "tz_convert") else ts
+                                t_iso = ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except Exception:
+                                t_iso = str(ts)
                             underlying_bars.append({
                                 "time": t_iso,
                                 "open": float(row["open"]), "high": float(row["high"]),
                                 "low": float(row["low"]),   "close": float(row["close"]),
                             })
+                        underlying_source = "kite_5min"
+            except Exception:
+                pass
+
+        # 2) Fall back to yfinance 5-min (free, no auth, covers recent dates)
+        if not underlying_bars:
+            try:
+                import yfinance as yf
+                YF_SYMBOLS = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "^CNXFIN"}
+                yf_sym = YF_SYMBOLS.get(trade.underlying.upper())
+                if yf_sym:
+                    from_dt3 = entry_time - timedelta(hours=2)
+                    to_dt3   = (trade.exit_time or datetime.utcnow()) + timedelta(hours=1)
+                    ticker = yf.Ticker(yf_sym)
+                    df3 = ticker.history(
+                        start=from_dt3.strftime("%Y-%m-%d"),
+                        end=(to_dt3 + timedelta(days=1)).strftime("%Y-%m-%d"),
+                        interval="5m"
+                    )
+                    if df3 is not None and not df3.empty:
+                        for ts, row in df3.iterrows():
+                            try:
+                                ts_utc = ts.tz_convert("UTC")
+                                t_iso = ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except Exception:
+                                t_iso = str(ts)
+                            o = float(row["Open"]); h = float(row["High"])
+                            lo = float(row["Low"]); c = float(row["Close"])
+                            if c > 0:
+                                underlying_bars.append({"time": t_iso, "open": o, "high": h, "low": lo, "close": c})
+                        if underlying_bars:
+                            underlying_source = "yfinance_5min"
             except Exception:
                 pass
 
@@ -233,7 +272,7 @@ async def trade_chart(trade_id: int, db: AsyncSession = Depends(get_db)):
         "exit_time":      (trade.exit_time.isoformat() + "Z") if trade.exit_time else None,
         "signal":         signal_data,
         "underlying_bars": underlying_bars,
-        "underlying_source": "kite" if underlying_bars else "unavailable",
+        "underlying_source": underlying_source,
         # legacy option price chart kept for reference
         "chart":          chart,
         "chart_source":   "kite" if any(c for c in chart) and "fetched" in dir() and fetched else "bs_estimated",

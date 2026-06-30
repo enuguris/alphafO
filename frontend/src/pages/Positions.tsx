@@ -242,9 +242,11 @@ function SignalRationale({ tradeId, symbol, strike, optionType, entryTime, entry
         <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6 }}>
           <span style={{ color: 'var(--blue)', fontWeight: 600 }}>{(data.underlying || '').toUpperCase() || sym?.replace(/\d.*/, '')}</span>
           {' '}underlying · 5-min · IST
-          {data.underlying_source === 'kite'
-            ? <span style={{ marginLeft: 6, color: 'var(--up)' }}>● live Kite data</span>
-            : <span style={{ marginLeft: 6, color: 'var(--txt3)' }}>○ Kite not connected</span>}
+          {data.underlying_source === 'kite_5min'
+            ? <span style={{ marginLeft: 6, color: 'var(--up)' }}>● 5-min · Kite</span>
+            : data.underlying_source === 'yfinance_5min'
+            ? <span style={{ marginLeft: 6, color: 'var(--up)' }}>● 5-min · Yahoo Finance</span>
+            : <span style={{ marginLeft: 6, color: 'var(--txt3)' }}>○ no data</span>}
           {strike && <span style={{ marginLeft: 10 }}>strike <strong style={{ color: 'var(--orange)' }}>₹{strike}</strong> {optionType} shown as dashed line</span>}
         </div>
         <UnderlyingChart
