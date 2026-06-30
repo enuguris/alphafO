@@ -884,6 +884,26 @@ async def _close_trade(trade, exit_price: float, reason: str, db):
     except Exception:
         pass
 
+    # Auto-close hedge leg when main trade closes (they share the same symbol prefix)
+    # Hedge is identified by notes containing "spread_leg:hedge|main_sym:<symbol>"
+    if trade.notes and "spread_leg:main" in trade.notes:
+        try:
+            from app.models.trades import Trade as _Trade, TradeStatus as _TStatus
+            from sqlalchemy import select as _sel
+            hedge_marker = f"main_sym:{trade.symbol}"
+            hedge_q = await db.execute(
+                _sel(_Trade).where(
+                    _Trade.status == _TStatus.OPEN,
+                    _Trade.underlying == trade.underlying,
+                    _Trade.notes.like(f"%{hedge_marker}%"),
+                )
+            )
+            hedge_trade = hedge_q.scalar_one_or_none()
+            if hedge_trade:
+                await _close_trade(hedge_trade, exit_price, f"hedge_{reason}", db)
+        except Exception as _he:
+            logger.debug(f"Hedge auto-close skipped: {_he}")
+
 
 # ── Expiry settler ────────────────────────────────────────────────────────────
 
