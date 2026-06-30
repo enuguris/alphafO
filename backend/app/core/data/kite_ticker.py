@@ -311,6 +311,9 @@ class KiteTickerService:
 
             self._live_prices[sym] = {"ltp": ltp, "chg": round(chg, 2)}
 
+            # Write to a simple key so Celery workers (no in-memory snapshot) can read it
+            pipe.set(f"spot:{sym}", str(round(ltp, 2)), ex=3600)
+
             pipe.xadd(STREAM_KEY, {
                 "sym": sym,
                 "ltp": str(round(ltp, 2)),
@@ -343,6 +346,7 @@ class KiteTickerService:
                 chg  = round((ltp - open_px) / open_px * 100, 2) if open_px else 0.0
                 self._live_prices[sym] = {"ltp": ltp, "chg": chg}
                 batch[sym] = {"ltp": ltp, "chg": chg}
+                pipe.set(f"spot:{sym}", str(ltp), ex=3600)
 
                 pipe.xadd(STREAM_KEY, {
                     "sym": sym,

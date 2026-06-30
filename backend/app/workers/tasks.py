@@ -654,16 +654,28 @@ async def _do_mtm_update():
             except Exception as e:
                 logger.warning(f"MTM Kite quote unavailable: {e}")
 
-        # Build spot price lookup for BS fallback
+        # Build spot price lookup for BS fallback — read from Redis (cross-process)
         spot_prices: dict[str, float] = {}
         try:
-            from app.core.data.kite_ticker import ticker_service
-            snap = ticker_service.get_snapshot()
-            for sym, data in snap.items():
-                if data.get("ltp", 0) > 0:
-                    spot_prices[sym] = data["ltp"]
+            import redis as _redis_lib
+            from app.config import settings
+            _r = _redis_lib.from_url(settings.redis_url, decode_responses=True)
+            for sym in ["NIFTY", "BANKNIFTY", "SENSEX"]:
+                val = _r.get(f"spot:{sym}")
+                if val:
+                    spot_prices[sym] = float(val)
         except Exception:
             pass
+        # Fallback to in-process snapshot (populated in FastAPI process only)
+        if not spot_prices:
+            try:
+                from app.core.data.kite_ticker import ticker_service
+                snap = ticker_service.get_snapshot()
+                for sym, data in snap.items():
+                    if data.get("ltp", 0) > 0:
+                        spot_prices[sym] = data["ltp"]
+            except Exception:
+                pass
 
         now = datetime.utcnow()
         for trade in trades:
