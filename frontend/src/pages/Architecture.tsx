@@ -1,246 +1,374 @@
 import { useState } from 'react'
 
-type NodeId = 'frontend' | 'backend' | 'patterns' | 'risk' | 'options' | 'postgres' | 'redis' | 'celery' | 'kite' | 'nse'
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type NodeId =
+  | 'frontend' | 'backend' | 'kite'
+  | 'patterns' | 'risk' | 'options'
+  | 'postgres' | 'redis' | 'celery'
+  | 'nse' | 'yahoo'
+
+interface NodeMeta {
+  x: number; y: number; w: number; h: number
+  label: string; sub: string; color: string; ext?: boolean
+}
+
+interface Conn {
+  id: string; d: string; color: string; dur: number
+  r?: number; label?: string; labelX?: number; labelY?: number
+}
+
+// ─── Visual layout ────────────────────────────────────────────────────────────
+
+const N: Record<NodeId, NodeMeta> = {
+  frontend: { x:130, y:22,  w:400, h:54,  label:'React Frontend',   sub:'10 pages · Zustand · WebSocket hub',             color:'#4488ff' },
+  backend:  { x:28,  y:118, w:282, h:58,  label:'FastAPI Backend',  sub:'Python 3.12 · async · 10 API routes',             color:'#26a69a' },
+  kite:     { x:370, y:118, w:262, h:58,  label:'Kite Connect',     sub:'Zerodha · live prices · OAuth daily token',        color:'#ff9800', ext:true },
+  patterns: { x:28,  y:226, w:164, h:72,  label:'Pattern Engine',   sub:'8 patterns · IV gate · composite score',           color:'#7b61ff' },
+  risk:     { x:220, y:226, w:152, h:72,  label:'Risk Gate',        sub:'circuit breakers · trailing stop',                 color:'#ef5350' },
+  options:  { x:408, y:226, w:224, h:72,  label:'Options Engine',   sub:'chain · IV rank · max pain · regime',              color:'#4fa3e0' },
+  postgres: { x:28,  y:342, w:164, h:72,  label:'PostgreSQL',       sub:'7 tables · Alembic migrations',                   color:'#9b8fff' },
+  redis:    { x:220, y:342, w:152, h:72,  label:'Redis',            sub:'4 circuit breakers · Celery broker',               color:'#ff6b6b' },
+  celery:   { x:408, y:342, w:224, h:72,  label:'Celery Workers',   sub:'14 scheduled tasks · Celery Beat',                color:'#26c6b0' },
+  nse:      { x:28,  y:458, w:258, h:56,  label:'NSE Market Data',  sub:'bhavcopy · PCR cache · FII OI · bhav replayer',   color:'#888780' },
+  yahoo:    { x:308, y:458, w:324, h:56,  label:'Yahoo Finance',    sub:'India VIX (^INDIAVIX) · OHLCV fallback tier-2',   color:'#7ecaff', ext:true },
+}
+
+// ─── Connection paths ─────────────────────────────────────────────────────────
+
+const CONNS: Conn[] = [
+  // Frontend ↔ Backend (S-curves, slightly offset)
+  {
+    id:'fe-be', color:'#4488ff', dur:1.7,
+    d:'M330,76 C330,97 169,97 169,118',
+    label:'REST + WebSocket', labelX:220, labelY:94,
+  },
+  {
+    id:'be-fe', color:'#26a69a', dur:2.1,
+    d:'M173,118 C173,97 334,97 334,76',
+  },
+
+  // Backend ↔ Kite (horizontal pair, offset)
+  {
+    id:'be-kt', color:'#ff9800', dur:1.4,
+    d:'M310,140 L370,140',
+    label:'live prices', labelX:338, labelY:133,
+  },
+  {
+    id:'kt-be', color:'#26a69a', dur:1.8,
+    d:'M370,150 L310,150',
+  },
+
+  // Backend → Domain engines (fan out)
+  { id:'be-pa', color:'#7b61ff', dur:2.0, d:'M90,176 C70,204 90,218 110,226' },
+  { id:'be-ri', color:'#ef5350', dur:1.6, d:'M169,176 C169,204 296,204 296,226' },
+  { id:'be-op', color:'#4fa3e0', dur:1.9, d:'M248,176 C310,204 460,204 520,226' },
+
+  // Kite → Options (live chain data)
+  { id:'kt-op', color:'#ff9800', dur:1.3, d:'M501,176 L520,226' },
+
+  // Domain → Infrastructure (straight verticals)
+  { id:'pa-pg', color:'#9b8fff', dur:1.3, d:'M110,298 L110,342' },
+  { id:'ri-rd', color:'#ff6b6b', dur:1.1, d:'M296,298 L296,342' },
+  { id:'op-ce', color:'#26c6b0', dur:1.5, d:'M520,298 L520,342' },
+
+  // Redis → Risk Gate (risk gate reads Redis flags; curves left between the two)
+  {
+    id:'rd-ri', color:'#ff4444', dur:1.9, r:2.5,
+    d:'M220,378 C200,356 212,314 220,298',
+  },
+
+  // NSE → PostgreSQL + Celery (batch data flow upward)
+  { id:'nse-pg', color:'#888780', dur:2.2, r:2.8, d:'M90,458 C70,432 76,418 110,414' },
+  { id:'nse-ce', color:'#888780', dur:2.0, r:2.8, d:'M262,466 C330,440 440,440 520,414' },
+
+  // Yahoo → Backend (India VIX — daily fetch, cached 18h)
+  {
+    id:'yh-be', color:'#7ecaff', dur:2.5, r:2.8,
+    d:'M420,458 C450,360 390,260 248,176',
+    label:'VIX', labelX:404, labelY:360,
+  },
+
+  // Yahoo → Pattern Engine (OHLCV tier-2 for walk-forward backtests)
+  { id:'yh-pa', color:'#7ecaff', dur:2.8, r:2.8, d:'M308,480 C250,458 174,410 110,298' },
+]
+
+// ─── Tier bands ───────────────────────────────────────────────────────────────
+
+const BANDS = [
+  { label:'PRESENTATION',   y:10,  h:88,  color:'#4488ff' },
+  { label:'APPLICATION',    y:102, h:100, color:'#26a69a' },
+  { label:'DOMAIN LOGIC',   y:206, h:106, color:'#7b61ff' },
+  { label:'INFRASTRUCTURE', y:316, h:110, color:'#888780' },
+  { label:'DATA SOURCES',   y:430, h:94,  color:'#7ecaff' },
+]
+
+// ─── Detail panel content ─────────────────────────────────────────────────────
 
 interface Detail {
-  title: string
-  color: string
-  tagline: string
-  overview: string
-  bullets: string[]
-  tech: string[]
-  connects: string[]
+  title: string; color: string; tagline: string
+  overview: string; bullets: string[]; tech: string[]; connects: string[]
 }
 
 const DETAILS: Record<NodeId, Detail> = {
   frontend: {
-    title: 'React Frontend', color: '#4488ff',
-    tagline: '10 pages · Zustand · React Query · WebSocket',
-    overview: 'Single-page application built with React 18 + Vite. Handles all user interaction from signal browsing to live trade management, with five switchable UI themes persisted in localStorage.',
-    bullets: [
-      'Dashboard — pre-market briefing (PCR, FII, IV rank), live signal feed, sector scanner',
-      'Options — chain analysis, IV rank bar, max-pain overlay, regime badge',
-      'Positions — open paper trades with real-time MTM, trailing-stop indicator, close button',
-      'Pattern Finder — run walk-forward backtests, discover statistical edges via Mann-Whitney U',
-      'Report — Sharpe ratio, max drawdown, win rate, equity curve, pattern breakdown',
-      'Paper Trading — virtual trade history, cumulative P&L chart',
-      'Backtest — per-pattern walk-forward with equity curve and trade list',
-      'Settings — Kite credentials, trading mode, Anthropic API key, 5-theme picker',
-      'System Health — component health grid, 14 Celery tasks, manual trigger buttons',
+    title:'React Frontend', color:'#4488ff',
+    tagline:'10 pages · Zustand · React Query · 5 themes · WebSocket',
+    overview:'SPA built with React 18 + Vite. Handles all user interaction from signal browsing to live trade management. Five switchable UI themes (dark, midnight, high-contrast, solarized, light) persisted in localStorage.',
+    bullets:[
+      'Dashboard — pre-market briefing (PCR, FII, India VIX, IV rank), live signal feed, multi-timeframe sector scanner',
+      'Options — live chain analysis, IV rank bar, max-pain overlay, event calendar, regime badge',
+      'Positions — open paper trades with real-time MTM, trailing-stop indicator, one-click close',
+      'Pattern Finder — run walk-forward backtests, discover statistical edges via Mann-Whitney U test',
+      'Report — Sharpe ratio, max drawdown, max consecutive losses, avg hold time, equity curve',
+      'Paper Trading — full virtual trade history with cumulative P&L chart',
+      'Backtest — per-pattern walk-forward with equity curve and individual trade drill-down',
+      'Settings — Kite credentials, trading mode selector, Anthropic API key, 5-theme picker grid',
+      'System Health — component health grid, 14 Celery tasks with last-run timestamps, manual triggers',
       'Architecture — this animated diagram',
-      'Zustand stores: themeStore (dark/midnight/high-contrast/solarized/light), modeStore (paper/live/testing)',
-      'React Query: smart cache with 30s stale-time for portfolio, signals, dashboard',
-      'All API calls centralised in api/client.ts via axios targeting /api/v1/*',
+      'Zustand: themeStore (5 themes), modeStore (paper / live / testing)',
+      'React Query: 30s stale-time; background refetch on window focus for portfolio and signals',
+      'api/client.ts centralises all axios calls targeting /api/v1/* and /ws/* endpoints',
     ],
-    tech: ['React 18', 'Vite 5', 'TypeScript', 'Zustand', 'React Query', 'Recharts', 'Axios'],
-    connects: ['FastAPI Backend — REST requests + WebSocket subscription'],
+    tech:['React 18', 'Vite 5', 'TypeScript', 'Zustand', 'React Query', 'Recharts', 'Axios'],
+    connects:['FastAPI Backend — all REST requests + WebSocket subscriptions (/ws/signals, /ws/prices)'],
   },
+
   backend: {
-    title: 'FastAPI Backend', color: '#26a69a',
-    tagline: 'Python 3.12 · async SQLAlchemy · Black-Scholes · WebSocket hub',
-    overview: 'Central async API server. Every trade, signal, and analytics request flows through here. Also acts as the WebSocket broadcast hub so all open browser tabs receive live signal and price updates simultaneously.',
-    bullets: [
-      '/api/v1/signals — list, create, expire; TESTING_FOCUS filter; nan/inf sanitisation',
+    title:'FastAPI Backend', color:'#26a69a',
+    tagline:'Python 3.12 · async SQLAlchemy · Black-Scholes · WebSocket hub',
+    overview:'Central async API server and WebSocket broadcast hub. Every trade, signal, and analytics request flows through here. Also fetches India VIX from Yahoo Finance (^INDIAVIX) and includes it in the pre-market briefing.',
+    bullets:[
+      '/api/v1/signals — list, create, expire; TESTING_FOCUS filter; nan/inf sanitisation via _safe_dict()',
       '/api/v1/trades — open/close paper trades, MTM refresh, auto-execution gate at ≥82% confidence',
-      '/api/v1/portfolio — capital tracking, heat sync, cumulative P&L series',
-      '/api/v1/backtest — walk-forward engine API with IV-rank gate',
+      '/api/v1/portfolio — capital tracking, heat sync, cumulative P&L time series',
+      '/api/v1/backtest — walk-forward engine API with per-pattern IV-rank gate',
       '/api/v1/options — chain, IV rank, max pain, event calendar, regime overlay',
-      '/api/v1/dashboard — pre-market briefing + report (Sharpe, drawdown, win rate)',
+      '/api/v1/dashboard — pre-market briefing (PCR + FII + India VIX + IV rank) + full performance report',
       '/api/v1/pattern-finder — discover edges, run backtests, toggle/delete discovered patterns',
-      '/api/v1/settings — Kite credentials, Anthropic key, Kite connection test',
-      '/api/v1/system — health checks, Celery schedule, manual task trigger',
+      '/api/v1/settings — Kite credentials, Anthropic key, 5-check Kite connection test',
+      '/api/v1/system — health checks, Celery schedule with last-run times, manual task trigger',
       '/api/v1/chat — routes messages to Claude Sonnet 4.6 via Anthropic SDK',
-      '/ws/signals — broadcasts new signals to all connected clients in real time',
+      '/ws/signals — broadcasts new signals to ALL connected clients simultaneously',
       '/ws/prices — rebroadcasts Kite LTP ticks to browser for live price display',
-      'Black-Scholes engine computes synthetic option premiums when Kite is offline',
+      'Black-Scholes engine: synthetic option premiums + greeks when Kite is offline',
       'Startup lifespan: re-syncs Redis deployed-capital from DB open trades to survive restarts',
     ],
-    tech: ['FastAPI', 'Python 3.12', 'SQLAlchemy 2 async', 'Alembic', 'Pydantic v2', 'Anthropic SDK', 'asyncpg'],
-    connects: [
+    tech:['FastAPI', 'Python 3.12', 'SQLAlchemy 2 async', 'Alembic', 'Pydantic v2', 'Anthropic SDK', 'asyncpg'],
+    connects:[
       'Frontend ← REST responses + WebSocket push',
       'PostgreSQL — async ORM reads/writes via SQLAlchemy',
       'Redis — circuit-breaker flag checks before every trade',
       'Celery — task dispatch via Redis broker',
       'Kite Connect — live prices and order placement',
+      'Yahoo Finance — India VIX (^INDIAVIX) fetched daily, cached 18h in market_data/india_vix.csv',
     ],
   },
+
+  kite: {
+    title:'Kite Connect', color:'#ff9800',
+    tagline:'Zerodha broker API · Live WebSocket ticker · Daily OAuth token',
+    overview:'Zerodha broker API for live market data and order execution. When disconnected the system falls back automatically to Black-Scholes synthetic pricing (tier-2: Yahoo Finance OHLCV, tier-3: NSE bhav replayer), so paper trading continues without interruption.',
+    bullets:[
+      'KiteTicker WebSocket — real-time LTP feed for NIFTY + BANKNIFTY futures and all tracked option strikes',
+      'Historical OHLCV — 15m / 1h / 4h / daily candles for multi-timeframe pattern detection (tier-1 source)',
+      'Instrument master — full F&O universe: lot sizes, expiry dates, strike step sizes for all underlyings',
+      'Order placement — market + limit orders for live trading; gated behind paper-trading performance threshold',
+      'OAuth flow — daily access_token obtained by exchanging request_token from Kite login redirect URL',
+      'Synthetic fallback — when disconnected, Black-Scholes uses last-known IV to price all options',
+      'is_synthetic flag — real signals have explanation "[Weekly/Monthly expiry …]"; synthetic starts with "["',
+      'Connection test — /api/v1/settings/test-connection runs 5 independent sub-checks with breakdown',
+    ],
+    tech:['kiteconnect-py', 'WebSocket', 'OAuth 2.0', 'REST API'],
+    connects:[
+      'FastAPI Backend — all REST calls, price ticks rebroadcast to /ws/prices, order placement',
+      'Options Engine — live option chain data (OI, IV, LTP per strike)',
+    ],
+  },
+
   patterns: {
-    title: 'Pattern Engine', color: '#7b61ff',
-    tagline: '8 patterns · IV rank gate · Composite confidence scorer',
-    overview: 'The alpha-generation core. Eight independently pluggable pattern modules each implement a distinct market mechanism. The scanner runs all of them every 5 minutes and merges results through the composite confidence scorer before writing signals to DB.',
-    bullets: [
-      'Gap Fill — pre-market gap ≥0.5% with OI > 20L; 70% of gaps fill within session',
+    title:'Pattern Engine', color:'#7b61ff',
+    tagline:'8 patterns · IV rank gate · Composite confidence scorer · Walk-forward backtesting',
+    overview:'Alpha-generation core. Eight independently pluggable pattern modules each implement a distinct market mechanism. Data priority for OHLCV: Kite Connect → Yahoo Finance → NSE bhav replayer.',
+    bullets:[
+      'Gap Fill — pre-market gap ≥0.5% + OI > 20L; ~70% of gaps fill within the same session',
       'PCR Divergence — PCR < 0.7 (bearish extreme) or > 1.3 (bullish) signals institutional positioning',
       'Mean Reversion — Bollinger Band squeeze break confirmed on both 15m and 1h timeframes',
       'OI Buildup — open interest increasing alongside price confirmation = smart money accumulation',
-      'VWAP + OI — price rejects VWAP level on high OI buildup = institutional defence',
+      'VWAP + OI — price rejects VWAP level on high OI buildup = institutional level defence',
       'IV Crush — sell options when IV rank > 75% ahead of scheduled events (results, RBI policy)',
-      'Max Pain Gravity — expiry week: price gravitates to the strike where writers lose least',
+      'Max Pain Gravity — expiry week: price gravitates to strike where option writers lose least',
       'Expiry Week Theta — harvest rapid theta decay in the final 48 hours of weekly expiry',
       'IV rank gate — each pattern requires IV rank above a per-pattern threshold before firing',
-      'Composite scorer — multi-factor 0–1 confidence with weighted inputs (PCR, IV rank, OI trend)',
+      'Composite scorer — 0–1 confidence: PCR weight + IV rank + OI trend + directional filters',
       'Auto-trade gate — ≥0.82 confidence (real Kite) or ≥0.72 (synthetic) triggers auto paper trade',
       'Signal dedup — (underlying, pattern, direction, option_type) within 1-hour window prevents floods',
-      'Age gate — signals > 2h old are skipped at auto-execution time to avoid stale strikes',
+      'Age gate — signals older than 2 hours are skipped at auto-execution time to avoid stale strikes',
     ],
-    tech: ['Python', 'NumPy', 'SciPy', 'Black-Scholes', 'NSE bhavcopy data'],
-    connects: ['FastAPI — scanner orchestrated by scan_signals Celery task', 'PostgreSQL — signals written to DB'],
+    tech:['Python', 'NumPy', 'SciPy', 'Black-Scholes', 'Yahoo Finance (yfinance)', 'NSE bhavcopy'],
+    connects:[
+      'FastAPI — scanner orchestrated by scan_signals Celery task every 5 min',
+      'PostgreSQL — signals written to DB after dedup check',
+      'Yahoo Finance — tier-2 OHLCV via fetch_yfinance() when Kite unavailable; 60d 15m, 730d 1h, 1825d daily',
+      'NSE Market Data — bhav replayer (tier-3) for walk-forward backtests when both Kite and Yahoo fail',
+    ],
   },
+
   risk: {
-    title: 'Risk Gate', color: '#ef5350',
-    tagline: 'Redis circuit breakers · Daily P&L · Portfolio heat · Kill switch',
-    overview: 'Every trade order passes through the risk gate before execution. Four independent circuit breakers operate in Redis so they survive API restarts and are checked atomically without DB round-trips.',
-    bullets: [
-      'Daily P&L limit — if realized P&L drops below −2% of capital, TRADING_HALTED is set to "1" instantly',
-      'Portfolio heat — total deployed capital across open positions capped at 3% of portfolio value',
-      'Kill switch — KILL_SWITCH_KEY is a permanent halt; only cleared manually from the Settings page',
-      'Trailing stop — at +30% gain the stop_loss is raised to entry + 50% of profit; locks in gains automatically',
-      'Position sizing — 1% capital at risk per trade, sized by (entry − stop) / lot_size',
-      'Startup re-sync — on container restart, open trades in DB are summed and written back to Redis',
-      'Weekly loss ceiling — 3% weekly drawdown triggers the same TRADING_HALTED flag via Celery check',
+    title:'Risk Gate', color:'#ef5350',
+    tagline:'4 Redis circuit breakers · Daily P&L limit · Portfolio heat · Kill switch',
+    overview:'Every trade order passes through the risk gate before execution. Four independent circuit breakers live in Redis — no DB round-trips on the hot path. All checks are atomic.',
+    bullets:[
+      'DAILY_PNL — realized P&L drops below −2% of capital → TRADING_HALTED set to "1" immediately',
+      'Portfolio heat — total deployed capital (entry_price × quantity) across all open positions capped at 3%',
+      'Kill switch — KILL_SWITCH_KEY is permanent halt "1" until manually cleared from the Settings page',
+      'Trailing stop — at +30% gain, stop_loss raised to entry + 50% of profit; locks in gains automatically',
+      'Position sizing — 1% capital at risk per trade, sized by (entry − stop) / lot_size to determine quantity',
+      'Startup re-sync — on container restart, open trades in DB are summed and written back to Redis to restore heat',
+      'Weekly loss ceiling — 3% weekly drawdown triggers the same TRADING_HALTED flag via Celery weekly check',
     ],
-    tech: ['Redis 7', 'redis-py async', 'Python'],
-    connects: ['Redis — atomic read/write of all four circuit-breaker keys', 'FastAPI — checked before every auto-trade'],
+    tech:['Redis 7', 'redis-py async', 'Python'],
+    connects:[
+      'Redis — atomic reads of DAILY_PNL, DAILY_DEPLOYED, TRADING_HALTED, KILL_SWITCH before every trade',
+      'FastAPI — gate checked before every auto-trade decision',
+    ],
   },
+
   options: {
-    title: 'Options Engine', color: '#4fa3e0',
-    tagline: 'Chain analysis · IV rank · Max pain · Regime classifier',
-    overview: 'Options analytics layer. Provides IV rank, max-pain computation, expiry calendar, and regime classification — all of which feed into pattern confidence scores and the pre-market briefing.',
-    bullets: [
-      'Options chain — per-strike calls + puts: OI, IV, LTP, bid/ask pulled from Kite Connect API',
-      'IV rank — current IV as a percentile of the 52-week IV range; key weight in composite confidence',
-      'Max pain — strike at which total OI-weighted option writer loss is minimised; computed from bhavcopy OI',
-      'Expiry calendar — weekly Thursday + monthly last-Thursday expiry for both NIFTY and BANKNIFTY',
-      'Event calendar — upcoming results, RBI policy, index rebalancing flagged for IV Crush pattern',
-      'Strike selector — ATM ± N strikes chosen based on signal direction, DTE, and lot size',
-      'Regime — bullish / bearish / neutral classification using PCR + price vs VWAP + OI trend direction',
+    title:'Options Engine', color:'#4fa3e0',
+    tagline:'Options chain · IV rank · Max pain · Regime classifier',
+    overview:'Options analytics layer. IV rank, max-pain, expiry calendar, and regime classification all feed into pattern confidence scores and the pre-market briefing. Live chain data comes from Kite Connect.',
+    bullets:[
+      'Options chain — per-strike calls + puts: OI, IV, LTP, bid/ask from Kite Connect REST API',
+      'IV rank — current IV as percentile of 52-week high/low range; primary weight in composite confidence scorer',
+      'Max pain — strike minimising total OI-weighted option writer loss; computed from NSE bhavcopy OI',
+      'Expiry calendar — weekly Thursday + monthly last-Thursday for NIFTY and BANKNIFTY',
+      'Event calendar — results dates, RBI policy meetings, index rebalancing flagged for IV Crush pattern',
+      'Strike selector — ATM ± N strikes chosen based on signal direction, DTE, and lot size constraints',
+      'Regime — bullish / bearish / neutral: requires PCR + price vs VWAP + OI trend to agree',
     ],
-    tech: ['Python', 'Black-Scholes', 'Kite Connect API', 'NSE bhavcopy'],
-    connects: ['Kite Connect — live chain data', 'FastAPI — analytics results served to Dashboard and Options pages'],
+    tech:['Python', 'Black-Scholes', 'Kite Connect API', 'NSE bhavcopy'],
+    connects:[
+      'Kite Connect — live option chain data input',
+      'FastAPI — analytics results served to Dashboard and Options pages',
+    ],
   },
+
   postgres: {
-    title: 'PostgreSQL', color: '#9b8fff',
-    tagline: '7 tables · SQLAlchemy async · Alembic migrations',
-    overview: 'Primary relational store for all persistent state. Uses SQLAlchemy 2.0 async ORM with asyncpg driver. Alembic manages incremental schema migrations so the DB evolves without data loss.',
-    bullets: [
-      'signals — pattern signals: underlying, strike, expiry, premium, IV, DTE, direction, confidence, status (ACTIVE / EXPIRED / EXECUTED)',
-      'trades — paper + live trades: entry/exit prices, MTM, stop_loss (updated by trailing stop), brokerage charges, realized P&L, notes',
-      'portfolio — capital, peak_capital, max_drawdown_pct, weekly_pnl, total_trades; one row per mode (paper/live)',
+    title:'PostgreSQL', color:'#9b8fff',
+    tagline:'7 tables · SQLAlchemy 2 async · Alembic migrations',
+    overview:'Primary relational store for all persistent state. SQLAlchemy 2.0 async ORM with asyncpg driver. Alembic manages incremental schema migrations.',
+    bullets:[
+      'signals — strike, expiry, premium, IV, DTE, direction, confidence, explanation, valid_until, status',
+      'trades — entry/exit prices, MTM, stop_loss (updated by trailing stop), brokerage, realized P&L, notes',
+      'portfolio — capital_initial, capital_current, peak_capital, max_drawdown_pct, weekly_pnl, total_trades; one row per mode',
       'kite_config — API key, API secret, daily access_token (rotated each Kite session)',
-      'discovered_patterns — statistically-mined pattern edges with Mann-Whitney U p-values, sample sizes, has_edge flag',
-      'pattern_backtest_runs — walk-forward results per pattern: Sharpe ratio, max drawdown, win rate, profit factor, date range',
-      'pattern_backtest_trades — individual trades within each backtest run for drill-down analysis in Pattern Finder',
-      'tradestatus enum in DB: OPEN, CLOSED, CANCELLED, PENDING, EXPIRED',
+      'discovered_patterns — Mann-Whitney U p-values, sample size, effect size, has_edge flag',
+      'pattern_backtest_runs — Sharpe, max drawdown, win rate, profit factor, trade count, date range',
+      'pattern_backtest_trades — individual simulated trades per run for Pattern Finder drill-down',
+      'TradeStatus enum in DB: OPEN, CLOSED, CANCELLED, PENDING, EXPIRED (uppercase)',
+      'Portfolio mode stored as lowercase varchar: "paper" or "live" (NOT a DB enum)',
     ],
-    tech: ['PostgreSQL 15', 'SQLAlchemy 2.0 async', 'asyncpg', 'Alembic'],
-    connects: ['FastAPI — all async reads/writes', 'Celery — task results and discovered patterns written here'],
+    tech:['PostgreSQL 15', 'SQLAlchemy 2 async', 'asyncpg', 'Alembic'],
+    connects:[
+      'FastAPI — all async reads and writes',
+      'Celery — task results and discovered patterns stored here',
+    ],
   },
+
   redis: {
-    title: 'Redis', color: '#ff6b6b',
-    tagline: 'Circuit breakers · Celery broker · Daily state',
-    overview: 'In-memory store for real-time risk state and Celery task brokering. State resets daily at 09:15 IST. Because checks are in-memory, the risk gate adds zero DB latency to the trade path.',
-    bullets: [
-      'DAILY_PNL_KEY — running sum of realized P&L for the day; triggers TRADING_HALTED at −2% of capital',
-      'DAILY_DEPLOYED_KEY — sum of entry_price × quantity for all open trades; capped at 3% heat limit',
-      'TRADING_HALTED_KEY — boolean "1"/"0"; checked before every auto-trade; set by loss limits or kill switch',
-      'KILL_SWITCH_KEY — permanent halt "1" until manually cleared from Settings; highest priority flag',
-      'Celery broker — Redis queues all 14 Celery tasks and stores results (result_backend = Redis)',
+    title:'Redis', color:'#ff6b6b',
+    tagline:'4 circuit-breaker keys · Celery broker · Daily P&L state',
+    overview:'In-memory store for real-time risk state and Celery task brokering. State resets daily at 09:15 IST. All risk checks are in-memory — zero DB latency on the trade hot path.',
+    bullets:[
+      'DAILY_PNL_KEY — running sum of realized P&L; compared against −2% limit on every trade',
+      'DAILY_DEPLOYED_KEY — sum of entry_price × quantity for all open trades; capped at 3% portfolio heat',
+      'TRADING_HALTED_KEY — "1"/"0"; checked before every auto-trade; set by loss limits or risk violations',
+      'KILL_SWITCH_KEY — permanent halt "1" until manually cleared from Settings; highest priority check',
+      'Celery broker — Redis queues all 14 Celery tasks and stores task results (result_backend = Redis)',
       'On startup — _sync_portfolio_heat_from_db() reloads DAILY_DEPLOYED_KEY from DB open trades',
-      'Daily reset — reset_daily_pnl Celery task clears PNL + DEPLOYED at 09:15 IST and re-syncs from DB',
+      'Daily reset — reset_daily_pnl Celery task clears PNL + DEPLOYED at 09:15 IST then re-syncs from DB',
     ],
-    tech: ['Redis 7', 'redis-py async', 'Celery broker + result backend'],
-    connects: ['Risk Gate — atomic flag reads/writes', 'Celery — message broker for all 14 tasks', 'FastAPI — startup heat sync'],
+    tech:['Redis 7', 'redis-py async', 'Celery broker + result backend'],
+    connects:[
+      'Risk Gate — atomic flag reads on every trade decision',
+      'Celery — message broker for all 14 tasks; result storage',
+      'FastAPI — startup heat sync from DB open trades',
+    ],
   },
+
   celery: {
-    title: 'Celery Workers', color: '#26c6b0',
-    tagline: '14 scheduled tasks · Redis broker · Celery Beat',
-    overview: 'Distributed task queue with Celery Beat scheduler. Workers run independently of the FastAPI process so heavy tasks (scanning, backtesting, data download) never block API responses.',
-    bullets: [
+    title:'Celery Workers', color:'#26c6b0',
+    tagline:'14 scheduled tasks · Celery Beat · Redis broker',
+    overview:'Distributed task queue running independently of FastAPI. Heavy jobs (scanning, backtesting, data sync) never block API responses. Celery Beat provides the cron-like schedule.',
+    bullets:[
       'scan_signals (*/5 min) — runs all 8 patterns; deduplicates; auto-executes ≥82% confidence as paper trades',
-      'mtm_update (*/2 min) — marks all open trades to market with Black-Scholes pricing; applies trailing stop',
-      'settle_expired (*/10 min) — closes trades whose options have passed expiry date',
+      'mtm_update (*/2 min) — marks all open trades to market with Black-Scholes; applies trailing stop',
+      'settle_expired (*/10 min) — closes trades whose options have passed their expiry date',
       'cleanup_stale_signals (*/15 min) — expires ACTIVE signals past valid_until; purges old EXPIRED records',
-      'eod_close_intraday (15:20 IST Mon–Fri) — force-closes all intraday trades before broker auto-square-off',
+      'eod_close_intraday (15:20 IST Mon–Fri) — force-closes intraday trades before broker auto-square-off',
       'sync_market_data (16:15 IST Mon–Fri) — downloads NSE bhavcopy; bootstraps PCR + max-pain cache',
       'run_nightly_backtests (16:00 daily) — walk-forward backtests all discovered patterns for edge validation',
       'run_nightly_discovery (02:00 daily) — Mann-Whitney U statistical miner on bhav history for new edges',
-      'reset_daily_pnl (09:15 daily) — clears Redis P&L + deployed; resyncs heat from DB open trades',
+      'reset_daily_pnl (09:15 daily) — clears Redis P&L + deployed capital; re-syncs heat from DB open trades',
       'reset_weekly_pnl (Monday 09:15) — clears weekly_pnl field in portfolio table',
-      'generate_briefing (08:45 IST) — AI pre-market briefing: PCR, FII, IV rank, expiry events via Claude',
+      'generate_briefing (08:45 IST) — AI pre-market briefing: PCR, FII, India VIX, IV rank via Claude Sonnet 4.6',
     ],
-    tech: ['Celery 5', 'Celery Beat', 'Redis broker', 'Python 3.12'],
-    connects: ['Redis — all task messages queued here; results stored here', 'PostgreSQL — task results written to DB', 'FastAPI — triggered on demand via POST /api/v1/system/run-task/{name}'],
-  },
-  kite: {
-    title: 'Kite Connect', color: '#ff9800',
-    tagline: 'Zerodha broker API · Live WebSocket · OAuth daily token',
-    overview: 'Zerodha broker API for live market data and order execution. When disconnected, the system automatically falls back to Black-Scholes synthetic pricing so paper trading continues uninterrupted.',
-    bullets: [
-      'KiteTicker WebSocket — real-time LTP feed for NIFTY + BANKNIFTY futures and all tracked strikes',
-      'Historical OHLCV — 15m / 1h / 4h / daily candle data for pattern detection across timeframes',
-      'Instrument master — full F&O universe: lot sizes, expiry dates, strike step sizes for all underlyings',
-      'Order placement — market + limit orders for live trading; gated behind paper-trading performance gate',
-      'OAuth flow — daily access_token obtained by exchanging request_token from the Kite login redirect URL',
-      'Synthetic fallback — when disconnected, Black-Scholes uses last-known IV to price options',
-      'is_synthetic flag — signals have explanation starting with "[" for synthetic vs "[Weekly/Monthly …]" for real',
-      'Connection test — /api/v1/settings/test-connection runs 5 sub-checks and returns per-check results',
+    tech:['Celery 5', 'Celery Beat', 'Redis broker', 'Python 3.12'],
+    connects:[
+      'Redis — all task messages queued here; task results stored here',
+      'PostgreSQL — patterns, backtest runs, briefing data written here',
+      'FastAPI — triggered on demand via POST /api/v1/system/run-task/{name}',
+      'NSE Market Data — bhavcopy downloaded and processed by sync_market_data at 16:15 IST',
     ],
-    tech: ['kiteconnect-py', 'WebSocket', 'OAuth 2.0', 'REST API'],
-    connects: ['FastAPI — all REST calls go through here', 'Pattern Engine — OHLCV data for detection', 'Options Engine — live chain data'],
   },
+
   nse: {
-    title: 'NSE Market Data', color: '#888780',
-    tagline: 'Bhavcopy CSVs · PCR cache · FII OI · Bhav replayer',
-    overview: 'Offline NSE data pipeline. Daily bhavcopy CSV files form the backbone of backtesting, PCR computation, and IV rank history. 184+ dates are already cached and processed.',
-    bullets: [
-      'Bhavcopy CSV — NSE daily F&O settlement data: OI, volume, settlement price per strike per expiry',
-      'PCR cache — put/call ratio computed per underlying per date; 184+ dates cached in pcr_NIFTY.csv etc.',
+    title:'NSE Market Data', color:'#888780',
+    tagline:'Bhavcopy CSVs · PCR cache · FII OI · Bhav replayer (tier-3 OHLCV)',
+    overview:'Offline NSE data pipeline. Daily bhavcopy CSV files form the backbone of backtesting, PCR computation, and IV rank history. 184+ dates already cached and processed.',
+    bullets:[
+      'Bhavcopy CSV — NSE daily F&O settlement: OI, volume, settlement price per strike per expiry',
+      'PCR cache — put/call ratio per underlying per date; 184+ dates cached in pcr_NIFTY.csv etc.',
       'Max pain — strike minimising total OI-weighted option writer loss; recomputed from each bhav file',
-      'FII OI (CCIL) — participant-wise open interest: FII, DII, proprietary; signals institutional positioning',
-      'IV rank — historical IV per underlying stored from bhavcopy settlement prices; percentile vs 52-week range',
-      'Bhav replayer — walk-forward backtest engine replays bhavcopy files as synthetic OHLCV for pattern testing',
+      'FII OI (CCIL) — participant-wise OI: FII, DII, proprietary; signals institutional positioning',
+      'IV rank — historical IV from bhavcopy settlement prices; percentile rank vs 52-week range',
+      'Bhav replayer — tier-3 OHLCV: replays bhavcopy files as synthetic OHLCV for walk-forward backtests',
       'Bootstrap — build_pcr_from_cached_bhav() processes all cached CSVs on first startup or on demand',
       'Sync task — sync_market_data Celery task downloads next bhavcopy at 16:15 IST after market close',
     ],
-    tech: ['pandas', 'NSE bhavcopy format', 'CSV pipeline', 'SciPy (Mann-Whitney)'],
-    connects: ['Celery sync_market_data — downloads at 16:15 IST', 'PostgreSQL — processed data stored here', 'Pattern Engine — bhav replayer feeds walk-forward backtests'],
+    tech:['pandas', 'NSE bhavcopy format', 'CSV pipeline', 'SciPy Mann-Whitney'],
+    connects:[
+      'Celery sync_market_data — bhavcopy downloaded and processed at 16:15 IST',
+      'PostgreSQL — processed PCR / IV rank / max-pain data stored here',
+      'Pattern Engine — bhav replayer provides tier-3 OHLCV for walk-forward backtests',
+    ],
+  },
+
+  yahoo: {
+    title:'Yahoo Finance', color:'#7ecaff',
+    tagline:'India VIX (^INDIAVIX) · OHLCV tier-2 fallback · yfinance 0.2.40+ · Free tier',
+    overview:'Free market data API with two distinct roles. (1) Sole free source of India VIX history via ^INDIAVIX — fetched daily and cached 18h. (2) Tier-2 OHLCV source when Kite Connect is not configured, enabling pattern discovery without a broker subscription. Data priority: Kite → Yahoo → NSE bhav replayer.',
+    bullets:[
+      'India VIX — ^INDIAVIX ticker downloaded from Yahoo Finance; cached in market_data/india_vix.csv with 18h TTL',
+      'OHLCV tier-2 fallback — when Kite is not configured, yfinance provides historical candle data for backtesting',
+      'NSE ticker mapping — NIFTY→^NSEI, BANKNIFTY→^NSEBANK, FINNIFTY→NIFTY_FIN_SERVICE.NS, stocks→SYM.NS',
+      'Interval limits — 60 days of 15m candles, 730 days of 1h candles, 1825 days of daily OHLCV',
+      'OI / IV gap — Yahoo Finance does NOT carry open interest or option IV; NSE bhavcopy fills those gaps',
+      'Source tag — backtest run records are tagged source="yahoo" vs "kite" vs "synthetic" for traceability',
+      'Multi-level column flattening — yfinance sometimes returns multi-level DataFrame columns; code handles this',
+      'Lazy import — yfinance is imported only when Kite is unavailable; no overhead when Kite is connected',
+    ],
+    tech:['yfinance 0.2.40+', 'pandas', 'Python', 'NSE ticker map'],
+    connects:[
+      'FastAPI Backend — India VIX fetched via fetch_india_vix(), cached 18h in market_data/india_vix.csv',
+      'Pattern Engine — OHLCV data via fetch_yfinance() called from get_historical_data() as tier-2 source',
+      'Celery — sync_market_data task also triggers VIX refresh alongside bhavcopy download',
+    ],
   },
 }
 
-const NODE_META: Record<NodeId, { x: number; y: number; w: number; h: number; label: string; sub: string; color: string }> = {
-  frontend: { x: 190, y: 28,  w: 280, h: 52, label: 'React frontend',    sub: '10 pages · Zustand · WS',       color: '#4488ff' },
-  backend:  { x: 128, y: 140, w: 304, h: 52, label: 'FastAPI backend',   sub: 'Python 3.12 · async · WS hub',   color: '#26a69a' },
-  kite:     { x: 488, y: 140, w: 152, h: 52, label: 'Kite Connect',      sub: 'Zerodha · live prices',          color: '#ff9800' },
-  patterns: { x: 28,  y: 252, w: 165, h: 78, label: 'Pattern engine',    sub: '8 patterns · IV gate',           color: '#7b61ff' },
-  risk:     { x: 223, y: 252, w: 155, h: 78, label: 'Risk gate',         sub: 'circuit breakers · Redis',       color: '#ef5350' },
-  options:  { x: 408, y: 252, w: 165, h: 78, label: 'Options engine',    sub: 'chain · IV rank · max pain',     color: '#4fa3e0' },
-  postgres: { x: 28,  y: 380, w: 165, h: 78, label: 'PostgreSQL',        sub: '7 tables · Alembic',             color: '#9b8fff' },
-  redis:    { x: 223, y: 380, w: 155, h: 78, label: 'Redis',             sub: 'circuit breakers · broker',      color: '#ff6b6b' },
-  celery:   { x: 408, y: 380, w: 192, h: 78, label: 'Celery workers',    sub: '14 tasks · Beat scheduler',      color: '#26c6b0' },
-  nse:      { x: 128, y: 502, w: 304, h: 52, label: 'NSE market data',   sub: 'bhavcopy · PCR · FII · bhav replayer', color: '#888780' },
-}
-
-interface Conn { id: string; d: string; color: string; dur: number; label?: string; reverse?: boolean }
-
-const CONNECTIONS: Conn[] = [
-  { id: 'fe-be',  d: 'M330,80 L280,140',           color: '#4488ff', dur: 1.8, label: 'REST + WS' },
-  { id: 'be-fe',  d: 'M284,140 L334,80',           color: '#26a69a', dur: 2.2, label: '' },
-  { id: 'be-kt',  d: 'M432,166 L488,166',           color: '#ff9800', dur: 1.5, label: 'live prices' },
-  { id: 'kt-be',  d: 'M488,172 L432,172',           color: '#26a69a', dur: 1.9, label: '' },
-  { id: 'be-pa',  d: 'M190,192 L111,252',           color: '#7b61ff', dur: 2.0 },
-  { id: 'be-ri',  d: 'M280,192 L301,252',           color: '#ef5350', dur: 1.6 },
-  { id: 'be-op',  d: 'M366,192 L491,252',           color: '#4fa3e0', dur: 1.8 },
-  { id: 'pa-pg',  d: 'M111,330 L111,380',           color: '#9b8fff', dur: 1.4 },
-  { id: 'ri-rd',  d: 'M301,330 L301,380',           color: '#ff6b6b', dur: 1.2 },
-  { id: 'op-ce',  d: 'M491,330 L504,380',           color: '#26c6b0', dur: 1.6 },
-  { id: 'ce-be',  d: 'M600,419 Q648,280 432,172',   color: '#26c6b0', dur: 2.6, label: 'task results' },
-  { id: 'nse-pg', d: 'M200,502 Q148,462 111,458',   color: '#888780', dur: 2.2 },
-  { id: 'nse-ce', d: 'M360,502 Q430,462 504,458',   color: '#888780', dur: 2.0 },
-  { id: 'rd-be',  d: 'M301,380 Q220,300 215,192',   color: '#ef5350', dur: 2.0, label: 'gate check' },
-]
-
-function cx(id: NodeId) { const n = NODE_META[id]; return n.x + n.w / 2 }
-function cy(id: NodeId) { const n = NODE_META[id]; return n.y + n.h / 2 }
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Architecture() {
   const [selected, setSelected] = useState<NodeId | null>(null)
@@ -248,225 +376,252 @@ export default function Architecture() {
   const detail = selected ? DETAILS[selected] : null
 
   return (
-    <div style={{ display: 'flex', height: '100%', background: 'var(--bg)', overflow: 'hidden' }}>
+    <div style={{ display:'flex', height:'100%', background:'var(--bg)', overflow:'hidden' }}>
 
-      {/* ── Diagram pane ── */}
-      <div style={{ flex: 1, overflow: 'auto', padding: '16px 12px 16px 16px', minWidth: 0 }}>
+      {/* ── Diagram pane ─────────────────────────────────────────────────────── */}
+      <div style={{ flex:1, overflow:'auto', padding:'14px 10px 14px 14px', minWidth:0 }}>
 
-        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--txt)' }}>AlphaFO — System Architecture</span>
-          <span style={{ fontSize: 11, color: 'var(--txt3)' }}>Click any component to explore</span>
+        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:10 }}>
+          <span style={{ fontSize:13, fontWeight:700, color:'var(--txt)' }}>AlphaFO — System Architecture</span>
+          <span style={{ fontSize:11, color:'var(--txt3)' }}>· click any component for details</span>
           {selected && (
-            <button
-              onClick={() => setSelected(null)}
-              className="tv-btn tv-btn-ghost"
-              style={{ marginLeft: 'auto', fontSize: 11, padding: '2px 10px' }}
-            >✕ Close panel</button>
+            <button onClick={() => setSelected(null)} className="tv-btn tv-btn-ghost"
+              style={{ marginLeft:'auto', fontSize:11, padding:'2px 10px' }}>✕ close</button>
           )}
         </div>
 
-        <svg
-          viewBox="0 0 660 574"
-          width="100%"
-          style={{ display: 'block', maxHeight: 'calc(100vh - 80px)' }}
-          role="img"
-          aria-label="AlphaFO system architecture diagram"
-        >
+        <svg viewBox="0 0 660 530" width="100%"
+          style={{ display:'block', maxHeight:'calc(100vh - 80px)' }}
+          aria-label="AlphaFO system architecture">
+
           <defs>
-            {/* ── Arrow marker ── */}
-            <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-              <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            {/* Context-stroke arrow marker — inherits path colour automatically */}
+            <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5"
+              markerWidth="4.5" markerHeight="4.5" orient="auto-start-reverse">
+              <path d="M2,1.5 L8,5 L2,8.5" fill="none" stroke="context-stroke"
+                strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
             </marker>
 
-            {/* ── Glow filter for selected node ── */}
-            <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-              <feGaussianBlur stdDeviation="3" result="blur"/>
-              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            {/* Glow filter for selected node ring */}
+            <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+              <feGaussianBlur stdDeviation="3" result="b"/>
+              <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
             </filter>
 
-            {/* ── Path defs for animateMotion ── */}
-            {CONNECTIONS.map(c => (
-              <path key={`p-${c.id}`} id={`p-${c.id}`} d={c.d} fill="none"/>
-            ))}
+            {/* Path defs for animateMotion particles */}
+            {CONNS.map(c => <path key={`pd-${c.id}`} id={`p-${c.id}`} d={c.d} fill="none"/>)}
           </defs>
 
-          {/* ── SVG animation styles ── */}
           <style>{`
-            .arch-node { cursor: pointer; transition: opacity 0.15s; }
-            .arch-node:hover rect { filter: brightness(1.2); }
-            .arch-node-bg { rx: 6; }
-            @keyframes arch-pulse {
-              0%,100% { stroke-opacity: 0.6; }
-              50%      { stroke-opacity: 1; }
+            @keyframes ring-pulse {
+              0%,100% { stroke-opacity:0.5; stroke-width:2; }
+              50%      { stroke-opacity:1;   stroke-width:2.8; }
             }
-            .arch-selected-ring { animation: arch-pulse 1.4s ease-in-out infinite; }
+            .sel-ring { animation: ring-pulse 1.4s ease-in-out infinite; }
+            .arch-node { cursor: pointer; }
           `}</style>
 
-          {/* ── Connection lines ── */}
-          {CONNECTIONS.map(c => (
-            <g key={c.id}>
-              {/* Static dashed track */}
-              <path d={c.d} fill="none" stroke={c.color} strokeWidth="1.2" strokeOpacity="0.18" strokeDasharray="5 4"/>
-              {/* Solid arrow */}
-              <path d={c.d} fill="none" stroke={c.color} strokeWidth="1.2" strokeOpacity="0.35" markerEnd="url(#arr)"/>
+          {/* ── Tier swimlane bands ───────────────────────────────────────────── */}
+          {BANDS.map(b => (
+            <g key={b.label}>
+              <rect x="10" y={b.y} width="642" height={b.h} rx="6"
+                fill={b.color} fillOpacity="0.04"
+                stroke={b.color} strokeOpacity="0.10" strokeWidth="1"/>
+              <text x="646" y={b.y + 13} textAnchor="start"
+                fill={b.color} fillOpacity="0.38" fontSize="8.5" fontWeight="700"
+                fontFamily="-apple-system,BlinkMacSystemFont,sans-serif"
+                letterSpacing="0.07em">{b.label}</text>
+            </g>
+          ))}
 
-              {/* Animated flow particles (3 staggered) */}
-              {[0, 0.33, 0.66].map((offset, i) => (
-                <circle key={i} r="3.5" fill={c.color} opacity="0.85">
-                  <animateMotion dur={`${c.dur}s`} repeatCount="indefinite" begin={`${offset * c.dur}s`} calcMode="linear">
+          {/* ── Connections ───────────────────────────────────────────────────── */}
+          {CONNS.map(c => (
+            <g key={c.id}>
+              {/* Dashed track */}
+              <path d={c.d} fill="none" stroke={c.color}
+                strokeWidth="1.2" strokeOpacity="0.15" strokeDasharray="5 4"/>
+              {/* Arrow line */}
+              <path d={c.d} fill="none" stroke={c.color}
+                strokeWidth="1.2" strokeOpacity="0.28" markerEnd="url(#arr)"/>
+
+              {/* 3 staggered particles — grow-in, travel, shrink-out */}
+              {[0, 0.34, 0.67].map((off, i) => (
+                <circle key={i} r={c.r ?? 3.5} fill={c.color}>
+                  <animateMotion dur={`${c.dur}s`} repeatCount="indefinite"
+                    begin={`${off * c.dur}s`} calcMode="linear">
                     <mpath href={`#p-${c.id}`}/>
                   </animateMotion>
+                  {/* Opacity: emerge → full → sustain → fade */}
+                  <animate attributeName="opacity"
+                    values="0;0;0.9;0.9;0" keyTimes="0;0.08;0.22;0.80;1"
+                    dur={`${c.dur}s`} repeatCount="indefinite" begin={`${off * c.dur}s`}/>
+                  {/* Radius: tiny → full → full → tiny */}
+                  <animate attributeName="r"
+                    values={`1;${(c.r ?? 3.5) * 0.6};${c.r ?? 3.5};${c.r ?? 3.5};1`}
+                    keyTimes="0;0.08;0.22;0.80;1"
+                    dur={`${c.dur}s`} repeatCount="indefinite" begin={`${off * c.dur}s`}/>
                 </circle>
               ))}
 
-              {/* Connection label */}
-              {c.label && (() => {
-                const mid = c.d.includes('Q')
-                  ? { x: parseFloat(c.d.split('Q')[1].split(' ')[0]) - 10, y: parseFloat(c.d.split('Q')[1].split(' ')[1]) }
-                  : { x: (parseFloat(c.d.split('M')[1]) + parseFloat(c.d.split('L')[1])) / 2, y: (parseFloat(c.d.split('M')[1].split(',')[1]) + parseFloat(c.d.split('L')[1].split(',')[1])) / 2 - 6 }
+              {/* Inline label with backing rect */}
+              {c.label && c.labelX != null && c.labelY != null && (() => {
+                const w = c.label.length * 6 + 12
                 return (
-                  <text x={mid.x} y={mid.y} textAnchor="middle" fill={c.color} opacity="0.65"
-                    fontSize="9" fontFamily="-apple-system,sans-serif">{c.label}</text>
+                  <g>
+                    <rect x={(c.labelX ?? 0) - w/2} y={(c.labelY ?? 0) - 11}
+                      width={w} height={14} rx="3"
+                      fill="var(--bg2)" fillOpacity="0.88"/>
+                    <text x={c.labelX} y={c.labelY} textAnchor="middle"
+                      fill={c.color} fillOpacity="0.72" fontSize="9" fontWeight="600"
+                      fontFamily="-apple-system,BlinkMacSystemFont,sans-serif">{c.label}</text>
+                  </g>
                 )
               })()}
             </g>
           ))}
 
-          {/* ── Nodes ── */}
-          {(Object.entries(NODE_META) as [NodeId, typeof NODE_META[NodeId]][]).map(([id, n]) => {
+          {/* ── Nodes ─────────────────────────────────────────────────────────── */}
+          {(Object.entries(N) as [NodeId, NodeMeta][]).map(([id, n]) => {
             const isSel = selected === id
             const isHov = hovered === id
+            const midY  = n.y + n.h / 2
             return (
-              <g
-                key={id}
-                className="arch-node"
+              <g key={id} className="arch-node"
                 onClick={() => setSelected(isSel ? null : id)}
                 onMouseEnter={() => setHovered(id)}
-                onMouseLeave={() => setHovered(null)}
-              >
-                {/* Selected ring */}
+                onMouseLeave={() => setHovered(null)}>
+
+                {/* Pulsing glow ring when selected */}
                 {isSel && (
-                  <rect
-                    x={n.x - 3} y={n.y - 3}
-                    width={n.w + 6} height={n.h + 6}
-                    rx="9" fill="none"
-                    stroke={n.color} strokeWidth="2.5"
-                    className="arch-selected-ring"
-                  />
+                  <rect x={n.x-4} y={n.y-4} width={n.w+8} height={n.h+8}
+                    rx="10" fill="none" stroke={n.color}
+                    filter="url(#glow)" className="sel-ring"/>
                 )}
+
                 {/* Node body */}
-                <rect
-                  x={n.x} y={n.y} width={n.w} height={n.h} rx="6"
+                <rect x={n.x} y={n.y} width={n.w} height={n.h} rx="6"
                   fill={n.color}
-                  fillOpacity={isHov || isSel ? 0.28 : 0.14}
+                  fillOpacity={isSel ? 0.24 : isHov ? 0.18 : 0.09}
                   stroke={n.color}
-                  strokeWidth={isHov || isSel ? 1.5 : 0.8}
-                  strokeOpacity={isHov || isSel ? 0.9 : 0.4}
+                  strokeWidth={isSel || isHov ? 1.8 : 0.9}
+                  strokeOpacity={isSel || isHov ? 0.90 : 0.36}
                 />
-                {/* Label */}
-                <text
-                  x={n.x + n.w / 2} y={n.y + (n.h > 60 ? 24 : 21)}
-                  textAnchor="middle"
-                  fill={n.color} fillOpacity={0.95}
-                  fontSize="12" fontWeight="600"
-                  fontFamily="-apple-system,BlinkMacSystemFont,sans-serif"
-                >{n.label}</text>
-                <text
-                  x={n.x + n.w / 2} y={n.y + (n.h > 60 ? 40 : 37)}
-                  textAnchor="middle"
-                  fill={n.color} fillOpacity="0.55"
-                  fontSize="10"
-                  fontFamily="-apple-system,BlinkMacSystemFont,sans-serif"
-                >{n.sub}</text>
+
+                {/* Primary label */}
+                <text x={n.x + n.w/2} y={midY - 7}
+                  textAnchor="middle" fill={n.color} fillOpacity="0.95"
+                  fontSize="12" fontWeight="700"
+                  fontFamily="-apple-system,BlinkMacSystemFont,sans-serif">
+                  {n.label}
+                </text>
+
+                {/* Sub-label */}
+                <text x={n.x + n.w/2} y={midY + 9}
+                  textAnchor="middle" fill={n.color} fillOpacity="0.46"
+                  fontSize={n.w < 180 ? 9 : 10}
+                  fontFamily="-apple-system,BlinkMacSystemFont,sans-serif">
+                  {n.sub}
+                </text>
+
+                {/* External badge */}
+                {n.ext && (
+                  <text x={n.x + n.w - 6} y={n.y + n.h - 5}
+                    textAnchor="end" fill={n.color} fillOpacity="0.35"
+                    fontSize="8" fontWeight="600"
+                    fontFamily="-apple-system,BlinkMacSystemFont,sans-serif">
+                    external
+                  </text>
+                )}
               </g>
             )
           })}
 
-          {/* ── Tier labels ── */}
-          {[
-            { y: 54,  label: 'presentation' },
-            { y: 166, label: 'application' },
-            { y: 291, label: 'domain' },
-            { y: 419, label: 'infrastructure' },
-            { y: 528, label: 'data sources' },
-          ].map(({ y, label }) => (
-            <text key={label} x="640" y={y} textAnchor="end"
-              fill="#636670" fontSize="9" fontFamily="-apple-system,sans-serif"
-              fontStyle="italic">{label}</text>
-          ))}
-
-          {/* ── Horizontal tier dividers ── */}
-          {[112, 228, 356, 474].map(y => (
-            <line key={y} x1="20" y1={y} x2="640" y2={y}
-              stroke="#2a2e39" strokeWidth="0.5" strokeDasharray="3 5"/>
+          {/* ── Horizontal tier dividers ──────────────────────────────────────── */}
+          {[100, 204, 316, 430].map(y => (
+            <line key={y} x1="18" y1={y} x2="642" y2={y}
+              stroke="#2a2e39" strokeWidth="0.6" strokeDasharray="3 6"/>
           ))}
         </svg>
       </div>
 
-      {/* ── Detail panel ── */}
-      {detail && (
+      {/* ── Detail side panel ─────────────────────────────────────────────────── */}
+      {detail && selected && (
         <div style={{
-          width: 348, flexShrink: 0,
-          borderLeft: '1px solid var(--border)',
-          background: 'var(--bg2)',
-          overflow: 'auto',
-          padding: '16px 18px',
-          display: 'flex', flexDirection: 'column', gap: 14,
+          width:352, flexShrink:0,
+          borderLeft:'1px solid var(--border)',
+          background:'var(--bg2)',
+          overflow:'auto',
+          padding:'16px 18px',
+          display:'flex', flexDirection:'column', gap:16,
         }}>
+
           {/* Header */}
           <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:5 }}>
               <span style={{
-                display: 'inline-block', width: 10, height: 10, borderRadius: '50%',
-                background: NODE_META[selected!].color, flexShrink: 0,
+                display:'inline-block', width:10, height:10,
+                borderRadius:'50%', flexShrink:0, background:N[selected].color,
               }}/>
-              <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--txt)' }}>{detail.title}</span>
+              <span style={{ fontWeight:800, fontSize:15, color:'var(--txt)' }}>{detail.title}</span>
+              {N[selected].ext && (
+                <span style={{
+                  fontSize:9, fontWeight:700, padding:'1px 6px', borderRadius:3,
+                  background:`${N[selected].color}1a`, color:N[selected].color,
+                  border:`1px solid ${N[selected].color}44`, letterSpacing:'0.05em',
+                }}>EXTERNAL</span>
+              )}
             </div>
-            <div style={{ fontSize: 11, color: NODE_META[selected!].color, opacity: 0.85, fontWeight: 500, marginBottom: 8 }}>
+            <div style={{ fontSize:11, color:N[selected].color, opacity:0.8, fontWeight:600, marginBottom:10 }}>
               {detail.tagline}
             </div>
-            <div style={{ fontSize: 12, color: 'var(--txt2)', lineHeight: 1.65 }}>{detail.overview}</div>
+            <div style={{ fontSize:12, color:'var(--txt2)', lineHeight:1.68 }}>
+              {detail.overview}
+            </div>
           </div>
 
           {/* Responsibilities */}
           <div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+            <div style={{ fontSize:9.5, fontWeight:800, color:'var(--txt3)',
+              textTransform:'uppercase', letterSpacing:'0.08em', marginBottom:8 }}>
               Responsibilities
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+            <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
               {detail.bullets.map((b, i) => (
-                <div key={i} style={{ display: 'flex', gap: 7, alignItems: 'flex-start' }}>
-                  <span style={{ color: NODE_META[selected!].color, fontSize: 11, marginTop: 1, flexShrink: 0 }}>›</span>
-                  <span style={{ fontSize: 11, color: 'var(--txt2)', lineHeight: 1.55 }}>{b}</span>
+                <div key={i} style={{ display:'flex', gap:7, alignItems:'flex-start' }}>
+                  <span style={{ color:N[selected].color, fontSize:12, marginTop:1, flexShrink:0 }}>›</span>
+                  <span style={{ fontSize:11, color:'var(--txt2)', lineHeight:1.58 }}>{b}</span>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* Connects to */}
+          {/* Connections */}
           <div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+            <div style={{ fontSize:9.5, fontWeight:800, color:'var(--txt3)',
+              textTransform:'uppercase', letterSpacing:'0.08em', marginBottom:8 }}>
               Connects to
             </div>
             {detail.connects.map((c, i) => (
-              <div key={i} style={{ fontSize: 11, color: 'var(--txt2)', padding: '4px 0', borderBottom: '1px solid var(--border)', lineHeight: 1.5 }}>
-                {c}
-              </div>
+              <div key={i} style={{
+                fontSize:11, color:'var(--txt2)', padding:'5px 0',
+                borderBottom:'1px solid var(--border)', lineHeight:1.55,
+              }}>{c}</div>
             ))}
           </div>
 
-          {/* Tech stack */}
+          {/* Technology */}
           <div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+            <div style={{ fontSize:9.5, fontWeight:800, color:'var(--txt3)',
+              textTransform:'uppercase', letterSpacing:'0.08em', marginBottom:8 }}>
               Technology
             </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+            <div style={{ display:'flex', flexWrap:'wrap', gap:5 }}>
               {detail.tech.map(t => (
                 <span key={t} style={{
-                  fontSize: 10, padding: '2px 8px', borderRadius: 3, fontWeight: 500,
-                  background: `${NODE_META[selected!].color}1a`,
-                  color: NODE_META[selected!].color,
-                  border: `1px solid ${NODE_META[selected!].color}44`,
+                  fontSize:10, padding:'2px 8px', borderRadius:3, fontWeight:600,
+                  background:`${N[selected].color}18`,
+                  color:N[selected].color,
+                  border:`1px solid ${N[selected].color}40`,
                 }}>{t}</span>
               ))}
             </div>
