@@ -265,10 +265,9 @@ async def _auto_paper_trade(signals, db):
                 hedge_strike = sig.strike - 2 * step   # buy lower PE to cap loss
             hedge_prem = _hedge_premium(sig.underlying, spot, hedge_strike,
                                         sig.option_type, sig.expiry_date_iso)
-            if hedge_prem > 0:
+            # Only use hedge if it's cheaper than the main leg (credit spread, not debit)
+            if 0 < hedge_prem < premium * 0.85:
                 # Derive hedge symbol (same expiry date string)
-                expiry_tag = (sig.instrument or "").replace(sig.underlying, "")
-                # Extract expiry portion: e.g. "07JUL26" from "NIFTY07JUL2624800CE"
                 import re as _re
                 m = _re.search(r'(\d{2}[A-Z]{3}\d{2})', sig.instrument or "")
                 expiry_tag = m.group(1) if m else ""
