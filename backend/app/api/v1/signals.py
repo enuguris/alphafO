@@ -17,7 +17,7 @@ from app.core.options.iv_rank import IVRankService
 from app.core.options.event_calendar import EventCalendar
 from app.core.options.strike_selector import StrikeSelector
 from app.core.options.max_pain import compute_max_pain
-from app.core.options.greeks import compute_greeks, RISK_FREE_RATE
+from app.core.options.greeks import compute_greeks, RISK_FREE_RATE, _bs_price
 
 router = APIRouter()
 
@@ -371,7 +371,9 @@ async def run_signals(
         greeks_data = {}
         if opt.get("strike") and opt.get("option_type"):
             try:
-                T = dte / 365.0
+                # Use actual expiry DTE (from selector) for accurate pricing; floor at 1 day
+                actual_dte = max(1.0, float(opt.get("expiry_dte") or opt.get("expiry", {}).get("dte") or dte))
+                T = actual_dte / 365.0
                 sigma = current_iv / 100.0
                 g = compute_greeks(spot_price, opt["strike"], T, sigma, opt["option_type"], RISK_FREE_RATE)
                 greeks_data = {
@@ -380,7 +382,7 @@ async def run_signals(
                     "theta": round(g.theta, 4),
                     "vega": round(g.vega, 4),
                 }
-                estimated_premium = abs(g.delta) * spot_price * 0.02  # rough estimate
+                estimated_premium = max(0.05, _bs_price(spot_price, opt["strike"], T, RISK_FREE_RATE, sigma, opt["option_type"]))
                 max_loss_val = estimated_premium * (opt.get("lot_size") or 25)
             except Exception:
                 greeks_data = {}
