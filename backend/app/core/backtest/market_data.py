@@ -496,6 +496,24 @@ def build_ohlcv_from_bhav(underlying: str, rows: int = 120) -> Optional[pd.DataF
 
     result = pd.DataFrame(records).sort_values("timestamp").drop_duplicates("timestamp")
     result = result[result["close"] > 0].tail(rows).reset_index(drop=True)
-    # Synthetic IV column (ATM IV not available from bhav)
-    result["iv"] = 18.0
+
+    # Use India VIX as a proxy for option IV — merge by date
+    try:
+        vix_df = fetch_india_vix()
+        if vix_df is not None and not vix_df.empty and "vix" in vix_df.columns:
+            vix_df = vix_df[["date", "vix"]].copy()
+            vix_df["date"] = pd.to_datetime(vix_df["date"]).dt.normalize()
+            vix_df = vix_df.sort_values("date")
+            result_ts = result["timestamp"].dt.normalize()
+            merged = pd.merge_asof(
+                pd.DataFrame({"ts": result_ts}),
+                vix_df.rename(columns={"date": "ts"}),
+                on="ts", direction="backward"
+            )
+            result["iv"] = merged["vix"].fillna(18.0).clip(lower=8.0, upper=80.0).values
+        else:
+            result["iv"] = 18.0
+    except Exception:
+        result["iv"] = 18.0
+
     return result if len(result) >= 20 else None
