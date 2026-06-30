@@ -691,7 +691,7 @@ async def _do_mtm_update():
                     spot = spot_prices.get(trade.underlying.upper()) or \
                            BASE_PRICES.get(trade.underlying.upper(), 0)
                     if spot > 0:
-                        # DTE: days remaining to expiry (floor at 0.01 to avoid div-zero)
+                        # DTE: days remaining to expiry (floor at 0.5 to avoid div-zero)
                         if trade.expiry_date:
                             from datetime import date as _date
                             exp_d = _date.fromisoformat(str(trade.expiry_date)[:10])
@@ -699,8 +699,22 @@ async def _do_mtm_update():
                         else:
                             dte = 7.0
                         T = dte / 365.0
-                        # Use a reasonable IV estimate (18% base, no history available here)
-                        iv = 0.18
+                        # Use ATM chain IV for this underlying (more accurate than fixed 18%)
+                        iv = 0.18  # default
+                        try:
+                            chain_df = ChainService().get_chain(trade.underlying.upper())
+                            atm_strike = min(chain_df["strike"].unique(), key=lambda s: abs(s - spot))
+                            atm_row = chain_df[chain_df["strike"] == atm_strike].iloc[0]
+                            ce_iv = float(atm_row.get("ce_iv") or 0)
+                            pe_iv = float(atm_row.get("pe_iv") or 0)
+                            raw_iv = (ce_iv + pe_iv) / 2 if (ce_iv > 0 and pe_iv > 0) else max(ce_iv, pe_iv)
+                            atm_iv = raw_iv if raw_iv >= 0.05 else (raw_iv * 100 if raw_iv > 0 else 0)
+                            if 0.05 < atm_iv < 2.0:
+                                iv = atm_iv  # already as fraction (e.g. 0.18)
+                            elif atm_iv >= 2.0:
+                                iv = atm_iv / 100.0  # convert from % to fraction
+                        except Exception:
+                            pass  # keep default iv=0.18
                         current = round(_bs_price(spot, float(trade.strike), T,
                                                    RISK_FREE_RATE, iv, trade.option_type), 2)
                         current = max(0.05, current)
