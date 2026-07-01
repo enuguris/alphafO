@@ -48,6 +48,8 @@ async def get_schedule():
         "reset-weekly-pnl":       "Reset weekly P&L every Monday at 09:15",
         "confirm-order-fills":    "Confirm Kite live order fills (every 2 min)",
         "generate-briefing":      "AI pre-market briefing via Claude Sonnet at 08:45",
+        "verify-lot-sizes":       "Cross-check lot sizes vs Kite NFO master at 08:30",
+        "health-scan":            "Health check: drift, stale signals, halt status (every 5 min)",
     }
 
     tasks_out = []

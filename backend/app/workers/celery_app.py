@@ -129,5 +129,12 @@ celery_app.conf.update(
             "task": "workers.verify_lot_sizes",
             "schedule": crontab(minute="30", hour="8", day_of_week="1-5"),
         },
+        # Health scanner — runs every 5 minutes, all day.
+        # Checks: deployed-capital drift, stale signals, halt status, signal queue.
+        # Auto-fixes: resyncs Redis heat, expires stale signals, clears old halts.
+        "health-scan": {
+            "task": "workers.health_scan",
+            "schedule": crontab(minute="*/5"),
+        },
     },
 )

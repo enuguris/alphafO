@@ -1972,3 +1972,146 @@ def verify_lot_sizes():
         return {"status": "ok"}
     except Exception as exc:
         logger.error(f"verify-lot-sizes failed: {exc}")
+
+
+# ── Health-check scanner ───────────────────────────────────────────────────────
+
+@celery_app.task(name="workers.health_scan")
+def health_scan():
+    """
+    Periodic health scanner — runs every 5 minutes.
+
+    Checks and auto-heals:
+      1. Redis deployed-capital drift  — resyncs from DB open trades
+      2. Stale ACTIVE signals (> 2h)   — expires them so fresh scan replaces
+      3. Kill-switch / halt auto-clear  — resumes if daily-loss gate cleared itself
+      4. Negative deployed capital      — resets to 0 (float imprecision artifact)
+      5. Signal queue empty (no ACTIVE) — logs warning to prompt manual scan
+
+    Returns a health dict with 'issues' list (empty = all clear).
+    """
+    import asyncio as _asyncio
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    issues: list[str] = []
+    fixes:  list[str] = []
+
+    try:
+        import redis as _redis_lib
+        from app.config import settings as _st
+        from app.core.risk.gate import (
+            DAILY_DEPLOYED_KEY, DAILY_PNL_KEY, KILL_SWITCH_KEY,
+            get_risk_params, is_halted,
+        )
+
+        r = _redis_lib.from_url(_st.redis_url, decode_responses=True)
+
+        # ── 1. Deployed capital drift check ──────────────────────────────────
+        async def _resync_heat():
+            from app.database import AsyncSessionLocal as _DB
+            from sqlalchemy import select as _s
+            from app.models.trades import Trade, TradeStatus, TradeMode
+            async with _DB() as db:
+                rows = (await db.execute(
+                    _s(Trade).where(
+                        Trade.status == TradeStatus.OPEN,
+                        Trade.mode  == TradeMode.PAPER,
+                    )
+                )).scalars().all()
+                return sum(
+                    (t.entry_price or 0) * (t.lot_size or 1) * (t.quantity or 1)
+                    for t in rows
+                )
+
+        db_deployed = _run_async(_resync_heat())
+        redis_deployed = float(r.get(DAILY_DEPLOYED_KEY) or 0)
+        drift = abs(redis_deployed - db_deployed)
+
+        if redis_deployed < 0:
+            r.set(DAILY_DEPLOYED_KEY, str(max(db_deployed, 0)))
+            fixes.append(f"deployed_negative_reset: Redis={redis_deployed:.0f} → DB={db_deployed:.0f}")
+        elif drift > 5000:
+            r.set(DAILY_DEPLOYED_KEY, str(db_deployed))
+            fixes.append(f"deployed_drift_corrected: Redis={redis_deployed:.0f} → DB={db_deployed:.0f} (drift ₹{drift:.0f})")
+
+        # ── 2. Stale signal expiry (> 2h old ACTIVE signals) ─────────────────
+        async def _expire_stale():
+            from app.database import AsyncSessionLocal as _DB
+            from sqlalchemy import update as _u, text as _text
+            from app.models.signals import Signal, SignalStatus
+            # Use SQL NOW() - INTERVAL to avoid asyncpg naive-datetime issues
+            stale_expr = Signal.created_at < _text("NOW() - INTERVAL '2 hours'")
+            async with _DB() as db:
+                res = await db.execute(
+                    _u(Signal)
+                    .where(Signal.status == SignalStatus.ACTIVE, stale_expr)
+                    .values(status=SignalStatus.EXPIRED)
+                    .returning(Signal.id, Signal.underlying, Signal.pattern_name)
+                )
+                expired = res.fetchall()
+                await db.commit()
+                return expired
+
+        expired = _run_async(_expire_stale())
+        if expired:
+            syms = ", ".join(f"{row[1]}/{row[2]}" for row in expired[:5])
+            fixes.append(f"stale_signals_expired: {len(expired)} ({syms}{'…' if len(expired)>5 else ''})")
+
+        # ── 3. Kill-switch / halt check ───────────────────────────────────────
+        if is_halted():
+            reason = r.get("TRADING_HALT_REASON") or "unknown"
+            halt_ts = r.get("TRADING_HALT_TS")
+            halt_age_min = (_dt.now(_tz.utc).timestamp() - float(halt_ts)) / 60 if halt_ts else 0
+            rp = get_risk_params()
+            daily_pnl = float(r.get(DAILY_PNL_KEY) or 0)
+            capital = rp.get("paper_capital", 500000)
+            daily_loss_pct = (daily_pnl / capital) * 100
+            # Auto-resume if >30 min old AND loss has recovered to within 80% of limit
+            if halt_age_min > 30 and daily_loss_pct > -(rp.get("max_daily_loss_pct", 2) * 0.8):
+                r.delete(KILL_SWITCH_KEY)
+                r.delete("TRADING_HALT_REASON")
+                fixes.append(f"halt_auto_cleared: halted {halt_age_min:.0f}m for '{reason}', daily_pnl={daily_loss_pct:.1f}%")
+            else:
+                issues.append(f"trading_halted: reason='{reason}' age={halt_age_min:.0f}m daily_pnl={daily_loss_pct:.1f}%")
+
+        # ── 4. Active signal count ────────────────────────────────────────────
+        async def _count_active():
+            from app.database import AsyncSessionLocal as _DB
+            from sqlalchemy import select as _s, func as _f
+            from app.models.signals import Signal, SignalStatus
+            async with _DB() as db:
+                res = await db.execute(
+                    _s(_f.count(Signal.id)).where(Signal.status == SignalStatus.ACTIVE)
+                )
+                return res.scalar() or 0
+
+        active_signals = _run_async(_count_active())
+
+        if active_signals == 0:
+            issues.append("no_active_signals: scanner may be stalled — trigger scan-priority-15m")
+
+        # ── 5. Summary ────────────────────────────────────────────────────────
+        status = "ok" if not issues else "degraded"
+        result = {
+            "status":         status,
+            "issues":         issues,
+            "fixes_applied":  fixes,
+            "active_signals": active_signals,
+            "redis_deployed": redis_deployed,
+            "db_deployed":    db_deployed,
+            "ts_ist":         (_dt.now(_tz.utc) + _td(hours=5, minutes=30)).strftime("%H:%M IST"),
+        }
+        if issues:
+            logger.warning(f"health-scan DEGRADED: {issues}")
+        if fixes:
+            logger.info(f"health-scan fixes applied: {fixes}")
+        if status == "ok" and not fixes:
+            logger.info(f"health-scan OK — deployed=₹{db_deployed:.0f}, active_signals={active_signals}")
+
+        _stamp_task_run("workers.health_scan")
+        return result
+
+    except Exception as exc:
+        logger.error(f"health-scan failed: {exc}", exc_info=True)
+        return {"status": "error", "error": str(exc)}
