@@ -2,6 +2,7 @@
 from datetime import date
 from app.core.instruments import INSTRUMENT_MAP, LOT_SIZES, get_lot_size
 from app.core.options.expiry import select_expiry, available_expiries
+from app.core.strategies.composite import _build_symbol as _sym
 
 
 # Strike step sizes per underlying
@@ -117,7 +118,7 @@ class StrikeSelector:
         expiry = select_expiry(sym, dte_preference=dte_preference, from_date=ref_date)
 
         # NSE F&O symbol format: NIFTY26JUL2425000CE
-        instrument = f"{sym}{expiry['short']}{strike}{option_type}"
+        instrument = _sym(sym, expiry["date"], strike, option_type)
 
         return {
             "instrument":     instrument,
@@ -242,7 +243,7 @@ class StrikeSelector:
             # Profit score: higher is better
             profit_score = round(risk_reward * math.log1p(dte) * (1 + iv_rank * 0.2), 3)
 
-            instrument = f"{sym}{expiry['short']}{strike}{option_type}"
+            instrument = _sym(sym, expiry["date"], strike, option_type)
             viable.append({
                 "instrument":      instrument,
                 "option_type":     option_type,
