@@ -64,11 +64,12 @@ class EventCalendar:
         return 999
 
     def is_event_risk(self, today: date, dte: int = 2) -> bool:
-        """Return True if within `dte` days of any upcoming event."""
+        """Return True if within `dte` days of any UPCOMING (future) event.
+        Only looks forward — past events do not trigger the block."""
         events = self._all_events(today)
         for ev in events:
-            diff = abs((ev["date"] - today).days)
-            if diff <= dte:
+            days_ahead = (ev["date"] - today).days
+            if 0 <= days_ahead <= dte:
                 return True
         return False
 

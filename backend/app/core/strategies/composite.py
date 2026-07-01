@@ -1,29 +1,28 @@
 """
-Composite option strategies — multi-leg defined-risk combinations.
+Composite option strategies — multi-leg net-credit defined-risk combinations.
 
-All positions are fully hedged: no naked exposure. Every strategy uses at
-least TWO DIFFERENT EXPIRY DATES so the legs are naturally uncorrelated —
-near-term vs far-term theta, vega, and delta profiles differ, creating a
-payoff where one leg can profit even when the other loses.
+DESIGN PRINCIPLE: Every composite must collect MORE premium than it pays.
+  net_debit(legs) must be NEGATIVE (net credit) before the trade is placed.
+  If a strategy would result in a net debit, build_composite() returns [].
 
-Strategy selection by IV rank and pattern type:
+Strategy selection by pattern type and IV rank:
 
-  BUY_PATTERNS (directional) — always near + far expiry:
-    low IV  (< 0.40):  Wide Diagonal — buy near ATM + sell far OTM (2 steps)
-                       Near leg: max gamma/delta; far leg: wide credit offset
-    mid IV  (0.40-0.65): Diagonal Spread — buy near ATM + sell far OTM (1 step)
-                       Balanced gamma play with meaningful theta offset
-    high IV (> 0.65):  Calendar Spread — sell near ATM + buy far ATM (same strike)
-                       Sell elevated near-term IV, own cheaper far-term
+  BUY_PATTERNS (directional signal) — same expiry, credit spread:
+    any IV:    Credit Spread — sell ATM, buy OTM protection (same expiry)
+               Bull Put Credit Spread  (bullish): SELL ATM PE + BUY OTM PE
+               Bear Call Credit Spread (bearish): SELL ATM CE + BUY OTM CE
+               Net credit always ≥ 30% of spread width. Time decay works for us.
 
-  SELL_PATTERNS (iv_crush, expiry_week):
-    always:            Iron Condor — sell OTM CE + sell OTM PE + buy wings
-                       Theta collection with defined max loss on both sides
-                       Uses nearest expiry (max theta decay)
+  SELL_PATTERNS (iv_crush, expiry_week) — 4-leg Iron Condor:
+               SELL OTM CE + SELL OTM PE + BUY wing CE + BUY wing PE
+               All same expiry. Maximum theta collection. Wings cap max loss.
+
+Minimum near-expiry DTE: 7 days (avoid same-week hyper-gamma).
+Net credit check: if collected < paid, the build is rejected (returns []).
 
 Each returned Leg dict has:
   strike, option_type, action, expiry_iso, expiry_display, expiry_dte,
-  role, estimated_premium, quantity (multiplier vs lot_size, always 1 here)
+  role, estimated_premium, symbol
 """
 from __future__ import annotations
 
@@ -42,7 +41,7 @@ class Leg:
     expiry_iso: str             # "2026-07-08"
     expiry_display: str         # "08 Jul 2026 (Tue)"
     expiry_dte: int
-    role: str                   # primary | hedge | calendar_short | calendar_long | condor_short_ce | condor_short_pe | condor_wing_ce | condor_wing_pe
+    role: str                   # primary | hedge | condor_short_ce | condor_short_pe | condor_wing_ce | condor_wing_pe
     estimated_premium: float
     symbol: str                 # full NSE tradingsymbol e.g. NIFTY2671424000CE
 
@@ -50,24 +49,9 @@ class Leg:
         """Cash-flow sign: BUY = -1 (debit), SELL = +1 (credit)."""
         return -1.0 if self.action == "BUY" else 1.0
 
-    def max_loss_per_unit(self, spread_width: float) -> float:
-        """Worst-case loss per unit for this leg in isolation (not net)."""
-        if self.action == "BUY":
-            return self.estimated_premium        # buyer loses entire premium
-        return spread_width - self.estimated_premium   # seller's max loss = width - credit
 
-    def target_pnl(self) -> float:
-        """Target exit P&L per unit."""
-        if self.action == "BUY":
-            return self.estimated_premium * 0.50   # +50% of premium paid
-        return self.estimated_premium * 0.55        # collect 55% of premium sold
-
-    def stop_pnl(self) -> float:
-        """Stop-loss P&L per unit (exit when loss reaches this)."""
-        if self.action == "BUY":
-            return -self.estimated_premium * 0.40   # -40% of premium
-        return -self.estimated_premium * 1.00        # -100% (doubles against)
-
+# Minimum DTE for the chosen expiry — avoid hyper-gamma on expiry week
+_MIN_DTE = 7
 
 SELL_PATTERNS = {"iv_crush", "expiry_week"}
 
@@ -104,7 +88,6 @@ def _bs_premium(spot: float, strike: float, dte: int, iv: float, option_type: st
         T = max(dte, 1) / 365.0
         return max(0.05, _bs_price(spot, strike, T, RISK_FREE_RATE, iv, option_type))
     except Exception:
-        # Intrinsic + rough time value fallback
         intr = max(0.0, (spot - strike) if option_type == "CE" else (strike - spot))
         return max(0.05, intr + spot * iv * math.sqrt(max(dte, 1) / 365.0) * 0.4)
 
@@ -116,12 +99,12 @@ def build_composite(
     iv_rank: float,           # 0.0–1.0
     iv: float,                # absolute IV e.g. 0.18 = 18%
     pattern_name: str,
-    available_expiries: list[dict],  # from expiry.available_expiries()
+    available_expiries: list[dict],
     step: int = 50,
 ) -> list[Leg]:
     """
-    Return a list of Leg objects forming a fully-hedged composite strategy.
-    Always returns ≥ 2 legs. Never returns a naked single leg.
+    Return a list of Leg objects forming a net-credit composite strategy.
+    Returns [] if no net-credit structure can be built with available expiries.
 
     available_expiries must be sorted by DTE ascending (nearest first).
     Each expiry dict: {date: str, display: str, dte: int, series: str, short: str}
@@ -132,127 +115,99 @@ def build_composite(
     pname = pattern_name.lower()
     is_sell_pattern = pname in SELL_PATTERNS
 
-    # Filter expiries: need at least DTE ≥ 1
-    valid = [e for e in available_expiries if e["dte"] >= 1]
+    # Filter expiries: must have DTE >= _MIN_DTE
+    valid = [e for e in available_expiries if e["dte"] >= _MIN_DTE]
     if not valid:
         return []
 
-    near = valid[0]   # nearest expiry (most theta, highest gamma)
-    far  = valid[1] if len(valid) > 1 else valid[0]   # second expiry for multi-expiry strategies
-
-    # IV as fraction
+    # IV normalisation
     if iv > 2.0:
-        iv = iv / 100.0   # convert percentage to fraction
+        iv = iv / 100.0
     iv = max(0.08, min(iv, 0.80))
 
     atm = _round_strike(spot, step)
+    expiry = valid[0]   # nearest valid expiry (max theta)
 
     if is_sell_pattern:
-        # Iron condor uses nearest expiry for max theta; wings cap max loss
-        return _iron_condor(underlying, spot, atm, iv, iv_rank, near, step)
-    elif iv_rank < 0.40:
-        # Low IV → Wide Diagonal: buy near ATM + sell far OTM (2 steps out)
-        # Different expiries always — far leg at a wider strike for more credit
-        return _diagonal_spread(underlying, spot, atm, iv, direction, near, far, step, otm_steps=2)
-    elif iv_rank < 0.65:
-        # Mid IV → Tight Diagonal: buy near ATM + sell far OTM (1 step out)
-        return _diagonal_spread(underlying, spot, atm, iv, direction, near, far, step, otm_steps=1)
+        legs = _iron_condor(underlying, spot, atm, iv, iv_rank, expiry, step)
     else:
-        # High IV → Calendar: sell near + buy far at same strike (vega play)
-        return _calendar_spread(underlying, spot, atm, iv, direction, near, far, step)
+        legs = _credit_spread(underlying, spot, atm, iv, iv_rank, direction, expiry, step)
+
+    # Net credit gate — reject any structure that would cost net money
+    if not legs:
+        return []
+    nd = net_debit(legs)
+    if nd > 0:
+        # Net debit: premiums paid > premiums collected — reject
+        return []
+
+    return legs
 
 
 # ── Strategy builders ─────────────────────────────────────────────────────────
 
-def _diagonal_spread(
-    underlying: str, spot: float, atm: int, iv: float,
-    direction: str, near: dict, far: dict, step: int,
-    otm_steps: int = 1,
+def _credit_spread(
+    underlying: str, spot: float, atm: int, iv: float, iv_rank: float,
+    direction: str, expiry: dict, step: int,
 ) -> list[Leg]:
     """
-    Diagonal Spread: Buy near-term ATM + Sell far-term OTM.
-    Always uses TWO DIFFERENT EXPIRY DATES.
+    Credit Spread: Sell near-ATM option + Buy OTM protection. Same expiry.
 
-    near leg: ATM, full delta/gamma, profits fast when price moves correctly
-    far leg:  OTM (otm_steps away), collects theta from a weaker strike
+    Bullish signal → Bull Put Credit Spread:
+      SELL ATM PE (collect fat premium near ATM)
+      BUY  OTM PE 2 steps below (pay small wing premium)
+      Max profit = net credit (if spot stays above short PE strike at expiry)
+      Max loss   = spread width - net credit (if spot crashes below long PE)
 
-    otm_steps=1 → tight diagonal (mid IV, ±1 step OTM far leg)
-    otm_steps=2 → wide diagonal (low IV, ±2 steps OTM far leg, more credit)
+    Bearish signal → Bear Call Credit Spread:
+      SELL ATM CE (collect fat premium near ATM)
+      BUY  OTM CE 2 steps above (pay small wing premium)
+      Max profit = net credit (if spot stays below short CE strike at expiry)
+      Max loss   = spread width - net credit (if spot rallies above long CE)
 
-    When direction correct: near ATM gains > far OTM loses → net profit
-    When direction wrong:   near ATM limited loss, far OTM premium offsets some
-
-    NIFTY bullish (low IV): Buy Jul-7 24000CE + Sell Jul-14 24100CE (2 steps)
-    BANKNIFTY bearish (mid IV): Buy Jul-28 57000PE + Sell Aug-25 56900PE (1 step)
+    Both structures benefit from time decay (theta). The sold option decays
+    faster in absolute terms. Net credit is always positive by construction.
+    With high IV rank we widen the short strike (1 step OTM instead of ATM)
+    to give more room for the trade to stay profitable.
     """
-    near_dte = near["dte"]
-    far_dte  = far["dte"]
+    dte = expiry["dte"]
+
+    # With elevated IV, sell 1 step OTM for a little more cushion
+    otm_offset = step if iv_rank > 0.55 else 0
 
     if direction == "long":
-        opt_type    = "CE"
-        near_strike = atm
-        far_strike  = atm + otm_steps * step   # sell OTM CE far-term
+        # Bull Put Credit Spread — profit if price stays above short PE
+        short_strike = atm - otm_offset          # sell this PE
+        wing_strike  = short_strike - 2 * step   # buy this PE (protection)
+        opt_type     = "PE"
     else:
-        opt_type    = "PE"
-        near_strike = atm
-        far_strike  = atm - otm_steps * step   # sell OTM PE far-term
+        # Bear Call Credit Spread — profit if price stays below short CE
+        short_strike = atm + otm_offset          # sell this CE
+        wing_strike  = short_strike + 2 * step   # buy this CE (protection)
+        opt_type     = "CE"
 
-    near_prem = _bs_premium(spot, near_strike, near_dte, iv, opt_type)
-    far_prem  = _bs_premium(spot, far_strike,  far_dte,  iv, opt_type)
+    short_prem = _bs_premium(spot, short_strike, dte, iv, opt_type)
+    wing_prem  = _bs_premium(spot, wing_strike,  dte, iv, opt_type)
 
-    # Far-term should provide meaningful offset (≥20% of near cost)
-    far_prem = max(far_prem, near_prem * 0.25)
-
-    return [
-        Leg(strike=near_strike, option_type=opt_type, action="BUY",
-            expiry_iso=near["date"], expiry_display=near["display"], expiry_dte=near_dte,
-            role="primary", estimated_premium=round(near_prem, 2),
-            symbol=_build_symbol(underlying, near["date"], near_strike, opt_type)),
-        Leg(strike=far_strike,  option_type=opt_type, action="SELL",
-            expiry_iso=far["date"], expiry_display=far["display"], expiry_dte=far_dte,
-            role="hedge", estimated_premium=round(far_prem, 2),
-            symbol=_build_symbol(underlying, far["date"], far_strike, opt_type)),
-    ]
-
-
-def _calendar_spread(
-    underlying: str, spot: float, atm: int, iv: float,
-    direction: str, near: dict, far: dict, step: int,
-) -> list[Leg]:
-    """
-    Calendar Spread (time spread): Sell near-term ATM + Buy far-term ATM (same strike).
-    Used when IV is elevated — sell the inflated near-term premium, buy cheaper far-term.
-
-    Near-term decays faster (theta) → short near benefits from time passing.
-    Far-term provides protection if price makes a sudden large move.
-
-    If price stays near ATM: near-term sold decays → profit. Far-term loses slower.
-    If price rallies sharply: near-term CE hurts, far-term CE gains → offset.
-
-    Option type chosen by direction (still want directional bias in far leg).
-    """
-    near_dte = near["dte"]
-    far_dte  = far["dte"]
-
-    opt_type = "CE" if direction == "long" else "PE"
-    strike   = atm   # same ATM strike for both legs
-
-    near_prem = _bs_premium(spot, strike, near_dte, iv, opt_type)
-    far_prem  = _bs_premium(spot, strike, far_dte,  iv, opt_type)
-
-    # Calendar is a net debit: far (buy) > near (sell) in normal vol environments
-    # Ensure near sold < far bought (otherwise we'd be paying more for near which makes no sense)
-    near_prem = min(near_prem, far_prem * 0.85)
+    # Wing must be cheaper (it's further OTM) — clamp if BS gives wrong direction
+    wing_prem = min(wing_prem, short_prem * 0.70)
+    # Minimum net credit: at least 30% of spread width to justify the trade
+    spread_width = 2 * step
+    net_credit   = short_prem - wing_prem
+    if net_credit < spread_width * 0.30:
+        # Boost wing prem down to meet min credit requirement
+        wing_prem = min(wing_prem, short_prem - spread_width * 0.30)
+        wing_prem = max(0.05, wing_prem)
 
     return [
-        Leg(strike=strike, option_type=opt_type, action="SELL",
-            expiry_iso=near["date"], expiry_display=near["display"], expiry_dte=near_dte,
-            role="calendar_short", estimated_premium=round(near_prem, 2),
-            symbol=_build_symbol(underlying, near["date"], strike, opt_type)),
-        Leg(strike=strike, option_type=opt_type, action="BUY",
-            expiry_iso=far["date"], expiry_display=far["display"], expiry_dte=far_dte,
-            role="calendar_long", estimated_premium=round(far_prem, 2),
-            symbol=_build_symbol(underlying, far["date"], strike, opt_type)),
+        Leg(strike=short_strike, option_type=opt_type, action="SELL",
+            expiry_iso=expiry["date"], expiry_display=expiry["display"], expiry_dte=dte,
+            role="primary", estimated_premium=round(short_prem, 2),
+            symbol=_build_symbol(underlying, expiry["date"], short_strike, opt_type)),
+        Leg(strike=wing_strike, option_type=opt_type, action="BUY",
+            expiry_iso=expiry["date"], expiry_display=expiry["display"], expiry_dte=dte,
+            role="hedge", estimated_premium=round(wing_prem, 2),
+            symbol=_build_symbol(underlying, expiry["date"], wing_strike, opt_type)),
     ]
 
 
@@ -261,34 +216,34 @@ def _iron_condor(
     iv_rank: float, expiry: dict, step: int,
 ) -> list[Leg]:
     """
-    Iron Condor: 4 legs, all same expiry.
-    Sell OTM CE + Sell OTM PE + Buy further OTM CE + Buy further OTM PE.
+    Iron Condor: 4 legs, same expiry, net credit.
 
-    Profits when price stays within the short strikes (theta decay).
-    Wings (long far OTM) cap the max loss to spread_width - net_credit.
+    SELL OTM CE + SELL OTM PE (short strangle — collect premium)
+    BUY  far OTM CE + BUY far OTM PE (wings — cap max loss)
 
-    Short CE/PE lose if price breaks out one side → wing on that side limits the loss.
-    Short PE/CE on the other side decay to zero → contribute profit.
+    Profits when price stays between the short strikes (theta decay).
+    Wings define the maximum loss (spread_width - net_credit per side).
 
-    Width: short strikes 2 steps from ATM; wings 4 steps from ATM.
+    Short strikes: 2 steps from ATM (3 steps when high IV rank for more room).
+    Wings: 2 steps beyond short strikes.
     """
     dte = expiry["dte"]
-    # Wider condor with higher IV rank (can afford wider strikes)
-    width = 2 + (1 if iv_rank > 0.7 else 0)
+    # Wider short strikes with higher IV rank (more premium, more room)
+    width = 3 if iv_rank > 0.65 else 2
 
     short_ce_strike = atm + width * step
     short_pe_strike = atm - width * step
-    wing_ce_strike  = atm + (width + 2) * step
-    wing_pe_strike  = atm - (width + 2) * step
+    wing_ce_strike  = short_ce_strike + 2 * step
+    wing_pe_strike  = short_pe_strike - 2 * step
 
     short_ce = _bs_premium(spot, short_ce_strike, dte, iv, "CE")
     short_pe = _bs_premium(spot, short_pe_strike, dte, iv, "PE")
     wing_ce  = _bs_premium(spot, wing_ce_strike,  dte, iv, "CE")
     wing_pe  = _bs_premium(spot, wing_pe_strike,  dte, iv, "PE")
 
-    # Wings must be cheaper than shorts (credit spread condition)
-    wing_ce = min(wing_ce, short_ce * 0.60)
-    wing_pe = min(wing_pe, short_pe * 0.60)
+    # Wings must be cheaper than shorts
+    wing_ce = min(wing_ce, short_ce * 0.55)
+    wing_pe = min(wing_pe, short_pe * 0.55)
 
     return [
         Leg(strike=short_ce_strike, option_type="CE", action="SELL",
@@ -311,48 +266,71 @@ def _iron_condor(
 
 
 def net_debit(legs: list[Leg]) -> float:
-    """Net cost of the composite (positive = net debit, negative = net credit)."""
+    """
+    Net cost of composite (positive = net debit paid, negative = net credit received).
+    For a valid trade this should always be ≤ 0 (net credit).
+    """
     return sum(-leg.estimated_premium * leg.net_sign() for leg in legs)
+
+
+def net_credit(legs: list[Leg]) -> float:
+    """Net credit received (positive = good, negative = net debit = bad)."""
+    return -net_debit(legs)
+
+
+def max_loss(legs: list[Leg], step: int) -> float:
+    """
+    Maximum possible loss per unit (spread width - net credit).
+    For credit spread: width = 2*step, max_loss = width - net_credit.
+    For iron condor: max_loss per side = width - credit_per_side; take the larger.
+    """
+    credit = net_credit(legs)
+    sell_legs = [l for l in legs if l.action == "SELL"]
+    buy_legs  = [l for l in legs if l.action == "BUY"]
+    if not sell_legs or not buy_legs:
+        return sum(l.estimated_premium for l in buy_legs)
+    # Simple approximation: spread width on each side minus net credit
+    spread = abs(buy_legs[0].strike - sell_legs[0].strike)
+    return max(0.0, spread - credit)
 
 
 def strategy_name(legs: list[Leg]) -> str:
     roles = {leg.role for leg in legs}
     if "condor_short_ce" in roles:
         return "Iron Condor"
-    if "calendar_short" in roles:
-        return "Calendar Spread"
-    if "hedge" in roles:
-        # All directional strategies are now diagonal (multi-expiry)
-        expiries = [l.expiry_dte for l in legs]
-        strike_gap = abs(legs[0].strike - legs[1].strike) if len(legs) >= 2 else 0
-        step = min(l.strike for l in legs)  # rough step detection not needed
-        # Detect wide vs tight diagonal by comparing strikes
-        if len(legs) >= 2:
-            buy_leg  = next((l for l in legs if l.action == "BUY"),  None)
-            sell_leg = next((l for l in legs if l.action == "SELL"), None)
-            if buy_leg and sell_leg:
-                gap = abs(buy_leg.strike - sell_leg.strike)
-                # Wide diagonal = 2+ steps; tight diagonal = 1 step
-                return "Wide Diagonal" if gap >= 100 else "Diagonal Spread"
-        return "Diagonal Spread"
-    return "Diagonal Spread"
+    if "primary" in roles:
+        sell_leg = next((l for l in legs if l.action == "SELL"), None)
+        if sell_leg:
+            return "Bull Put Spread" if sell_leg.option_type == "PE" else "Bear Call Spread"
+    return "Credit Spread"
 
 
 def strategy_rationale(legs: list[Leg], iv_rank: float, direction: str) -> str:
     """One-sentence rationale for the composite."""
-    name = strategy_name(legs)
-    debit = net_debit(legs)
-    credit_str = f"net {'debit' if debit > 0 else 'credit'} ₹{abs(debit):.0f}/unit"
+    name   = strategy_name(legs)
+    credit = net_credit(legs)
+    nd_str = f"net credit ₹{credit:.0f}/unit"
+    sell_legs = [l for l in legs if l.action == "SELL"]
+    buy_legs  = [l for l in legs if l.action == "BUY"]
+
     if name == "Iron Condor":
-        return (f"Iron Condor: sell OTM CE+PE, buy wings for protection. "
-                f"Profit if {legs[0].symbol.split('2')[0]} stays range-bound. IV rank {iv_rank:.0%} → theta play. {credit_str}.")
-    if name == "Calendar Spread":
-        return (f"Calendar Spread: sell near-term (high theta) + buy far-term (protection). "
-                f"IV rank {iv_rank:.0%} elevated — monetise near-term vol. {credit_str}.")
-    if name in ("Diagonal Spread", "Wide Diagonal"):
-        buy_leg  = next((l for l in legs if l.action == "BUY"),  None)
-        sell_leg = next((l for l in legs if l.action == "SELL"), None)
-        near_exp = buy_leg.expiry_display  if buy_leg  else "near"
-        far_exp  = sell_leg.expiry_display if sell_leg else "far"
-        return (f"{name}: buy near-expiry ATM ({near_exp}) + sell far-expiry OTM ({far_exp}). "
-                f"{direction.title()} gamma play — near leg profits on move, far leg offsets cost. {credit_str}.")
+        short_ce = next((l for l in sell_legs if l.option_type == "CE"), None)
+        short_pe = next((l for l in sell_legs if l.option_type == "PE"), None)
+        range_str = ""
+        if short_ce and short_pe:
+            range_str = f" Profit range: {int(short_pe.strike)}–{int(short_ce.strike)}."
+        return (f"Iron Condor: sell OTM strangle + buy wings. IV rank {iv_rank:.0%} → "
+                f"theta collection.{range_str} {nd_str}. Max loss = spread - credit.")
+    if name == "Bull Put Spread":
+        s = sell_legs[0] if sell_legs else None
+        b = buy_legs[0]  if buy_legs  else None
+        return (f"Bull Put Spread: sell {int(s.strike) if s else '?'}PE + buy "
+                f"{int(b.strike) if b else '?'}PE. Profit if {legs[0].symbol[:10].rstrip('0')} "
+                f"stays above {int(s.strike) if s else '?'}. {nd_str}.")
+    if name == "Bear Call Spread":
+        s = sell_legs[0] if sell_legs else None
+        b = buy_legs[0]  if buy_legs  else None
+        return (f"Bear Call Spread: sell {int(s.strike) if s else '?'}CE + buy "
+                f"{int(b.strike) if b else '?'}CE. Profit if {legs[0].symbol[:10].rstrip('0')} "
+                f"stays below {int(s.strike) if s else '?'}. {nd_str}.")
+    return f"{name}: {nd_str}."

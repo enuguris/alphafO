@@ -447,7 +447,7 @@ async def _auto_paper_trade(signals, db):
 
         # ── Build composite multi-leg strategy (no naked positions) ───────────
         from app.core.strategies.composite import (
-            build_composite, net_debit as _net_debit,
+            build_composite, net_credit as _net_credit,
             strategy_name as _strat_name, strategy_rationale as _strat_rationale,
         )
         from app.core.options.expiry import available_expiries as _avail_exp
@@ -478,8 +478,8 @@ async def _auto_paper_trade(signals, db):
         _strat = _strat_name(composite_legs)
         _rationale = _strat_rationale(composite_legs, _iv_rank, sig.direction or "long")
 
-        # Net cost of composite position (positive = net debit, negative = net credit received)
-        _net_cost_per_unit = _net_debit(composite_legs)
+        # Net credit received per unit (always positive for valid composite)
+        _net_cost_per_unit = _net_credit(composite_legs)
         cost = abs(_net_cost_per_unit) * quantity
         # Add charges for all legs
         for _leg in composite_legs:
@@ -1143,6 +1143,63 @@ async def _do_mtm_update():
                 elif current >= trade.stop_loss:
                     await _close_trade(trade, trade.stop_loss, "stop_hit", db)
                     continue
+
+        # ── Group-level exit: close ALL legs atomically when net group P&L hits target/stop ──
+        # Individual leg stops are disabled for composite trades — only the group P&L matters.
+        # This prevents the "one leg closes, naked exposure remains" problem.
+        from collections import defaultdict as _dd
+        group_buckets: dict[str, list] = _dd(list)
+        for t in trades:
+            if t.status == TradeStatus.OPEN and t.trade_group_id:
+                group_buckets[t.trade_group_id].append(t)
+
+        for group_id, group_trades in group_buckets.items():
+            # Sum net cost (absolute) of the group at entry — this is our risk capital
+            net_entry_cost = 0.0
+            net_unrealized = 0.0
+            for t in group_trades:
+                if t.action == "BUY":
+                    net_entry_cost -= t.entry_price * t.quantity   # paid
+                    net_unrealized += (t.current_price - t.entry_price) * t.quantity
+                else:
+                    net_entry_cost += t.entry_price * t.quantity   # received
+                    net_unrealized += (t.entry_price - t.current_price) * t.quantity
+
+            # net_entry_cost > 0 means we collected net credit at entry
+            # net_unrealized > 0 means the group is currently profitable
+            # For a credit spread: net_entry_cost = credit received, max_loss = spread - credit
+
+            # Determine max risk (spread width per side - net credit)
+            spread_width = 0.0
+            sell_legs = [t for t in group_trades if t.action == "SELL"]
+            buy_legs  = [t for t in group_trades if t.action == "BUY"]
+            if sell_legs and buy_legs:
+                spread_width = abs(
+                    (sell_legs[0].strike or 0) - (buy_legs[0].strike or 0)
+                ) * (sell_legs[0].quantity or 1)
+
+            max_risk = max(spread_width - net_entry_cost, net_entry_cost * 1.5, 5000.0)
+
+            # Take-profit: keep 70% of max credit collected
+            take_profit_threshold = net_entry_cost * 0.70 if net_entry_cost > 0 else 0
+            # Stop-loss: exit if unrealized loss exceeds 50% of max risk
+            stop_loss_threshold = -max_risk * 0.50
+
+            reason = None
+            if net_entry_cost > 0 and net_unrealized >= take_profit_threshold:
+                reason = "group_target"
+            elif net_unrealized <= stop_loss_threshold:
+                reason = "group_stop"
+
+            if reason:
+                logger.info(
+                    f"Group exit [{group_id[:8]}]: {reason} | "
+                    f"net_credit=₹{net_entry_cost:.0f} unrealized=₹{net_unrealized:.0f} "
+                    f"({len(group_trades)} legs)"
+                )
+                for t in group_trades:
+                    exit_px = t.current_price or t.entry_price
+                    await _close_trade(t, exit_px, reason, db)
 
         await db.commit()
         logger.info(f"MTM update: {len(trades)} open trades repriced")
