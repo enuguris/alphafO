@@ -612,7 +612,15 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
         </td>
         <td colSpan={2} />
         <td style={{ padding: '9px 10px', fontFamily: 'monospace', fontSize: 11, color: 'var(--txt3)' }}>
-          Net debit: ₹{Math.abs(netEntry).toFixed(0)}/unit
+          <div>Net debit: ₹{Math.abs(netEntry).toFixed(0)}/unit</div>
+          {spotPrices[sym] && (
+            <div style={{ marginTop: 2 }}>
+              <span style={{ color: 'var(--txt3)' }}>Spot </span>
+              <span style={{ color: 'var(--txt)', fontWeight: 700 }}>
+                ₹{spotPrices[sym].toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+              </span>
+            </div>
+          )}
         </td>
         <td style={{ padding: '9px 10px', fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11 }}>{legs[0]?.quantity}</td>
         <td style={{ padding: '9px 10px', fontFamily: 'monospace', fontWeight: 800, fontSize: 14,
@@ -697,6 +705,22 @@ function TradeRow({ t, spotPrices, onClose: closeFn }: {
         <td style={{ padding: '9px 10px', fontFamily: 'monospace', fontSize: 11, fontWeight: isHedge ? 400 : 700, color: isHedge ? 'var(--txt3)' : 'var(--txt)' }}>
           {t.symbol}
           {isHedge && <span style={{ fontSize: 9, color: 'var(--orange)', marginLeft: 5 }}>HEDGE</span>}
+          {(() => {
+            const spot = spotPrices[t.underlying?.toUpperCase()]
+            if (!spot) return null
+            const itm = t.option_type === 'CE' ? spot > (t.strike ?? 0) : spot < (t.strike ?? 999999)
+            return (
+              <div style={{ fontSize: 9, marginTop: 2, fontFamily: 'monospace' }}>
+                <span style={{ color: 'var(--txt3)' }}>Spot </span>
+                <span style={{ color: 'var(--txt)', fontWeight: 700 }}>
+                  ₹{spot.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </span>
+                <span style={{ marginLeft: 4, color: itm ? 'var(--up)' : 'var(--dn)', fontWeight: 700 }}>
+                  {itm ? 'ITM' : 'OTM'}
+                </span>
+              </div>
+            )
+          })()}
         </td>
         <td style={{ padding: '9px 10px' }}>
           {t.option_type ? pill(t.option_type, t.option_type === 'CE' ? 'rgba(41,98,255,0.12)' : 'rgba(233,30,99,0.12)', t.option_type === 'CE' ? 'var(--blue)' : '#e91e63') : '—'}
