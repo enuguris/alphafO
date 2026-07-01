@@ -565,8 +565,12 @@ async def _auto_paper_trade(signals, db):
                     _leg_target = round(_leg.estimated_premium * 0.45, 2)
                     _leg_stop   = round(_leg.estimated_premium * 2.00, 2)
 
-                # Try to get live price for each leg
+                # Try to get live price for each leg — three-tier cascade:
+                # 1. Kite/Upstox real-time LTP (requires credentials)
+                # 2. Chain service LTP (synthetic but strike-accurate, no credentials needed)
+                # 3. BS estimate from composite builder (last resort)
                 _leg_prem = _leg.estimated_premium
+                _leg_price_src = "bs"
                 try:
                     _ll, _ls, _lt = await _fetch_option_ltp(
                         _entry_cfg, sig.underlying, _leg.expiry_iso,
@@ -574,8 +578,28 @@ async def _auto_paper_trade(signals, db):
                     )
                     if _ll and _ll > 0:
                         _leg_prem = _ll
+                        _leg_price_src = _ls
                 except Exception:
                     pass
+
+                if _leg_price_src == "bs":
+                    # Tier 2: chain service LTP for this expiry/strike
+                    try:
+                        from app.core.options.chain_service import ChainService as _CS
+                        _chain = _CS().get_chain(sig.underlying)
+                        _ltp_col = "ce_ltp" if _leg.option_type == "CE" else "pe_ltp"
+                        _crow = _chain.iloc[(_chain["strike"] - _leg.strike).abs().argsort()[:1]].iloc[0]
+                        _chain_ltp = float(_crow.get(_ltp_col, 0) or 0)
+                        if _chain_ltp >= 1.0:
+                            _leg_prem = round(_chain_ltp, 2)
+                            _leg_price_src = "chain"
+                    except Exception:
+                        pass
+
+                if _leg_price_src not in ("bs",):
+                    logger.debug(f"Leg {_leg.symbol} price={_leg_prem:.2f} source={_leg_price_src}")
+                else:
+                    logger.debug(f"Leg {_leg.symbol} price={_leg_prem:.2f} source=bs (BS estimate)")
 
                 _leg_note = (
                     f"{composite_notes_prefix}|"
