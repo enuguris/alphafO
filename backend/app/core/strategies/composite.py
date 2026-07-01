@@ -1,23 +1,25 @@
 """
 Composite option strategies — multi-leg defined-risk combinations.
 
-All positions are fully hedged: no naked exposure. Every strategy has at
-least one leg that profits when another loses, creating a net payoff that
-is bounded on both sides.
+All positions are fully hedged: no naked exposure. Every strategy uses at
+least TWO DIFFERENT EXPIRY DATES so the legs are naturally uncorrelated —
+near-term vs far-term theta, vega, and delta profiles differ, creating a
+payoff where one leg can profit even when the other loses.
 
 Strategy selection by IV rank and pattern type:
 
-  BUY_PATTERNS (directional):
-    low IV  (< 0.40):  Vertical Spread — buy ATM + sell OTM (same expiry)
-                       Cheap debit, limited profit, limited loss
-    mid IV  (0.40-0.65): Diagonal Spread — buy near-term ATM + sell far-term OTM
-                       Direction + some theta from far-term short
-    high IV (> 0.65):  Calendar Spread — sell near-term ATM + buy far-term ATM
+  BUY_PATTERNS (directional) — always near + far expiry:
+    low IV  (< 0.40):  Wide Diagonal — buy near ATM + sell far OTM (2 steps)
+                       Near leg: max gamma/delta; far leg: wide credit offset
+    mid IV  (0.40-0.65): Diagonal Spread — buy near ATM + sell far OTM (1 step)
+                       Balanced gamma play with meaningful theta offset
+    high IV (> 0.65):  Calendar Spread — sell near ATM + buy far ATM (same strike)
                        Sell elevated near-term IV, own cheaper far-term
 
   SELL_PATTERNS (iv_crush, expiry_week):
     always:            Iron Condor — sell OTM CE + sell OTM PE + buy wings
                        Theta collection with defined max loss on both sides
+                       Uses nearest expiry (max theta decay)
 
 Each returned Leg dict has:
   strike, option_type, action, expiry_iso, expiry_display, expiry_dte,
@@ -146,94 +148,59 @@ def build_composite(
     atm = _round_strike(spot, step)
 
     if is_sell_pattern:
+        # Iron condor uses nearest expiry for max theta; wings cap max loss
         return _iron_condor(underlying, spot, atm, iv, iv_rank, near, step)
     elif iv_rank < 0.40:
-        return _vertical_spread(underlying, spot, atm, iv, direction, near, step)
+        # Low IV → Wide Diagonal: buy near ATM + sell far OTM (2 steps out)
+        # Different expiries always — far leg at a wider strike for more credit
+        return _diagonal_spread(underlying, spot, atm, iv, direction, near, far, step, otm_steps=2)
     elif iv_rank < 0.65:
-        return _diagonal_spread(underlying, spot, atm, iv, direction, near, far, step)
+        # Mid IV → Tight Diagonal: buy near ATM + sell far OTM (1 step out)
+        return _diagonal_spread(underlying, spot, atm, iv, direction, near, far, step, otm_steps=1)
     else:
+        # High IV → Calendar: sell near + buy far at same strike (vega play)
         return _calendar_spread(underlying, spot, atm, iv, direction, near, far, step)
 
 
 # ── Strategy builders ─────────────────────────────────────────────────────────
 
-def _vertical_spread(
-    underlying: str, spot: float, atm: int, iv: float,
-    direction: str, expiry: dict, step: int,
-) -> list[Leg]:
-    """
-    Bull Call Spread (bullish) or Bear Put Spread (bearish).
-    Buy ATM option + Sell OTM option (2 steps away), same expiry.
-
-    Payoff: capped profit (up to spread width), capped loss (net debit paid).
-    "One leg loses, the other limits it" — short OTM reduces cost by 40–60%.
-
-    Example bullish NIFTY: Buy 24000CE @ ₹180 + Sell 24100CE @ ₹90 = ₹90 net debit
-    Max profit: ₹10 (spread) - ₹0.90 (per unit) = ₹9.10/unit × 65 lots = ₹591
-    Max loss:   ₹0.90/unit = ₹58.50 total
-    """
-    dte = expiry["dte"]
-    if direction == "long":
-        opt_type = "CE"
-        long_strike = atm
-        short_strike = atm + 2 * step     # sell OTM CE 2 strikes above
-    else:
-        opt_type = "PE"
-        long_strike = atm
-        short_strike = atm - 2 * step     # sell OTM PE 2 strikes below
-
-    long_prem  = _bs_premium(spot, long_strike,  dte, iv, opt_type)
-    short_prem = _bs_premium(spot, short_strike, dte, iv, opt_type)
-
-    # Ensure it's a credit-reducing debit (not a debit spread where short costs more)
-    if short_prem >= long_prem * 0.95:
-        short_prem = long_prem * 0.50   # floor at 50% of long premium
-
-    return [
-        Leg(strike=long_strike,  option_type=opt_type, action="BUY",
-            expiry_iso=expiry["date"], expiry_display=expiry["display"], expiry_dte=dte,
-            role="primary", estimated_premium=round(long_prem, 2),
-            symbol=_build_symbol(underlying, expiry["date"], long_strike, opt_type)),
-        Leg(strike=short_strike, option_type=opt_type, action="SELL",
-            expiry_iso=expiry["date"], expiry_display=expiry["display"], expiry_dte=dte,
-            role="hedge", estimated_premium=round(short_prem, 2),
-            symbol=_build_symbol(underlying, expiry["date"], short_strike, opt_type)),
-    ]
-
-
 def _diagonal_spread(
     underlying: str, spot: float, atm: int, iv: float,
     direction: str, near: dict, far: dict, step: int,
+    otm_steps: int = 1,
 ) -> list[Leg]:
     """
-    Diagonal Spread: Buy near-term ATM + Sell far-term OTM (or vice-versa).
+    Diagonal Spread: Buy near-term ATM + Sell far-term OTM.
+    Always uses TWO DIFFERENT EXPIRY DATES.
 
-    Directional bias: near-term ATM owns gamma (profits when price moves quickly).
-    Far-term short: collects theta from a less aggressive strike (OTM protection).
+    near leg: ATM, full delta/gamma, profits fast when price moves correctly
+    far leg:  OTM (otm_steps away), collects theta from a weaker strike
 
-    When direction is correct: near-term gains > far-term loses → net profit.
-    When direction wrong: near-term limited loss, far-term premium offsets some.
+    otm_steps=1 → tight diagonal (mid IV, ±1 step OTM far leg)
+    otm_steps=2 → wide diagonal (low IV, ±2 steps OTM far leg, more credit)
 
-    Example bearish NIFTY: Buy 24000PE (7d) @ ₹150 + Sell 23700PE (21d) @ ₹80 = ₹70 net
-    If NIFTY falls 200pts: near PE → +₹120, far PE → -₹60 → net +₹60
-    If NIFTY rises 100pts: near PE → -₹80, far PE → +₹40 → net -₹40 (partial offset)
+    When direction correct: near ATM gains > far OTM loses → net profit
+    When direction wrong:   near ATM limited loss, far OTM premium offsets some
+
+    NIFTY bullish (low IV): Buy Jul-7 24000CE + Sell Jul-14 24100CE (2 steps)
+    BANKNIFTY bearish (mid IV): Buy Jul-28 57000PE + Sell Aug-25 56900PE (1 step)
     """
     near_dte = near["dte"]
     far_dte  = far["dte"]
 
     if direction == "long":
-        opt_type = "CE"
-        near_strike = atm                  # buy ATM CE near-term (gamma play)
-        far_strike  = atm + step           # sell slightly OTM CE far-term (collect theta)
-    else:
-        opt_type = "PE"
+        opt_type    = "CE"
         near_strike = atm
-        far_strike  = atm - step
+        far_strike  = atm + otm_steps * step   # sell OTM CE far-term
+    else:
+        opt_type    = "PE"
+        near_strike = atm
+        far_strike  = atm - otm_steps * step   # sell OTM PE far-term
 
     near_prem = _bs_premium(spot, near_strike, near_dte, iv, opt_type)
     far_prem  = _bs_premium(spot, far_strike,  far_dte,  iv, opt_type)
 
-    # Far-term should provide meaningful offset (>20% of near cost)
+    # Far-term should provide meaningful offset (≥20% of near cost)
     far_prem = max(far_prem, near_prem * 0.25)
 
     return [
@@ -354,9 +321,21 @@ def strategy_name(legs: list[Leg]) -> str:
         return "Iron Condor"
     if "calendar_short" in roles:
         return "Calendar Spread"
-    if "hedge" in roles and any(l.expiry_dte != legs[0].expiry_dte for l in legs):
+    if "hedge" in roles:
+        # All directional strategies are now diagonal (multi-expiry)
+        expiries = [l.expiry_dte for l in legs]
+        strike_gap = abs(legs[0].strike - legs[1].strike) if len(legs) >= 2 else 0
+        step = min(l.strike for l in legs)  # rough step detection not needed
+        # Detect wide vs tight diagonal by comparing strikes
+        if len(legs) >= 2:
+            buy_leg  = next((l for l in legs if l.action == "BUY"),  None)
+            sell_leg = next((l for l in legs if l.action == "SELL"), None)
+            if buy_leg and sell_leg:
+                gap = abs(buy_leg.strike - sell_leg.strike)
+                # Wide diagonal = 2+ steps; tight diagonal = 1 step
+                return "Wide Diagonal" if gap >= 100 else "Diagonal Spread"
         return "Diagonal Spread"
-    return "Vertical Spread"
+    return "Diagonal Spread"
 
 
 def strategy_rationale(legs: list[Leg], iv_rank: float, direction: str) -> str:
@@ -370,8 +349,10 @@ def strategy_rationale(legs: list[Leg], iv_rank: float, direction: str) -> str:
     if name == "Calendar Spread":
         return (f"Calendar Spread: sell near-term (high theta) + buy far-term (protection). "
                 f"IV rank {iv_rank:.0%} elevated — monetise near-term vol. {credit_str}.")
-    if name == "Diagonal Spread":
-        return (f"Diagonal Spread: buy near-term ATM (gamma) + sell far-term OTM (offset). "
-                f"{direction.title()} bias with theta offset. {credit_str}.")
-    return (f"Vertical Spread: buy ATM + sell OTM, capped profit+loss. "
-            f"{direction.title()} directional play, low IV. {credit_str}.")
+    if name in ("Diagonal Spread", "Wide Diagonal"):
+        buy_leg  = next((l for l in legs if l.action == "BUY"),  None)
+        sell_leg = next((l for l in legs if l.action == "SELL"), None)
+        near_exp = buy_leg.expiry_display  if buy_leg  else "near"
+        far_exp  = sell_leg.expiry_display if sell_leg else "far"
+        return (f"{name}: buy near-expiry ATM ({near_exp}) + sell far-expiry OTM ({far_exp}). "
+                f"{direction.title()} gamma play — near leg profits on move, far leg offsets cost. {credit_str}.")
