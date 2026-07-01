@@ -558,7 +558,8 @@ function TradeRow({ t, spotPrices, onClose: closeFn }: {
   const isOpen  = t.status === 'open'
   const isHedge = (t.notes ?? '').includes('spread_leg:hedge')
 
-  const current = isOpen ? (livePrice(t, spotPrices) ?? t.current_price ?? t.entry_price) : t.exit_price
+  // Prefer server MTM price (real Kite/Upstox LTP); BS estimate only if no server price yet
+  const current = isOpen ? (t.current_price ?? livePrice(t, spotPrices) ?? t.entry_price) : t.exit_price
   const pnl     = isOpen
     ? (current != null ? livePnl(t, current) : (t.unrealized_pnl ?? 0))
     : (t.pnl ?? 0)
@@ -645,13 +646,13 @@ function TradeRow({ t, spotPrices, onClose: closeFn }: {
 function LivePnlBar({ trades, spotPrices }: { trades: any[]; spotPrices: Record<string, number> }) {
   const mainTrades = trades.filter(t => !(t.notes ?? '').includes('spread_leg:hedge'))
   const totalPnl = mainTrades.reduce((sum, t) => {
-    const cur = livePrice(t, spotPrices) ?? t.current_price ?? t.entry_price
+    const cur = t.current_price ?? livePrice(t, spotPrices) ?? t.entry_price
     return sum + (cur != null ? livePnl(t, cur) : (t.unrealized_pnl ?? 0))
   }, 0)
 
   const byUnderlying: Record<string, number> = {}
   for (const t of mainTrades) {
-    const cur = livePrice(t, spotPrices) ?? t.current_price ?? t.entry_price
+    const cur = t.current_price ?? livePrice(t, spotPrices) ?? t.entry_price
     const p = cur != null ? livePnl(t, cur) : (t.unrealized_pnl ?? 0)
     byUnderlying[t.underlying] = (byUnderlying[t.underlying] ?? 0) + p
   }

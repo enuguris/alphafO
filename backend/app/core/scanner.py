@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from app.core.instruments import ALL_INSTRUMENTS, priority_scan_list, BASE_PRICES, LOT_SIZES
+from app.core.instruments import ALL_INSTRUMENTS, priority_scan_list, BASE_PRICES, LOT_SIZES, get_lot_size
 from app.core.patterns.registry import PatternRegistry
 from app.core.options.regime import RegimeDetector
 from app.core.options.chain_service import ChainService
@@ -441,7 +441,7 @@ async def scan_instrument(
                     opts = [fallback]
                 except Exception:
                     opts = [{"instrument": underlying, "option_type": None, "strategy": None,
-                             "strike": None, "lot_size": LOT_SIZES.get(underlying, 50)}]
+                             "strike": None, "lot_size": get_lot_size(underlying)}]
 
             for opt in opts:
                 exp_dte = opt.get("expiry_dte") or opt.get("expiry", {}).get("dte") or TIMEFRAME_DTE[timeframe]
@@ -460,7 +460,7 @@ async def scan_instrument(
                         }
                         if not estimated_premium:
                             estimated_premium = round(abs(g.delta) * spot * 0.02, 2)
-                        lot = opt.get("lot_size") or LOT_SIZES.get(underlying, 25)
+                        lot = opt.get("lot_size") or get_lot_size(underlying)
                         max_loss = round(estimated_premium * lot, 2)
                     except Exception:
                         pass
@@ -506,7 +506,7 @@ async def scan_instrument(
                     "expiry_dte":         exp_dte,
                     "expiry_series":      exp_series,
                     "option_strategy":    opt.get("strategy"),
-                    "lot_size":           opt.get("lot_size") or LOT_SIZES.get(underlying, 50),
+                    "lot_size":           opt.get("lot_size") or get_lot_size(underlying),
                     "delta":              greeks_data.get("delta"),
                     "gamma":              greeks_data.get("gamma"),
                     "theta":              greeks_data.get("theta"),

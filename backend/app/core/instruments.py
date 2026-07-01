@@ -5,6 +5,15 @@ IMPORTANT: base_price values are APPROXIMATE reference prices used only for
 synthetic data generation in testing mode. They are NOT live prices.
 When Kite Connect is configured, real historical OHLCV replaces synthetic data.
 Prices updated: June 2026.
+
+LOT SIZE HISTORY (NSE revised lot sizes in 2024-2025 to target ≥₹15L contract value):
+  NIFTY     : 25 → 75 (Apr 2024) → 65 (Oct 2024, confirmed user July 2026)
+  BANKNIFTY : 25 → 15 (2022)     → 30 (2024 revision, estimated ~₹17.1L at ₹57k spot)
+  FINNIFTY  : 40 → 65 (2024 revision, estimated at ₹24k spot)
+  MIDCPNIFTY: 50 → 120 (2024 revision, estimated at ₹13.5k spot)
+  SENSEX    : 10 → 20 (2024 revision BSE, estimated at ₹82k spot)
+  ⚠ Run the `verify-lot-sizes` Celery task to cross-check against live Kite data.
+  See: docs/NSE_MARKET_CONVENTIONS.md for full history.
 """
 from typing import TypedDict
 
@@ -19,11 +28,13 @@ class Instrument(TypedDict):
 
 
 INDICES: list[Instrument] = [
-    {"sym": "NIFTY",      "name": "Nifty 50",        "sector": "Index",   "lot_size": 25,  "base_price": 24800,  "expiry_type": "weekly"},
-    {"sym": "BANKNIFTY",  "name": "Bank Nifty",       "sector": "Index",   "lot_size": 15,  "base_price": 55000,  "expiry_type": "weekly"},
-    {"sym": "FINNIFTY",   "name": "Fin Nifty",        "sector": "Index",   "lot_size": 40,  "base_price": 24100,  "expiry_type": "weekly"},
-    {"sym": "MIDCPNIFTY", "name": "Midcap Nifty",     "sector": "Index",   "lot_size": 50,  "base_price": 13500,  "expiry_type": "weekly"},
-    {"sym": "SENSEX",     "name": "BSE Sensex",       "sector": "Index",   "lot_size": 10,  "base_price": 82000,  "expiry_type": "weekly"},
+    # lot_size revised Oct 2024 (SEBI ≥₹15L contract value mandate)
+    # NIFTY: 65 confirmed by user Jul 2026. BANKNIFTY: 30 estimated — verify via `verify-lot-sizes` task.
+    {"sym": "NIFTY",      "name": "Nifty 50",        "sector": "Index",   "lot_size": 65,  "base_price": 24800,  "expiry_type": "weekly"},
+    {"sym": "BANKNIFTY",  "name": "Bank Nifty",       "sector": "Index",   "lot_size": 30,  "base_price": 57000,  "expiry_type": "weekly"},
+    {"sym": "FINNIFTY",   "name": "Fin Nifty",        "sector": "Index",   "lot_size": 65,  "base_price": 24100,  "expiry_type": "weekly"},
+    {"sym": "MIDCPNIFTY", "name": "Midcap Nifty",     "sector": "Index",   "lot_size": 120, "base_price": 13500,  "expiry_type": "weekly"},
+    {"sym": "SENSEX",     "name": "BSE Sensex",       "sector": "Index",   "lot_size": 20,  "base_price": 82000,  "expiry_type": "weekly"},
 ]
 
 FNO_STOCKS: list[Instrument] = [
@@ -151,6 +162,28 @@ for _inst in ALL_INSTRUMENTS:
 
 LOT_SIZES: dict[str, int] = {i["sym"]: i["lot_size"] for i in ALL_INSTRUMENTS}
 BASE_PRICES: dict[str, float] = {i["sym"]: i["base_price"] for i in ALL_INSTRUMENTS}
+
+
+def get_lot_size(sym: str) -> int:
+    """
+    Return lot size for a symbol, preferring live Kite data from Redis cache.
+    Cache key `kite:nfo_lot_sizes` is written by KiteTickerService at startup
+    and refreshed daily by the `verify-lot-sizes` Celery task.
+    Falls back to instruments.py hardcoded values if cache unavailable.
+    """
+    try:
+        import json as _json
+        import redis as _redis
+        from app.config import settings as _s
+        _r = _redis.from_url(_s.redis_url, decode_responses=True, socket_connect_timeout=1)
+        raw = _r.get("kite:nfo_lot_sizes")
+        if raw:
+            live = _json.loads(raw)
+            if sym in live:
+                return int(live[sym])
+    except Exception:
+        pass
+    return LOT_SIZES.get(sym, 1)
 
 
 def get_instrument(sym: str) -> Instrument | None:

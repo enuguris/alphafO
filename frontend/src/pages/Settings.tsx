@@ -46,9 +46,29 @@ export default function Settings() {
   } | null>(null)
 
   // Risk controls state
-  const [riskStatus,   setRiskStatus]   = useState<{ halted: boolean; daily_pnl: number; capital_deployed: number; capital: number } | null>(null)
+  const [riskStatus,   setRiskStatus]   = useState<{ halted: boolean; daily_pnl: number; capital_deployed: number; capital: number; params?: Record<string, number> } | null>(null)
   const [riskBusy,     setRiskBusy]     = useState(false)
   const [haltReason,   setHaltReason]   = useState('manual halt from UI')
+  // Dynamic risk params
+  const [riskParams, setRiskParams] = useState<Record<string, number> | null>(null)
+  const [editingParams, setEditingParams] = useState<Record<string, string>>({})
+  const [paramSaving, setParamSaving] = useState(false)
+  const [paramStatus, setParamStatus] = useState<Status>(null)
+
+  // Upstox state
+  const [upApiKey,        setUpApiKey]        = useState('')
+  const [upApiSecret,     setUpApiSecret]     = useState('')
+  const [upAuthCode,      setUpAuthCode]      = useState('')
+  const [upRedirectUri,   setUpRedirectUri]   = useState('https://127.0.0.1')
+  const [upSavingCreds,   setUpSavingCreds]   = useState(false)
+  const [upGenToken,      setUpGenToken]      = useState(false)
+  const [upTestingConn,   setUpTestingConn]   = useState(false)
+  const [upCredStatus,    setUpCredStatus]    = useState<Status>(null)
+  const [upTokenStatus,   setUpTokenStatus]   = useState<Status>(null)
+  const [upTestResult,    setUpTestResult]    = useState<TestResult | null>(null)
+  const [upSavedInfo,     setUpSavedInfo]     = useState<{
+    api_key: string; has_secret: boolean; token_valid: boolean; token_date: string | null
+  } | null>(null)
 
   // Anthropic key state
   const [anthropicKey,        setAnthropicKey]        = useState('')
@@ -58,16 +78,16 @@ export default function Settings() {
 
   useEffect(() => {
     api.get('/settings/kite-credentials')
-      .then(r => {
-        setSavedInfo(r.data)
-        if (r.data.api_key) setApiKey(r.data.api_key)
-      })
+      .then(r => { setSavedInfo(r.data); if (r.data.api_key) setApiKey(r.data.api_key) })
+      .catch(() => {})
+    api.get('/settings/upstox-credentials')
+      .then(r => { setUpSavedInfo(r.data); if (r.data.api_key) setUpApiKey(r.data.api_key) })
       .catch(() => {})
     fetchAnthropicKeyStatus()
       .then(r => setAnthropicHasKey(r.has_key))
       .catch(() => {})
     fetchRiskStatus()
-      .then(r => setRiskStatus(r))
+      .then(r => { setRiskStatus(r); if (r.params) { setRiskParams(r.params); const init: Record<string, string> = {}; Object.entries(r.params).forEach(([k,v]) => { init[k] = String(v) }); setEditingParams(init) } })
       .catch(() => {})
   }, [])
 
@@ -139,6 +159,53 @@ export default function Settings() {
     }
   }
 
+  const upSaveCreds = async () => {
+    if (!upApiKey || !upApiSecret) return
+    setUpSavingCreds(true); setUpCredStatus(null)
+    try {
+      await api.post('/settings/upstox-credentials', { api_key: upApiKey, api_secret: upApiSecret })
+      setUpCredStatus({ text: 'Credentials saved. Open login URL to authenticate.', ok: true })
+      setUpApiSecret('')
+      const r = await api.get('/settings/upstox-credentials')
+      setUpSavedInfo(r.data)
+    } catch (e: any) {
+      setUpCredStatus({ text: e?.response?.data?.detail ?? 'Failed to save credentials.', ok: false })
+    } finally { setUpSavingCreds(false) }
+  }
+
+  const upOpenLoginUrl = async () => {
+    try {
+      const r = await api.get('/settings/upstox-login-url')
+      window.open(r.data.login_url, '_blank')
+    } catch (e: any) {
+      setUpCredStatus({ text: e?.response?.data?.detail ?? 'Save credentials first.', ok: false })
+    }
+  }
+
+  const upGenerateToken = async () => {
+    if (!upAuthCode) return
+    setUpGenToken(true); setUpTokenStatus(null)
+    try {
+      const r = await api.post('/settings/upstox-token', { auth_code: upAuthCode, redirect_uri: upRedirectUri })
+      setUpTokenStatus({ text: `${r.data.message} Valid until midnight today.`, ok: true })
+      setUpAuthCode('')
+      const info = await api.get('/settings/upstox-credentials')
+      setUpSavedInfo(info.data)
+    } catch (e: any) {
+      setUpTokenStatus({ text: e?.response?.data?.detail ?? 'Token exchange failed.', ok: false })
+    } finally { setUpGenToken(false) }
+  }
+
+  const upTestConnection = async () => {
+    setUpTestingConn(true); setUpTestResult(null)
+    try {
+      const r = await api.get('/settings/upstox-test')
+      setUpTestResult(r.data)
+    } catch (e: any) {
+      setUpTestResult({ passed: false, summary: e?.response?.data?.detail ?? 'Test failed.', results: [] })
+    } finally { setUpTestingConn(false) }
+  }
+
   const doHalt = async () => {
     if (!window.confirm(`Halt all automated trading?\nReason: "${haltReason}"`)) return
     setRiskBusy(true)
@@ -156,6 +223,29 @@ export default function Settings() {
       const r = await fetchRiskStatus()
       setRiskStatus(r)
     } finally { setRiskBusy(false) }
+  }
+
+  const saveRiskParamsHandler = async () => {
+    setParamSaving(true); setParamStatus(null)
+    try {
+      const updates: Record<string, number> = {}
+      Object.entries(editingParams).forEach(([k, v]) => { const n = parseFloat(v); if (!isNaN(n)) updates[k] = n })
+      const r = await api.put('/options/risk/params', updates)
+      setRiskParams(r.data.params)
+      setParamStatus({ text: 'Risk parameters saved and active immediately.', ok: true })
+    } catch (e: any) {
+      setParamStatus({ text: e?.response?.data?.detail ?? 'Save failed.', ok: false })
+    } finally { setParamSaving(false) }
+  }
+
+  const resetRiskParamsHandler = async () => {
+    if (!window.confirm('Reset all risk parameters to .env defaults?')) return
+    try {
+      const r = await api.delete('/options/risk/params')
+      setRiskParams(r.data.params)
+      const init: Record<string, string> = {}; Object.entries(r.data.params).forEach(([k,v]) => { init[k] = String(v) }); setEditingParams(init)
+      setParamStatus({ text: 'Reset to defaults.', ok: true })
+    } catch { setParamStatus({ text: 'Reset failed.', ok: false }) }
   }
 
   const generateToken = async () => {
@@ -408,6 +498,103 @@ export default function Settings() {
           </div>
         </section>
 
+        {/* ── Upstox ── */}
+        <section style={{ marginBottom: 20 }}>
+          <div className="section-title">Upstox API (LTP Round-Robin)</div>
+          <div className="form-section">
+            <div className="form-section-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+              {/* Status badge */}
+              {upSavedInfo && (
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 11, color: 'var(--txt2)' }}>
+                    API Key: <strong>{upSavedInfo.api_key || '—'}</strong>
+                  </span>
+                  <span style={{
+                    fontSize: 10, padding: '2px 7px', borderRadius: 4,
+                    background: upSavedInfo.token_valid ? 'var(--up)' : 'var(--orange)',
+                    color: '#fff', fontWeight: 600,
+                  }}>
+                    {upSavedInfo.token_valid ? `TOKEN VALID (${upSavedInfo.token_date})` : 'NO TOKEN'}
+                  </span>
+                </div>
+              )}
+
+              {/* Step 1 — credentials */}
+              <div>
+                <div style={{ fontWeight: 600, color: 'var(--txt)', marginBottom: 6 }}>Step 1 — API Credentials</div>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
+                  <input className="form-input" placeholder="API Key (client_id)" value={upApiKey}
+                    onChange={e => setUpApiKey(e.target.value)} style={{ flex: 1 }} />
+                  <input className="form-input" placeholder="API Secret" type="password" value={upApiSecret}
+                    onChange={e => setUpApiSecret(e.target.value)} style={{ flex: 1 }} />
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="tv-btn" onClick={upSaveCreds} disabled={upSavingCreds || !upApiKey || !upApiSecret}>
+                    {upSavingCreds ? 'Saving…' : 'Save Credentials'}
+                  </button>
+                  <button className="tv-btn" onClick={upOpenLoginUrl} disabled={!upSavedInfo?.api_key}>
+                    Open Login URL
+                  </button>
+                </div>
+                {upCredStatus && (
+                  <div style={{ marginTop: 6, fontSize: 12, color: upCredStatus.ok ? 'var(--up)' : 'var(--dn)' }}>
+                    {upCredStatus.text}
+                  </div>
+                )}
+              </div>
+
+              {/* Step 2 — auth code → token */}
+              <div>
+                <div style={{ fontWeight: 600, color: 'var(--txt)', marginBottom: 4 }}>Step 2 — Exchange Auth Code</div>
+                <div style={{ fontSize: 11, color: 'var(--txt2)', marginBottom: 6 }}>
+                  After login, copy the <code>code</code> param from the redirect URL (e.g. <code>https://127.0.0.1/?code=ABC123…</code>)
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
+                  <input className="form-input" placeholder="Auth code from redirect URL" value={upAuthCode}
+                    onChange={e => setUpAuthCode(e.target.value)} style={{ flex: 2 }} />
+                  <input className="form-input" placeholder="Redirect URI" value={upRedirectUri}
+                    onChange={e => setUpRedirectUri(e.target.value)} style={{ flex: 1 }} />
+                </div>
+                <button className="tv-btn" onClick={upGenerateToken} disabled={upGenToken || !upAuthCode}>
+                  {upGenToken ? 'Generating…' : 'Generate Access Token'}
+                </button>
+                {upTokenStatus && (
+                  <div style={{ marginTop: 6, fontSize: 12, color: upTokenStatus.ok ? 'var(--up)' : 'var(--dn)' }}>
+                    {upTokenStatus.text}
+                  </div>
+                )}
+              </div>
+
+              {/* Test */}
+              <div>
+                <button className="tv-btn" onClick={upTestConnection} disabled={upTestingConn || !upSavedInfo?.token_valid}>
+                  {upTestingConn ? 'Testing…' : 'Test Upstox Connection'}
+                </button>
+                {upTestResult && (
+                  <div style={{ marginTop: 8, padding: 10, background: 'var(--bg2)', borderRadius: 6 }}>
+                    <div style={{ fontWeight: 600, color: upTestResult.passed ? 'var(--up)' : 'var(--dn)', marginBottom: 6 }}>
+                      {upTestResult.passed ? '✓ Connected' : '✗ Failed'}
+                    </div>
+                    {upTestResult.results.map((r, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 4, fontSize: 12 }}>
+                        <span style={{ color: r.ok ? 'var(--up)' : 'var(--dn)', minWidth: 12 }}>{r.ok ? '✓' : '✗'}</span>
+                        <strong style={{ minWidth: 120 }}>{r.check}</strong>
+                        <span style={{ color: 'var(--txt2)' }}>{r.detail}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ fontSize: 11, color: 'var(--txt2)', borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+                When both Kite and Upstox tokens are valid, LTP calls alternate between them 50/50 to share rate-limit load.
+                NSE option chain (jugaad-data) is used only when both APIs are unavailable.
+              </div>
+            </div>
+          </div>
+        </section>
+
         {/* ── AI Chat ── */}
         <section style={{ marginBottom: 20 }}>
           <div className="section-title">AI Chat (Claude)</div>
@@ -518,30 +705,54 @@ export default function Settings() {
           </div>
         </section>
 
-        {/* ── Risk Parameters ── */}
+        {/* ── Risk Parameters (dynamic) ── */}
         <section>
-          <div className="section-title">Risk Parameters</div>
-          <div className="form-section" style={{ overflow: 'hidden' }}>
-            <table className="tv-table">
-              <thead>
-                <tr>
-                  <th style={{ textAlign: 'left' }}>Parameter</th>
-                  <th style={{ textAlign: 'left' }}>Description</th>
-                  <th>Value</th>
-                </tr>
-              </thead>
-              <tbody>
-                {RISK_PARAMS.map(([label, val, desc]) => (
-                  <tr key={label}>
-                    <td style={{ textAlign: 'left', fontWeight: 600, color: 'var(--txt)' }}>{label}</td>
-                    <td style={{ textAlign: 'left', color: 'var(--txt2)' }}>{desc}</td>
-                    <td className="mono" style={{ color: 'var(--blue)', fontWeight: 700 }}>{val}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <div style={{ padding: '8px 14px', borderTop: '1px solid var(--border)', fontSize: 10, color: 'var(--txt3)' }}>
-              Parameters are configured via the <code style={{ fontFamily: 'monospace' }}>.env</code> file.
+          <div className="section-title">Risk Appetite Controls</div>
+          <div className="form-section">
+            <div className="form-section-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {riskParams ? (
+                <>
+                  {[
+                    { key: 'max_portfolio_heat', label: 'Max Portfolio Heat (%)', desc: 'Total % of capital that can be deployed at once (e.g. 10 = 10%)' },
+                    { key: 'max_daily_loss_pct', label: 'Daily Loss Limit (%)', desc: 'Auto-halt when daily P&L loss exceeds this % of capital' },
+                    { key: 'max_risk_per_trade', label: 'Max Risk Per Trade (%)', desc: 'Max capital risked per individual trade position' },
+                    { key: 'paper_capital', label: 'Paper Capital (₹)', desc: 'Total virtual capital for paper trading' },
+                    { key: 'max_concurrent_trades', label: 'Max Concurrent Trades', desc: 'Maximum number of open positions at any time' },
+                  ].map(({ key, label, desc }) => (
+                    <div key={key} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+                        <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 4 }}>{desc}</div>
+                      </div>
+                      <input
+                        className="tv-input"
+                        style={{ width: 100, textAlign: 'right' }}
+                        value={editingParams[key] ?? String(riskParams[key] ?? '')}
+                        onChange={e => setEditingParams(p => ({ ...p, [key]: e.target.value }))}
+                      />
+                    </div>
+                  ))}
+                  <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
+                    <button onClick={saveRiskParamsHandler} disabled={paramSaving} className="tv-btn tv-btn-primary">
+                      {paramSaving ? 'Saving...' : 'Save Parameters'}
+                    </button>
+                    <button onClick={resetRiskParamsHandler} className="tv-btn" style={{ color: 'var(--txt2)' }}>
+                      Reset to Defaults
+                    </button>
+                  </div>
+                  {paramStatus && (
+                    <div style={{ fontSize: 11, color: paramStatus.ok ? 'var(--up)' : 'var(--dn)', padding: '4px 0' }}>
+                      {paramStatus.text}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 4 }}>
+                    Changes take effect immediately — no restart needed. With NIFTY lot size 65 @ ~₹200 premium = ₹13,000/lot.
+                    Set Max Portfolio Heat to ≥10% (₹50,000) to allow 3-4 concurrent NIFTY trades.
+                  </div>
+                </>
+              ) : (
+                <div style={{ color: 'var(--txt3)', fontSize: 12 }}>Loading risk parameters...</div>
+              )}
             </div>
           </div>
         </section>

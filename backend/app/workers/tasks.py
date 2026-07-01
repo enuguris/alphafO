@@ -132,6 +132,28 @@ def _is_market_hours() -> bool:
     return _time(9, 20) <= t <= _time(15, 25)
 
 
+def _build_trade_notes(sig, action: str, premium: float, risk, hedge_trade_data) -> str:
+    """Build a human-readable explanation for why this trade was placed."""
+    iv_pct = round((sig.iv_at_signal or 0) * 100, 1) if (sig.iv_at_signal or 0) < 2 else round(sig.iv_at_signal or 0, 1)
+    ivr = round(getattr(sig, "iv_rank", 0) or 0, 2)
+    conf = round(sig.confidence_score or 0, 2)
+    expiry_lbl = sig.expiry_display or sig.expiry_date_iso or "?"
+    strike = sig.strike or "ATM"
+
+    lines = [
+        f"WHY: {sig.pattern_name} pattern triggered a {sig.direction.upper()} signal on {sig.underlying}.",
+        f"Confidence: {conf:.0%} | IV: {iv_pct:.1f}% | IV Rank: {ivr:.0%}",
+        f"Strike: {strike} {sig.option_type} | Expiry: {expiry_lbl} ({sig.expiry_dte or '?'}d DTE)",
+        f"Action: {action} @ ₹{premium:.2f} | Target: ₹{round(premium*1.5,2) if action=='BUY' else round(premium*0.45,2)} | Stop: ₹{round(premium*0.6,2) if action=='BUY' else round(premium*2.0,2)}",
+    ]
+    if sig.explanation:
+        lines.append(f"Signal: {sig.explanation[:200]}")
+    if hedge_trade_data:
+        lines.append(f"Hedge: BUY {hedge_trade_data['symbol']} @ ₹{hedge_trade_data['premium']:.2f} (credit spread)")
+    lines.append(f"Risk/lot: ₹{risk.capital_at_risk:.0f} | Qty: {risk.recommended_qty} lot(s)")
+    return " | ".join(lines)
+
+
 async def _auto_paper_trade(signals, db):
     """
     Auto-execute trades for high-confidence signals.
@@ -163,6 +185,98 @@ async def _auto_paper_trade(signals, db):
 
     from app.core.options.chain_service import STRIKE_STEPS as _STEPS
     from app.core.options.greeks import _bs_price, RISK_FREE_RATE as _RF
+
+    async def _fetch_option_ltp(
+        cfg,                        # KiteConfig ORM row (may be None)
+        underlying: str,
+        expiry_iso: str,
+        strike: float,
+        opt_type: str,
+        our_sym: str,
+    ) -> tuple[float | None, str, int | None]:
+        """
+        Round-robin Kite ↔ Upstox for real-time option LTP.
+        Returns (price, source_label, instrument_token) or (None, "none", None).
+        instrument_token is non-None only when Kite is the source — store it on the
+        trade so MTM can use kite.ltp([token]) which works for all option types.
+
+        Turn selection stored in Redis key "ltp_turn" (0=Kite, 1=Upstox).
+        Each call flips the turn so load is shared 50/50.
+        If the selected provider fails the other is tried automatically.
+        NSE chain is NOT called here — caller handles it as last resort.
+        """
+        import calendar as _cal
+        from datetime import date as _d2
+        from app.core.encryption import decrypt as _dec
+
+        def _kite_sym(ul, exp_iso, stk, ot):
+            # NSE moved all index expiries to TUESDAY effective Sep 2025.
+            # Monthly = last Tuesday of month → MON3 format (e.g. NIFTY26JUL24000PE)
+            # Weekly  = any other Tuesday    → YYMMDD format (e.g. NIFTY2671424000PE)
+            # BSE (SENSEX/BANKEX) still uses Thursday — not handled here (NSE only).
+            try:
+                exp = _d2.fromisoformat(exp_iso)
+                yy = str(exp.year)[2:]
+                mon3 = exp.strftime("%b").upper()
+                last_tue = max(
+                    _d2(exp.year, exp.month, dd)
+                    for dd in range(1, _cal.monthrange(exp.year, exp.month)[1] + 1)
+                    if _d2(exp.year, exp.month, dd).weekday() == 1  # 1 = Tuesday
+                )
+                base = f"{int(stk)}{ot}"
+                if exp == last_tue:
+                    return f"{ul}{yy}{mon3}{base}"
+                return f"{ul}{yy}{exp.month}{exp.day:02d}{base}"
+            except Exception:
+                return None
+
+        today = _d2.today()
+        kite_ok = bool(cfg and cfg.access_token_enc and cfg.token_date == today)
+        upstox_ok = bool(cfg and cfg.upstox_access_token_enc and cfg.upstox_token_date == today)
+
+        # Determine turn via Redis (flip atomically)
+        turn = 0  # 0=Kite, 1=Upstox
+        try:
+            import redis as _redis_lib
+            from app.config import settings as _st
+            _r = _redis_lib.from_url(_st.redis_url, decode_responses=True)
+            raw = _r.get("ltp_turn")
+            turn = int(raw) if raw is not None else 0
+            _r.set("ltp_turn", 1 - turn)  # flip for next call
+        except Exception:
+            pass
+
+        providers = []
+        if turn == 0:
+            providers = (["kite", "upstox"] if upstox_ok else ["kite"]) if kite_ok else (["upstox"] if upstox_ok else [])
+        else:
+            providers = (["upstox", "kite"] if kite_ok else ["upstox"]) if upstox_ok else (["kite"] if kite_ok else [])
+
+        for provider in providers:
+            try:
+                if provider == "kite" and kite_ok:
+                    from kiteconnect import KiteConnect as _KCS
+                    kite_s = _kite_sym(underlying, expiry_iso, strike, opt_type)
+                    if not kite_s:
+                        continue
+                    _k = _KCS(api_key=cfg.api_key)
+                    _k.set_access_token(_dec(cfg.access_token_enc))
+                    res = _k.ltp([f"NFO:{kite_s}"])
+                    for v in res.values():
+                        p = v.get("last_price", 0)
+                        if p > 0:
+                            tok = v.get("instrument_token")
+                            return float(p), "kite", (int(tok) if tok else None)
+                elif provider == "upstox" and upstox_ok:
+                    from app.core.data.upstox_ltp import get_ltp as _upltp
+                    token = _dec(cfg.upstox_access_token_enc)
+                    p = _upltp(token, underlying, expiry_iso, strike, opt_type)
+                    if p and p > 0:
+                        return p, "upstox", None
+            except Exception as _e:
+                logger.debug(f"LTP provider {provider} failed for {our_sym}: {_e}")
+
+        return None, "none", None
 
     def _hedge_premium(underlying: str, spot: float, hedge_strike: float,
                        opt_type: str, expiry_date_iso: str) -> float:
@@ -292,6 +406,43 @@ async def _auto_paper_trade(signals, db):
                 pass
 
         premium  = sig.estimated_premium
+
+        # ── Entry price: Kite ↔ Upstox round-robin → NSE chain → BS ─────────
+        # Load KiteConfig once (has both Kite + Upstox tokens)
+        _entry_cfg = None
+        try:
+            from app.models.kite_config import KiteConfig as _EntryCfg
+            from app.database import AsyncSessionLocal as _EDB
+            from sqlalchemy import select as _esel
+            async with _EDB() as _es:
+                _entry_cfg = (await _es.execute(_esel(_EntryCfg).limit(1))).scalar_one_or_none()
+        except Exception:
+            pass
+
+        # 1. Try Kite / Upstox round-robin
+        _live_ltp, _ltp_src, _entry_token = await _fetch_option_ltp(
+            _entry_cfg, sig.underlying, sig.expiry_date_iso,
+            sig.strike, sig.option_type, sig.instrument or sig.underlying,
+        )
+        if _live_ltp and _live_ltp > 0:
+            premium = _live_ltp
+            logger.info(f"Entry {_ltp_src.upper()} LTP: {sig.instrument} = ₹{premium} (BS was ₹{sig.estimated_premium})")
+
+        # 2. NSE chain fallback (jugaad-data — last resort before BS)
+        if not _live_ltp:
+            try:
+                from app.core.options.chain_service import ChainService as _CS
+                _chain = _CS().get_chain(sig.underlying, expiry_iso=sig.expiry_date_iso)
+                _row = _chain[_chain["strike"] == sig.strike] if not _chain.empty else None
+                if _row is not None and not _row.empty:
+                    ltp_col = "ce_ltp" if sig.option_type == "CE" else "pe_ltp"
+                    _ltp = float(_row[ltp_col].iloc[0])
+                    if _ltp > 5:
+                        premium = _ltp
+                        logger.info(f"Entry NSE chain LTP: {sig.instrument} = ₹{premium} (BS was ₹{sig.estimated_premium})")
+            except Exception as _e:
+                logger.debug(f"Entry NSE chain failed for {sig.instrument}: {_e}")
+
         quantity = sig.lot_size
         # Use stored option_strategy (buy/sell) to determine action.
         # Directional BUY_PATTERNS use BUY regardless of market direction
@@ -354,6 +505,18 @@ async def _auto_paper_trade(signals, db):
             logger.warning(f"Insufficient capital for {sig.underlying} paper trade")
             continue
 
+        # ── Max concurrent trades gate ────────────────────────────────────────
+        try:
+            from app.core.risk.gate import get_risk_params as _rp
+            _max_trades = _rp().get("max_concurrent_trades", 10)
+            open_count_q = select(Trade).where(Trade.status == _TS.OPEN, Trade.mode == TradeMode.PAPER)
+            _open_count = len((await db.execute(open_count_q)).scalars().all())
+            if _open_count >= _max_trades:
+                logger.warning(f"Max concurrent trades ({_max_trades}) reached — skipping {sig.underlying}")
+                continue
+        except Exception:
+            pass
+
         # ── Risk gate ─────────────────────────────────────────────────────────
         try:
             from app.core.risk.gate import check as _risk_check
@@ -402,8 +565,9 @@ async def _auto_paper_trade(signals, db):
                 target_price = opt_target, stop_loss = opt_stop,
                 charges_entry = entry_charges, unrealized_pnl = 0.0,
                 status = TradeStatus.OPEN, entry_time = now,
-                notes = f"{'spread_leg:main|' if hedge_trade_data else ''}pattern:{sig.pattern_name}",
+                notes = _build_trade_notes(sig, action, premium, risk, hedge_trade_data),
                 capital_at_risk_pct = round((cost / portfolio.capital_current) * 100, 4),
+                instrument_token = _entry_token,  # store Kite token for reliable MTM ltp()
             )
             db.add(trade)
             portfolio.capital_deployed += premium * quantity + entry_charges
@@ -423,7 +587,7 @@ async def _auto_paper_trade(signals, db):
                     target_price = 0.0, stop_loss = 0.0,
                     charges_entry = h_charges, unrealized_pnl = 0.0,
                     status = TradeStatus.OPEN, entry_time = now,
-                    notes = f"spread_leg:hedge|main_sym:{instrument_sym}|pattern:{sig.pattern_name}",
+                    notes = f"spread_leg:hedge|main:{instrument_sym}|pattern:{sig.pattern_name}",
                     capital_at_risk_pct = 0.0,
                 )
                 db.add(hedge)
@@ -454,10 +618,13 @@ async def _auto_paper_trade(signals, db):
 
     await db.commit()
 
-    # ── Live order placement ──────────────────────────────────────────────────
-    # Place real Kite orders when: Kite credentials present AND market is open
-    # AND signal came from real OHLCV data (not synthetic)
-    if not market_open:
+    # ── Live order placement — DISABLED (paper-only mode enforced) ────────────
+    # SAFETY LOCK: Real Kite order placement is permanently disabled.
+    # All trading is paper-only. This block must never be re-enabled without
+    # explicit user confirmation and a separate safety review.
+    if True:  # PAPER_ONLY_LOCK — do not remove
+        logger.debug("Live order placement blocked: PAPER_ONLY_LOCK is active")
+    elif not market_open:
         logger.info("Live order placement skipped: outside market hours")
     else:
         try:
@@ -607,10 +774,11 @@ async def _auto_paper_trade(signals, db):
     if option_symbols:
         try:
             from app.core.data.kite_ticker import ticker_service, _token_to_sym
+            from app.database import AsyncSessionLocal as _ASL
             ticker_service.subscribe_option_tokens(option_symbols)
             # After subscription, _token_to_sym is populated — store tokens on trades for chart lookup
             sym_to_token = {sym: tok for tok, sym in _token_to_sym.items()}
-            async with AsyncSessionLocal() as _db2:
+            async with _ASL() as _db2:
                 from app.models.trades import Trade as _T2, TradeStatus as _TS3
                 _open = await _db2.execute(
                     select(_T2).where(_T2.status == TradeStatus.OPEN, _T2.instrument_token.is_(None))
@@ -674,22 +842,123 @@ async def _do_mtm_update():
 
             try:
                 from kiteconnect import KiteConnect
-                from app.config import settings
-                if settings.kite_access_token and settings.kite_api_key:
-                    kite = KiteConnect(api_key=settings.kite_api_key)
-                    kite.set_access_token(settings.kite_access_token)
-                    kite_syms = [f"NFO:{s}" for s in missing]
-                    for i in range(0, len(kite_syms), 500):
-                        batch = kite_syms[i:i+500]
+                from app.models.kite_config import KiteConfig as _KC
+                from app.core.encryption import decrypt as _decrypt
+                from app.database import AsyncSessionLocal as _AMTM
+                from sqlalchemy import select as _sel_mtm
+                from datetime import date as _dt
+                async with _AMTM() as _ksess:
+                    _kcfg = (await _ksess.execute(_sel_mtm(_KC).limit(1))).scalar_one_or_none()
+                _token_valid = (_kcfg and _kcfg.access_token_enc and
+                                _kcfg.token_date == _dt.today())
+                if _token_valid:
+                    _access_token = _decrypt(_kcfg.access_token_enc)
+                    kite = KiteConnect(api_key=_kcfg.api_key)
+                    kite.set_access_token(_access_token)
+                    # Build token→symbol map for trades that have instrument_token stored.
+                    # kite.ltp() with symbol name returns {} for weekly options (Kite quirk),
+                    # but calling it with the numeric instrument_token always works.
+                    token_to_sym: dict[int, str] = {}
+                    sym_to_kite: dict[str, str] = {}  # sym -> "NFO:SYM" for non-token trades
+                    for t in trades:
+                        if t.symbol in missing:
+                            if t.instrument_token:
+                                token_to_sym[t.instrument_token] = t.symbol
+                            else:
+                                sym_to_kite[t.symbol] = f"NFO:{t.symbol}"
+
+                    # Call ltp() using numeric tokens (reliable for all option types)
+                    if token_to_sym:
                         try:
-                            quotes = kite.quote(batch)
-                            for ks, data in quotes.items():
-                                sym = ks.replace("NFO:", "")
-                                prices[sym] = data.get("last_price", 0)
+                            ltp_data = kite.ltp(list(token_to_sym.keys()))
+                            for tok_key, data in ltp_data.items():
+                                tok_int = int(tok_key) if str(tok_key).isdigit() else None
+                                sym = token_to_sym.get(tok_int) if tok_int else None
+                                ltp_val = data.get("last_price", 0)
+                                if sym and ltp_val > 0:
+                                    prices[sym] = ltp_val
+                                    logger.info(f"MTM Kite LTP (token): {sym} = ₹{ltp_val}")
                         except Exception as e:
-                            logger.warning(f"MTM REST quote batch failed: {e}")
+                            logger.warning(f"MTM Kite ltp (token) failed: {e}")
+
+                    # Fallback: trades without stored token — convert to Kite symbol format
+                    if sym_to_kite:
+                        # Build kite_sym→our_sym map using YYMMDD format conversion
+                        kite_sym_map: dict[str, str] = {}
+                        for t in trades:
+                            if t.symbol in sym_to_kite and t.expiry_date and t.strike and t.option_type:
+                                try:
+                                    from datetime import date as _d2
+                                    import calendar as _cal2
+                                    exp2 = _d2.fromisoformat(str(t.expiry_date)[:10])
+                                    yy2 = str(exp2.year)[2:]
+                                    mon3_2 = exp2.strftime("%b").upper()
+                                    last_tue2 = max(
+                                        _d2(exp2.year, exp2.month, d)
+                                        for d in range(1, _cal2.monthrange(exp2.year, exp2.month)[1]+1)
+                                        if _d2(exp2.year, exp2.month, d).weekday() == 1  # Tuesday
+                                    )
+                                    if exp2 == last_tue2:
+                                        ks2 = f"NFO:{t.underlying}{yy2}{mon3_2}{int(t.strike)}{t.option_type}"
+                                    else:
+                                        ks2 = f"NFO:{t.underlying}{yy2}{exp2.month}{exp2.day:02d}{int(t.strike)}{t.option_type}"
+                                    kite_sym_map[ks2] = t.symbol
+                                except Exception:
+                                    kite_sym_map[f"NFO:{t.symbol}"] = t.symbol
+                        kite_syms = list(kite_sym_map.keys())
+                        # sym→trade map so we can backfill instrument_token
+                        sym_to_trade = {t.symbol: t for t in trades if t.symbol in sym_to_kite}
+                        for i in range(0, len(kite_syms), 500):
+                            batch = kite_syms[i:i+500]
+                            try:
+                                ltp_data = kite.ltp(batch)
+                                for ks, data in ltp_data.items():
+                                    sym = kite_sym_map.get(ks, ks.replace("NFO:", ""))
+                                    ltp_val = data.get("last_price", 0)
+                                    if ltp_val > 0:
+                                        prices[sym] = ltp_val
+                                        logger.info(f"MTM Kite LTP (sym): {sym} = ₹{ltp_val}")
+                                        # Backfill instrument_token so next run uses faster token path
+                                        tok = data.get("instrument_token")
+                                        tr = sym_to_trade.get(sym)
+                                        if tok and tr and not tr.instrument_token:
+                                            tr.instrument_token = int(tok)
+                            except Exception as e:
+                                logger.warning(f"MTM Kite ltp (sym) batch failed: {e}")
+                else:
+                    logger.debug("MTM: no valid Kite token today, skipping ltp()")
             except Exception as e:
-                logger.warning(f"MTM Kite quote unavailable: {e}")
+                logger.warning(f"MTM Kite ltp unavailable: {e}")
+
+        # 3. Upstox LTP for any symbols still missing after Kite
+        still_missing = {t for t in trades if t.symbol not in prices}
+        if still_missing:
+            try:
+                from datetime import date as _dt_up
+                _up_valid = (_kcfg and _kcfg.upstox_access_token_enc and
+                             _kcfg.upstox_token_date == _dt_up.today())
+                if _up_valid:
+                    from app.core.encryption import decrypt as _dec_up
+                    from app.core.data.upstox_ltp import get_ltp_batch as _up_batch
+                    _up_token = _dec_up(_kcfg.upstox_access_token_enc)
+                    _up_reqs = []
+                    for t in still_missing:
+                        if t.expiry_date and t.strike and t.option_type:
+                            _up_reqs.append({
+                                "underlying": t.underlying.upper(),
+                                "expiry_iso": str(t.expiry_date)[:10],
+                                "strike": float(t.strike),
+                                "opt_type": t.option_type,
+                                "sym": t.symbol,
+                            })
+                    if _up_reqs:
+                        _up_prices = _up_batch(_up_token, _up_reqs)
+                        for sym, ltp_val in _up_prices.items():
+                            if ltp_val > 0:
+                                prices[sym] = ltp_val
+                                logger.info(f"MTM Upstox LTP: {sym} = ₹{ltp_val}")
+            except Exception as e:
+                logger.debug(f"MTM Upstox ltp unavailable: {e}")
 
         # Build spot price lookup for BS fallback — read from Redis (cross-process)
         spot_prices: dict[str, float] = {}
@@ -718,7 +987,23 @@ async def _do_mtm_update():
         for trade in trades:
             current = prices.get(trade.symbol)
 
-            # Fallback: reprice via Black-Scholes using live spot
+            # Fallback 1: try real NSE chain LTP for the trade's specific expiry
+            if not current and trade.strike and trade.option_type and trade.underlying:
+                try:
+                    from app.core.options.chain_service import ChainService as _CS2
+                    _trade_exp = str(trade.expiry_date)[:10] if trade.expiry_date else None
+                    _chain2 = _CS2().get_chain(trade.underlying.upper(), expiry_iso=_trade_exp)
+                    if not _chain2.empty:
+                        _row2 = _chain2[_chain2["strike"] == float(trade.strike)]
+                        if not _row2.empty:
+                            ltp_col2 = "ce_ltp" if trade.option_type == "CE" else "pe_ltp"
+                            _ltp2 = float(_row2[ltp_col2].iloc[0])
+                            if _ltp2 > 0.5:
+                                current = _ltp2
+                except Exception:
+                    pass
+
+            # Fallback 2: reprice via Black-Scholes using live spot
             if not current and trade.strike and trade.option_type and trade.underlying:
                 try:
                     from app.core.options.greeks import _bs_price, RISK_FREE_RATE
@@ -1591,3 +1876,92 @@ def run_nightly_discovery():
         _stamp_task_run("workers.run_nightly_discovery")
     except Exception as exc:
         logger.error(f"Nightly discovery failed: {exc}")
+
+
+# ── Lot-size verifier ─────────────────────────────────────────────────────────
+
+@celery_app.task(name="workers.verify_lot_sizes")
+def verify_lot_sizes():
+    """
+    Cross-check configured lot sizes in instruments.py against Kite NFO instrument master.
+    Uses the Redis-cached token map (populated at startup) — avoids hitting kite.instruments()
+    rate limit by reading from cache first. Logs WARNING for any mismatch.
+    Runs daily at 08:30 IST via beat schedule.
+    See docs/NSE_MARKET_CONVENTIONS.md for full lot size history.
+    """
+    import redis as _redis_lib
+    import json as _json
+    from app.config import settings as _s
+    from app.core.instruments import LOT_SIZES, TESTING_FOCUS
+
+    logger.info("verify-lot-sizes: starting lot size cross-check")
+    mismatches: list[str] = []
+
+    try:
+        from kiteconnect import KiteConnect
+        from app.models.kite_config import KiteConfig as _KC
+        from app.core.encryption import decrypt as _dec
+        from app.database import AsyncSessionLocal as _DB
+        from sqlalchemy import select as _sel
+        from datetime import date as _dt
+
+        async def _run():
+            async with _DB() as db:
+                cfg = (await db.execute(_sel(_KC).limit(1))).scalar_one_or_none()
+            if not cfg or not cfg.access_token_enc or cfg.token_date != _dt.today():
+                logger.info("verify-lot-sizes: no valid Kite token today, skipping live check")
+                return
+
+            kite = KiteConnect(api_key=cfg.api_key)
+            kite.set_access_token(_dec(cfg.access_token_enc))
+
+            # Try Redis cache first to avoid rate limit
+            _r = _redis_lib.from_url(_s.redis_url, decode_responses=True)
+            _CACHE_KEY = "kite:nfo_lot_sizes"
+            cached = _r.get(_CACHE_KEY)
+            kite_lot_sizes: dict[str, int] = {}
+
+            if cached:
+                kite_lot_sizes = _json.loads(cached)
+                logger.info(f"verify-lot-sizes: loaded {len(kite_lot_sizes)} lot sizes from Redis cache")
+            else:
+                # Fetch fresh — rate limited to ~1/day, cache result
+                try:
+                    instruments = kite.instruments("NFO")
+                    for inst in instruments:
+                        sym = inst.get("name") or inst.get("tradingsymbol", "")
+                        # Index instruments have `name` = "NIFTY 50", "NIFTY BANK" etc.
+                        # We map them to our internal symbols
+                        _alias = {
+                            "NIFTY 50": "NIFTY", "NIFTY": "NIFTY",
+                            "NIFTY BANK": "BANKNIFTY", "BANKNIFTY": "BANKNIFTY",
+                            "NIFTY FIN SERVICE": "FINNIFTY", "FINNIFTY": "FINNIFTY",
+                            "NIFTY MID SELECT": "MIDCPNIFTY", "MIDCPNIFTY": "MIDCPNIFTY",
+                        }
+                        internal = _alias.get(sym) or _alias.get(inst.get("name", ""))
+                        if internal and inst.get("lot_size"):
+                            kite_lot_sizes[internal] = int(inst["lot_size"])
+                    _r.setex(_CACHE_KEY, 23 * 3600, _json.dumps(kite_lot_sizes))
+                    logger.info(f"verify-lot-sizes: fetched {len(kite_lot_sizes)} lot sizes from Kite, cached 23h")
+                except Exception as e:
+                    logger.warning(f"verify-lot-sizes: kite.instruments() failed: {e}")
+                    return
+
+            for sym in TESTING_FOCUS:
+                our_size = LOT_SIZES.get(sym)
+                kite_size = kite_lot_sizes.get(sym)
+                if kite_size and our_size and kite_size != our_size:
+                    msg = (f"LOT SIZE MISMATCH — {sym}: instruments.py={our_size} "
+                           f"vs Kite={kite_size}. Update instruments.py and docs/NSE_MARKET_CONVENTIONS.md")
+                    logger.warning(msg)
+                    mismatches.append(msg)
+                elif kite_size and our_size:
+                    logger.info(f"verify-lot-sizes: {sym} lot_size={our_size} ✓ matches Kite")
+
+        _run_async(_run())
+        _stamp_task_run("workers.verify_lot_sizes")
+        if mismatches:
+            return {"status": "mismatch", "mismatches": mismatches}
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.error(f"verify-lot-sizes failed: {exc}")

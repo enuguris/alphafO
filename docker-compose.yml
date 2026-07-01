@@ -59,6 +59,20 @@ services:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-alphafO}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-alphafO}
       - REDIS_URL=redis://redis:6379/0
 
+  celery-beat:
+    build: ./backend
+    env_file: .env
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    command: celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-alphafO}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-alphafO}
+      - REDIS_URL=redis://redis:6379/0
+
   frontend:
     build: ./frontend
     ports:

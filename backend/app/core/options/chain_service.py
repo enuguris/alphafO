@@ -18,11 +18,13 @@ DEFAULT_STEP = 50
 class ChainService:
     """Fetch or generate options chain data."""
 
-    def get_chain(self, underlying: str, kite_adapter=None) -> pd.DataFrame:
+    def get_chain(self, underlying: str, kite_adapter=None, expiry_iso: str | None = None) -> pd.DataFrame:
         """
         Get options chain DataFrame.
         Columns: strike, ce_oi, pe_oi, ce_iv, pe_iv, ce_ltp, pe_ltp, ce_delta, pe_delta
 
+        expiry_iso: ISO date string (e.g. "2026-07-14") — if provided, fetches that specific expiry
+                    instead of the nearest one.
         Priority: Kite (real-time) → NSE via jugaad-data (free, real) → synthetic fallback.
         """
         if kite_adapter is not None:
@@ -31,7 +33,7 @@ class ChainService:
             except Exception:
                 pass
         try:
-            return self._from_nse(underlying)
+            return self._from_nse(underlying, expiry_iso=expiry_iso)
         except Exception:
             pass
         return self._synthetic_chain(underlying)
@@ -113,10 +115,21 @@ class ChainService:
 
         return pd.DataFrame(rows)
 
-    def _from_nse(self, underlying: str) -> pd.DataFrame:
+    def _nse_expiry_to_iso(self, nse_expiry: str) -> str:
+        """Convert NSE expiry string like '07-Jul-2026' to ISO '2026-07-07'."""
+        from datetime import datetime
+        for fmt in ("%d-%b-%Y", "%d-%B-%Y"):
+            try:
+                return datetime.strptime(nse_expiry, fmt).date().isoformat()
+            except ValueError:
+                continue
+        return ""
+
+    def _from_nse(self, underlying: str, expiry_iso: str | None = None) -> pd.DataFrame:
         """
         Fetch live option chain from NSE via jugaad-data (free, no API key).
-        Uses the nearest weekly expiry. Returns same schema as _from_kite.
+        expiry_iso: target expiry as ISO date (e.g. "2026-07-14"). Defaults to nearest.
+        Returns same schema as _from_kite.
         """
         from jugaad_data.nse import NSELive
 
@@ -134,17 +147,23 @@ class ChainService:
         if not records:
             raise ValueError("Empty response from NSE")
 
-        # Pick nearest expiry (records include multiple expiries)
         expiry_dates = data.get("records", {}).get("expiryDates", [])
         if not expiry_dates:
             raise ValueError("No expiry dates in NSE response")
-        nearest_expiry = expiry_dates[0]  # e.g. "30-Jun-2026"
+
+        # Match the requested expiry_iso against available NSE expiries
+        target_nse_expiry = expiry_dates[0]  # default: nearest
+        if expiry_iso:
+            for ed in expiry_dates:
+                if self._nse_expiry_to_iso(ed) == expiry_iso:
+                    target_nse_expiry = ed
+                    break
 
         spot = self._get_live_spot(underlying)
         step = STRIKE_STEPS.get(underlying.upper(), DEFAULT_STEP)
         atm = round(spot / step) * step
 
-        # Filter to nearest expiry, ATM ± 10 strikes
+        # Filter to target expiry, ATM ± 10 strikes
         strike_window = {atm + (i - 10) * step for i in range(21)}
         rows = []
         for rec in records:
@@ -153,8 +172,7 @@ class ChainService:
             if not ce and not pe:
                 continue
             expiry = (ce or pe).get("expiryDate", "")
-            # NSE returns "30-Jun-2026", nearest_expiry is "30-Jun-2026"
-            if expiry and expiry.replace("-", " ").lower()[:6] != nearest_expiry.replace("-", " ").lower()[:6]:
+            if expiry and expiry.replace("-", " ").lower()[:6] != target_nse_expiry.replace("-", " ").lower()[:6]:
                 continue
             strike = rec.get("strikePrice") or (ce or pe).get("strikePrice")
             if not strike or strike not in strike_window:

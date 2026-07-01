@@ -23,6 +23,13 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 
 ---
 
+## CRITICAL SAFETY RULE — Paper-Only Mode
+- **NO real orders are ever placed.** `tasks.py` has `if True:  # PAPER_ONLY_LOCK` that permanently skips the `kite.place_order()` block.
+- All trades use `mode = TradeMode.PAPER`. The live order block is dead code — do not remove the `PAPER_ONLY_LOCK` guard.
+- If asked to enable live trading, explicitly confirm with the user and remove `PAPER_ONLY_LOCK` only after written approval.
+
+---
+
 ## Key Architecture Decisions
 
 ### Signal pipeline
@@ -33,13 +40,16 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 5. Age gate: skip signals > 2h old for auto-execution
 
 ### Risk gate (Redis)
-- `DAILY_PNL_KEY` — running daily P&L, halts at -2% of capital
-- `DAILY_DEPLOYED_KEY` — total deployed capital, caps at 3% portfolio heat (= ₹15,000 on ₹5L capital)
+- `DAILY_PNL_KEY` — running daily P&L, halts at -2% of capital (configurable)
+- `DAILY_DEPLOYED_KEY` — total deployed capital, caps at max_portfolio_heat % (configurable, default 3%)
 - `TRADING_HALTED_KEY` — boolean, set by circuit breakers
 - `KILL_SWITCH_KEY` — permanent halt until manually reset
+- `alphafO:risk_params` — JSON blob storing live risk param overrides; read by `get_risk_params()` in `gate.py`
 - `spot:{SYM}` — KiteTicker writes current LTP on every tick (TTL=1h); Celery MTM reads from here (cross-process, no in-memory state in worker)
 - On startup: `_sync_portfolio_heat_from_db()` reloads deployed capital from open trades in DB
-- **Risk params in `.env` are PERCENTAGES** (3.0 = 3%), not fractions. `gate.py` divides by 100. Wrong values cause cap of ₹150 instead of ₹15,000.
+- **Risk params are DYNAMIC** — `GET /api/v1/options/risk/params` reads current values; `PUT` updates immediately via Redis. Changes survive backend restarts. `.env` values are defaults only.
+- **With NIFTY lot size 65 × ~₹200 premium = ₹13,000/lot** — the default 3% heat cap (₹15K) allows only 1 NIFTY trade. Raise `max_portfolio_heat` to 10%+ in Settings → Risk Appetite Controls to allow more concurrent trades.
+- `max_concurrent_trades` — additional gate in `_auto_paper_trade`; default 10. Guards against scanner flooding positions.
 
 ### Trade lifecycle
 - Status enum (Python + DB): `OPEN → CLOSED | CANCELLED | PENDING | EXPIRED`
@@ -84,6 +94,25 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - IV column in bhav-based OHLCV: uses India VIX history (`fetch_india_vix()`) merged by date via `pd.merge_asof`; falls back to flat 18% if VIX cache unavailable
 - BANKNIFTY uses same VIX values as NIFTY (VIX only covers NIFTY index; close enough for regime detection)
 
+### Trade decision explanation
+- Every paper trade's `notes` field is populated by `_build_trade_notes()` in `tasks.py`
+- Contains: pattern name, direction, confidence %, IV%, IV rank, strike/expiry, entry/target/stop prices, signal explanation excerpt, hedge leg info, risk per lot
+- Hedge leg notes contain `spread_leg:hedge|main:{symbol}` for correlation with main leg
+- Main leg notes contain `spread_leg:main|` prefix when hedged
+
+### NSE lot sizes — live from Kite
+- `get_lot_size(sym)` in `instruments.py` reads Redis key `kite:nfo_lot_sizes` (set at startup by `kite_ticker.py`)
+- Falls back to hardcoded `LOT_SIZES` dict if Redis unavailable
+- Current verified values: NIFTY=65, BANKNIFTY=30 (SEBI 2024-2025 revision for ≥₹15L contract value)
+- `verify-lot-sizes` Celery beat task runs at 08:30 IST Mon-Fri to validate and refresh
+
+### NSE option expiry schedule (effective Sep 2025)
+- All NSE index options now expire on **Tuesday** (changed from Thursday/Wednesday)
+- BANKNIFTY: **monthly-only** since Nov 2024 (no weekly options)
+- Monthly = last Tuesday of month → symbol format `{UL}{YY}{MON3}{strike}{type}` e.g. `BANKNIFTY26JUL57900PE`
+- Weekly = any other Tuesday → symbol format `{UL}{YY}{M}{DD:02d}{strike}{type}` e.g. `NIFTY2671424000PE`
+- `_kite_sym()` in `tasks.py` and `_to_upstox_instrument_key()` in `upstox_ltp.py` both detect monthly vs weekly using `weekday() == 1` (Tuesday)
+
 ### MTM repricing in Celery
 - Celery worker has no active KiteTicker WebSocket (separate process, no in-memory prices)
 - Reads spot from Redis `spot:{SYM}` key (written by FastAPI's KiteTicker on every tick)
@@ -126,6 +155,21 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - Guard: `hedge_prem < premium * 0.85` — if hedge costs ≥85% of main, skip hedge (avoid debit spread)
 - `_hedge_premium()` tries live chain LTP first, then BS with ATM chain IV (not fixed sigma=0.18)
 - Trades 53+54 opened before this fix may show debit spread P&L (closed, can't retrofix)
+
+---
+
+## Hardcoded Values Audit (July 2026)
+These values are hardcoded but intentional. Review before changing:
+
+| Value | File | Notes |
+|-------|------|-------|
+| `RISK_FREE_RATE = 0.065` | `core/options/greeks.py` | RBI repo rate 6.5% — update if RBI changes rate |
+| `RF = 0.07` | `core/backtest/engine.py` | Duplicate, slightly higher — should be unified into config |
+| `iv = 0.18` | `workers/tasks.py`, `api/v1/trades.py` | Last-resort IV fallback when chain unavailable |
+| `STRIKE_STEPS` | `strike_selector.py`, `chain_service.py`, `engine.py` | Exchange-mandated step sizes, rarely change; duplicated |
+| `BASE_PRICES` | `instruments.py` | Synthetic fallback only; real trades always fetch live |
+
+All risk parameters (`max_portfolio_heat`, `max_daily_loss_pct`, `max_risk_per_trade`, `paper_capital`, `max_concurrent_trades`) are now **dynamically configurable** via `PUT /api/v1/options/risk/params` and the Settings UI.
 
 ---
 

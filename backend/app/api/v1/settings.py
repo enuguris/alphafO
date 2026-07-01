@@ -45,6 +45,16 @@ class AnthropicKeyIn(BaseModel):
     api_key: str
 
 
+class UpstoxCredentialsIn(BaseModel):
+    api_key: str
+    api_secret: str
+
+
+class UpstoxTokenIn(BaseModel):
+    auth_code: str
+    redirect_uri: str
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 _MODE_REDIS_KEY = "alphafO:app_mode"
@@ -218,6 +228,143 @@ async def generate_access_token(
         "token_date": cfg.token_date.isoformat(),
         "valid_until": "End of today (Kite tokens expire at midnight).",
     }
+
+
+@router.get("/upstox-credentials")
+async def get_upstox_credentials(db: AsyncSession = Depends(get_db)):
+    """Return Upstox api_key and token status — never expose secrets."""
+    cfg = await _get_or_create_config(db)
+    today = date.today()
+    token_valid = bool(cfg.upstox_access_token_enc) and cfg.upstox_token_date == today
+    return {
+        "api_key":     cfg.upstox_api_key,
+        "has_secret":  bool(cfg.upstox_api_secret_enc),
+        "token_valid": token_valid,
+        "token_date":  cfg.upstox_token_date.isoformat() if cfg.upstox_token_date else None,
+    }
+
+
+@router.post("/upstox-credentials")
+async def save_upstox_credentials(
+    creds: UpstoxCredentialsIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """Save Upstox api_key (plain) and api_secret (encrypted)."""
+    cfg = await _get_or_create_config(db)
+    cfg.upstox_api_key        = creds.api_key.strip()
+    cfg.upstox_api_secret_enc = encrypt(creds.api_secret.strip())
+    cfg.upstox_access_token_enc = ""
+    cfg.upstox_token_date = None
+    await db.commit()
+    redirect_uri = "https://127.0.0.1"  # user must register this in Upstox developer portal
+    login_url = (
+        f"https://api.upstox.com/v2/login/authorization/dialog"
+        f"?client_id={cfg.upstox_api_key}"
+        f"&redirect_uri={redirect_uri}"
+        f"&response_type=code"
+        f"&state=alphafO"
+    )
+    return {
+        "message":   "Credentials saved.",
+        "login_url": login_url,
+    }
+
+
+@router.get("/upstox-login-url")
+async def get_upstox_login_url(db: AsyncSession = Depends(get_db)):
+    """Return the Upstox OAuth URL. redirect_uri must be registered in Upstox developer portal."""
+    cfg = await _get_or_create_config(db)
+    if not cfg.upstox_api_key:
+        raise HTTPException(status_code=400, detail="Upstox API key not configured.")
+    redirect_uri = "https://127.0.0.1"
+    login_url = (
+        f"https://api.upstox.com/v2/login/authorization/dialog"
+        f"?client_id={cfg.upstox_api_key}"
+        f"&redirect_uri={redirect_uri}"
+        f"&response_type=code"
+        f"&state=alphafO"
+    )
+    return {"login_url": login_url}
+
+
+@router.post("/upstox-token")
+async def generate_upstox_token(
+    body: UpstoxTokenIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange Upstox authorization code for access token and store it encrypted."""
+    import httpx as _httpx
+
+    cfg = await _get_or_create_config(db)
+    if not cfg.upstox_api_key or not cfg.upstox_api_secret_enc:
+        raise HTTPException(status_code=400, detail="Upstox credentials not saved yet.")
+
+    api_secret = decrypt(cfg.upstox_api_secret_enc)
+
+    try:
+        resp = _httpx.post(
+            "https://api.upstox.com/v2/login/authorization/token",
+            data={
+                "code":          body.auth_code.strip(),
+                "client_id":     cfg.upstox_api_key,
+                "client_secret": api_secret,
+                "redirect_uri":  body.redirect_uri.strip(),
+                "grant_type":    "authorization_code",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        access_token = data.get("access_token")
+        if not access_token:
+            raise ValueError(f"No access_token in response: {data}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Upstox token exchange failed: {exc}")
+
+    cfg.upstox_access_token_enc = encrypt(access_token)
+    cfg.upstox_token_date       = date.today()
+    await db.commit()
+    return {
+        "message":    "Upstox access token generated and stored.",
+        "token_date": cfg.upstox_token_date.isoformat(),
+        "valid_until": "End of today (Upstox tokens expire at midnight).",
+    }
+
+
+@router.get("/upstox-test")
+async def test_upstox_connection(db: AsyncSession = Depends(get_db)):
+    """Test Upstox access token by fetching NIFTY index LTP."""
+    import httpx as _httpx
+
+    cfg = await _get_or_create_config(db)
+    today = date.today()
+    if not cfg.upstox_access_token_enc or cfg.upstox_token_date != today:
+        return {"passed": False, "results": [{"check": "Token", "ok": False, "detail": "No valid token for today."}]}
+
+    token = decrypt(cfg.upstox_access_token_enc)
+    results = []
+    try:
+        resp = _httpx.get(
+            "https://api.upstox.com/v3/market-quote/ltp",
+            params={"instrument_key": "NSE_INDEX|Nifty 50"},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=6,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        ltp = None
+        for val in data.values():
+            ltp = val.get("last_price") or val.get("ltp")
+        if ltp:
+            results.append({"check": "LTP (NIFTY 50)", "ok": True, "detail": f"NIFTY LTP: ₹{ltp:,.2f}"})
+        else:
+            results.append({"check": "LTP (NIFTY 50)", "ok": False, "detail": f"Empty response: {data}"})
+    except Exception as e:
+        results.append({"check": "LTP (NIFTY 50)", "ok": False, "detail": str(e)})
+
+    passed = all(r["ok"] for r in results)
+    return {"passed": passed, "results": results}
 
 
 @router.get("/anthropic-key")

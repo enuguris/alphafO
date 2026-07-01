@@ -22,9 +22,10 @@ from loguru import logger
 from app.config import settings
 
 
-KILL_SWITCH_KEY   = "TRADING_HALTED"
-DAILY_PNL_KEY     = "daily_pnl"           # float, updated after each fill
+KILL_SWITCH_KEY    = "TRADING_HALTED"
+DAILY_PNL_KEY      = "daily_pnl"           # float, updated after each fill
 DAILY_DEPLOYED_KEY = "daily_deployed"      # total capital in open positions
+RISK_PARAMS_KEY    = "alphafO:risk_params" # JSON, overrides config.py defaults
 
 
 @dataclass
@@ -37,6 +38,34 @@ class RiskDecision:
 
 def _r() -> redis.Redis:
     return redis.from_url(settings.redis_url, decode_responses=True)
+
+
+def get_risk_params() -> dict:
+    """Return active risk params — Redis overrides take precedence over config defaults."""
+    defaults = {
+        "max_portfolio_heat": settings.max_portfolio_heat,
+        "max_daily_loss_pct": settings.max_daily_loss_pct,
+        "max_risk_per_trade": settings.max_risk_per_trade,
+        "paper_capital":      settings.paper_capital,
+        "max_concurrent_trades": 10,
+    }
+    try:
+        raw = _r().get(RISK_PARAMS_KEY)
+        if raw:
+            overrides = json.loads(raw)
+            defaults.update(overrides)
+    except Exception:
+        pass
+    return defaults
+
+
+def set_risk_params(updates: dict) -> dict:
+    """Persist risk param overrides to Redis. Returns merged params."""
+    current = get_risk_params()
+    current.update(updates)
+    _r().set(RISK_PARAMS_KEY, json.dumps(current))
+    logger.info(f"Risk params updated: {updates}")
+    return current
 
 
 # ── Kill switch ────────────────────────────────────────────────────────────────
@@ -107,7 +136,8 @@ def check(
     Run all risk checks for a proposed trade.
     Returns RiskDecision with approved flag and recommended qty.
     """
-    capital = capital or settings.paper_capital
+    rp = get_risk_params()
+    capital = capital or rp["paper_capital"]
 
     # 1. Kill switch
     if is_halted():
@@ -117,7 +147,7 @@ def check(
 
     # 2. Daily loss limit
     daily_pnl = get_daily_pnl()
-    max_daily_loss = capital * (settings.max_daily_loss_pct / 100)
+    max_daily_loss = capital * (rp["max_daily_loss_pct"] / 100)
     if daily_pnl < -max_daily_loss:
         halt_trading(f"Daily loss limit hit: ₹{abs(daily_pnl):.0f}")
         return RiskDecision(
@@ -127,7 +157,7 @@ def check(
 
     # 3. Portfolio heat
     deployed = float(_r().get(DAILY_DEPLOYED_KEY) or 0)
-    max_heat = capital * (settings.max_portfolio_heat / 100)
+    max_heat = capital * (rp["max_portfolio_heat"] / 100)
     if deployed >= max_heat:
         return RiskDecision(
             approved=False,
@@ -135,7 +165,7 @@ def check(
         )
 
     # 4. Position sizing
-    risk_per_trade = capital * (settings.max_risk_per_trade / 100)
+    risk_per_trade = capital * (rp["max_risk_per_trade"] / 100)
     if strategy == "buy":
         # Risk = (entry - stop) × qty × lot_size, cap at risk_per_trade
         per_unit_risk = abs(entry_price - stop_loss)

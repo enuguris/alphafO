@@ -241,19 +241,23 @@ async def select_best_expiry(underlying: str, dte: int = 7):
 
 @router.get("/risk/status")
 async def risk_status():
-    """Current risk gate status: halt flag, daily P&L, portfolio heat."""
-    from app.core.risk.gate import halt_status, get_daily_pnl
+    """Current risk gate status: halt flag, daily P&L, portfolio heat, active params."""
+    from app.core.risk.gate import halt_status, get_daily_pnl, get_risk_params
     import redis as _redis
     from app.config import settings
 
     r = _redis.from_url(settings.redis_url, decode_responses=True)
     deployed = float(r.get("daily_deployed") or 0)
+    rp = get_risk_params()
 
     return {
         **halt_status(),
-        "daily_pnl":       round(get_daily_pnl(), 2),
-        "capital_deployed": round(deployed, 2),
-        "capital":         settings.paper_capital,
+        "daily_pnl":           round(get_daily_pnl(), 2),
+        "capital_deployed":    round(deployed, 2),
+        "capital":             rp["paper_capital"],
+        "max_heat_limit":      round(rp["paper_capital"] * rp["max_portfolio_heat"] / 100, 2),
+        "max_daily_loss_limit": round(rp["paper_capital"] * rp["max_daily_loss_pct"] / 100, 2),
+        "params":              rp,
     }
 
 
@@ -275,3 +279,43 @@ async def trigger_resume():
     from app.core.risk.gate import resume_trading
     resume_trading()
     return {"halted": False}
+
+
+class RiskParamsUpdate(BaseModel):
+    max_portfolio_heat: float | None = None    # % of capital max deployed (e.g. 10.0 = 10%)
+    max_daily_loss_pct: float | None = None    # % daily loss before halt (e.g. 3.0 = 3%)
+    max_risk_per_trade: float | None = None    # % capital risked per trade (e.g. 2.0 = 2%)
+    paper_capital: float | None = None         # Total paper capital in ₹
+    max_concurrent_trades: int | None = None   # Max open trades at once
+
+
+@router.get("/risk/params")
+async def get_risk_params_endpoint():
+    """Return current active risk parameters (Redis overrides + config defaults)."""
+    from app.core.risk.gate import get_risk_params
+    return get_risk_params()
+
+
+@router.put("/risk/params")
+async def update_risk_params(body: RiskParamsUpdate):
+    """
+    Update risk parameters dynamically — stored in Redis, take effect immediately.
+    Pass only the fields you want to change.
+    """
+    from app.core.risk.gate import set_risk_params
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No parameters provided")
+    result = set_risk_params(updates)
+    return {"message": "Risk parameters updated", "params": result}
+
+
+@router.delete("/risk/params")
+async def reset_risk_params():
+    """Reset risk parameters to config defaults (removes Redis overrides)."""
+    import redis as _redis
+    from app.config import settings as _s
+    from app.core.risk.gate import RISK_PARAMS_KEY
+    _redis.from_url(_s.redis_url, decode_responses=True).delete(RISK_PARAMS_KEY)
+    from app.core.risk.gate import get_risk_params
+    return {"message": "Risk parameters reset to defaults", "params": get_risk_params()}

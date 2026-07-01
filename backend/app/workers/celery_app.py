@@ -122,5 +122,12 @@ celery_app.conf.update(
             "task": "workers.generate_briefing",
             "schedule": crontab(minute="45", hour="8", day_of_week="1-5"),
         },
+        # Daily lot-size verifier — cross-checks instruments.py vs Kite NFO master
+        # Runs at 08:30 IST (before market open, Kite token valid).
+        # Logs WARNING if any mismatch found. See docs/NSE_MARKET_CONVENTIONS.md.
+        "verify-lot-sizes": {
+            "task": "workers.verify_lot_sizes",
+            "schedule": crontab(minute="30", hour="8", day_of_week="1-5"),
+        },
     },
 )

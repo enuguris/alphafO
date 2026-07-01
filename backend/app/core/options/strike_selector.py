@@ -1,6 +1,6 @@
 """Strike selector — picks the right option contract given a signal."""
 from datetime import date
-from app.core.instruments import INSTRUMENT_MAP, LOT_SIZES
+from app.core.instruments import INSTRUMENT_MAP, LOT_SIZES, get_lot_size
 from app.core.options.expiry import select_expiry, available_expiries
 
 
@@ -55,8 +55,7 @@ class StrikeSelector:
         sym = underlying.upper()
 
         step     = STRIKE_STEPS.get(sym, DEFAULT_STRIKE_STEP)
-        inst     = INSTRUMENT_MAP.get(sym)
-        lot_size = inst["lot_size"] if inst else LOT_SIZES.get(sym, 50)
+        lot_size = get_lot_size(sym)  # live from Kite Redis cache, falls back to instruments.py
         atm      = _round_to_step(spot_price, step)
         high_ivr = iv_rank >= 0.6
         pname    = pattern_name.lower()

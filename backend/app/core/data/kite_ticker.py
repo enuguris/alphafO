@@ -243,6 +243,7 @@ class KiteTickerService:
                     instruments = kite.instruments("NSE") + kite.instruments("NFO")
                     syms = set(all_symbols())
                     new_map: dict[str, str] = {}
+                    lot_size_map: dict[str, int] = {}
                     for inst in instruments:
                         ts = inst["tradingsymbol"]
                         internal_sym = _KITE_ALIAS.get(ts, ts)
@@ -250,8 +251,16 @@ class KiteTickerService:
                             tok = inst["instrument_token"]
                             _token_to_sym[tok] = internal_sym
                             new_map[str(tok)] = internal_sym
+                        # Capture lot sizes for all NFO instruments by underlying name
+                        name = inst.get("name", "")
+                        canonical = _KITE_ALIAS.get(name, name)
+                        if canonical in syms and inst.get("lot_size"):
+                            lot_size_map[canonical] = int(inst["lot_size"])
                     import json as _json
                     self._redis.setex(_INSTRUMENTS_CACHE_KEY, _INSTRUMENTS_CACHE_TTL, _json.dumps(new_map))
+                    if lot_size_map:
+                        self._redis.setex("kite:nfo_lot_sizes", _INSTRUMENTS_CACHE_TTL, _json.dumps(lot_size_map))
+                        logger.info(f"Cached live lot sizes for {len(lot_size_map)} instruments from Kite")
                     logger.info(f"Fetched and cached {len(new_map)} instrument tokens")
                 except Exception as e:
                     logger.warning(f"kite.instruments() failed ({e}), using hardcoded tokens only")
