@@ -444,49 +444,51 @@ async def _auto_paper_trade(signals, db):
                 logger.debug(f"Entry NSE chain failed for {sig.instrument}: {_e}")
 
         quantity = sig.lot_size
-        # Use stored option_strategy (buy/sell) to determine action.
-        # Directional BUY_PATTERNS use BUY regardless of market direction
-        # (short direction → buy a PE; long direction → buy a CE).
-        # Premium-selling SELL_PATTERNS always use SELL.
-        if sig.option_strategy in ("sell", "SELL"):
-            action = "SELL"
-        elif sig.option_strategy in ("buy", "BUY"):
-            action = "BUY"
-        else:
-            # Fallback: direction-based (old behaviour)
-            action = "BUY" if sig.direction == "long" else "SELL"
 
-        # ── Hedge leg for SELL positions (cap max loss via spread) ─────────────
-        hedge_trade_data = None
-        if action == "SELL" and sig.option_type in ("CE", "PE") and sig.strike and sig.expiry_date_iso:
-            step = _STEPS.get(sig.underlying.upper(), 50)
-            spot = _spot_price(sig.underlying)
-            if sig.option_type == "CE":
-                hedge_strike = sig.strike + 2 * step   # buy higher CE to cap loss
-            else:
-                hedge_strike = sig.strike - 2 * step   # buy lower PE to cap loss
-            hedge_prem = _hedge_premium(sig.underlying, spot, hedge_strike,
-                                        sig.option_type, sig.expiry_date_iso)
-            # Only use hedge if it's cheaper than the main leg (credit spread, not debit)
-            if 0 < hedge_prem < premium * 0.85:
-                # Derive hedge symbol (same expiry date string)
-                import re as _re
-                m = _re.search(r'(\d{2}[A-Z]{3}\d{2})', sig.instrument or "")
-                expiry_tag = m.group(1) if m else ""
-                hedge_sym = f"{sig.underlying}{expiry_tag}{int(hedge_strike)}{sig.option_type}"
-                hedge_trade_data = {
-                    "symbol": hedge_sym, "strike": hedge_strike,
-                    "premium": hedge_prem, "action": "BUY",  # hedge is always a buy
-                }
+        # ── Build composite multi-leg strategy (no naked positions) ───────────
+        from app.core.strategies.composite import (
+            build_composite, net_debit as _net_debit,
+            strategy_name as _strat_name, strategy_rationale as _strat_rationale,
+        )
+        from app.core.options.expiry import available_expiries as _avail_exp
 
-        # Total cost: main leg cost minus hedge premium collected/paid
-        entry_charges = charges_for_entry_only(premium, quantity, action)
-        cost = premium * quantity + entry_charges
-        if hedge_trade_data:
-            hedge_entry_charges = charges_for_entry_only(
-                hedge_trade_data["premium"], quantity, "BUY")
-            hedge_cost = hedge_trade_data["premium"] * quantity + hedge_entry_charges
-            cost += hedge_cost   # net debit: sell premium collected, buy hedge paid
+        _spot_now = _spot_price(sig.underlying)
+        _step = _STEPS.get(sig.underlying.upper(), 50)
+        _iv = sig.iv_at_signal or 0.18
+        if _iv > 2.0:
+            _iv /= 100.0
+        _iv_rank = getattr(sig, "iv_rank", 0.3) or 0.3
+
+        _avail = _avail_exp(sig.underlying, date.today())
+        composite_legs = build_composite(
+            underlying        = sig.underlying,
+            spot              = _spot_now,
+            direction         = sig.direction or "long",
+            iv_rank           = _iv_rank,
+            iv                = _iv,
+            pattern_name      = sig.pattern_name,
+            available_expiries= _avail,
+            step              = _step,
+        )
+
+        if not composite_legs or len(composite_legs) < 2:
+            logger.warning(f"Composite strategy builder returned < 2 legs for {sig.underlying} — skipping")
+            continue
+
+        _strat = _strat_name(composite_legs)
+        _rationale = _strat_rationale(composite_legs, _iv_rank, sig.direction or "long")
+
+        # Net cost of composite position (positive = net debit, negative = net credit received)
+        _net_cost_per_unit = _net_debit(composite_legs)
+        cost = abs(_net_cost_per_unit) * quantity
+        # Add charges for all legs
+        for _leg in composite_legs:
+            cost += charges_for_entry_only(_leg.estimated_premium, quantity, _leg.action)
+
+        # Primary leg drives the "main" action/premium for notes and risk gate
+        _primary = next((l for l in composite_legs if l.role in ("primary", "calendar_long", "condor_short_ce")), composite_legs[0])
+        action  = _primary.action
+        premium = _primary.estimated_premium
 
         # Skip if there's already an open trade for this same instrument
         from app.models.trades import TradeStatus as _TS
@@ -542,77 +544,82 @@ async def _auto_paper_trade(signals, db):
 
         now = datetime.utcnow()
 
-        # Option-centric target/stop — based on premium movement, not underlying
-        # BUY : target = +50% of premium, stop = -40% of premium
-        # SELL: target = collect 55% (premium drops to 45%), stop = premium doubles (2×)
-        if action == "BUY":
-            opt_target = round(premium * 1.50, 2)   # exit when up 50%
-            opt_stop   = round(premium * 0.60, 2)   # exit when down 40%
-        else:
-            opt_target = round(premium * 0.45, 2)   # exit when premium shrinks to 45%
-            opt_stop   = round(premium * 2.00, 2)   # exit if premium doubles (2× against)
-
-        # ── Atomic main + hedge leg (both succeed or neither is saved) ──────────
+        # -- Atomic insert of ALL composite legs (all succeed or none saved) --
+        import uuid as _uuid
+        group_id = str(_uuid.uuid4())
         try:
-            trade = Trade(
-                signal_id   = sig.id, mode = TradeMode.PAPER,
-                symbol      = sig.instrument or sig.underlying,
-                underlying  = sig.underlying, option_type = sig.option_type,
-                strike      = sig.strike, lot_size = sig.lot_size,
-                expiry_date = sig.expiry_date_iso, expiry_display = sig.expiry_display,
-                action      = action, direction = sig.direction, quantity = quantity,
-                entry_price = premium, current_price = premium,
-                target_price = opt_target, stop_loss = opt_stop,
-                charges_entry = entry_charges, unrealized_pnl = 0.0,
-                status = TradeStatus.OPEN, entry_time = now,
-                notes = _build_trade_notes(sig, action, premium, risk, hedge_trade_data),
-                capital_at_risk_pct = round((cost / portfolio.capital_current) * 100, 4),
-                instrument_token = _entry_token,  # store Kite token for reliable MTM ltp()
+            total_deployed = 0.0
+            composite_notes_prefix = (
+                f"STRATEGY:{_strat}|{_rationale}|"
+                f"legs:{len(composite_legs)}|group:{group_id[:8]}"
             )
-            db.add(trade)
-            portfolio.capital_deployed += premium * quantity + entry_charges
-            portfolio.capital_current  -= premium * quantity + entry_charges
 
-            if hedge_trade_data:
-                h = hedge_trade_data
-                h_charges = charges_for_entry_only(h["premium"], quantity, "BUY")
-                hedge = Trade(
-                    signal_id   = sig.id, mode = TradeMode.PAPER,
-                    symbol      = h["symbol"], underlying = sig.underlying,
-                    option_type = sig.option_type, strike = h["strike"],
-                    lot_size    = sig.lot_size, expiry_date = sig.expiry_date_iso,
-                    expiry_display = sig.expiry_display,
-                    action      = "BUY", direction = sig.direction, quantity = quantity,
-                    entry_price = h["premium"], current_price = h["premium"],
-                    target_price = 0.0, stop_loss = 0.0,
-                    charges_entry = h_charges, unrealized_pnl = 0.0,
-                    status = TradeStatus.OPEN, entry_time = now,
-                    notes = f"spread_leg:hedge|main:{instrument_sym}|pattern:{sig.pattern_name}",
-                    capital_at_risk_pct = 0.0,
+            for _idx, _leg in enumerate(composite_legs):
+                _leg_charges = charges_for_entry_only(_leg.estimated_premium, quantity, _leg.action)
+                _leg_cost    = _leg.estimated_premium * quantity + _leg_charges
+
+                if _leg.action == "BUY":
+                    _leg_target = round(_leg.estimated_premium * 1.50, 2)
+                    _leg_stop   = round(_leg.estimated_premium * 0.60, 2)
+                else:
+                    _leg_target = round(_leg.estimated_premium * 0.45, 2)
+                    _leg_stop   = round(_leg.estimated_premium * 2.00, 2)
+
+                # Try to get live price for each leg
+                _leg_prem = _leg.estimated_premium
+                try:
+                    _ll, _ls, _lt = await _fetch_option_ltp(
+                        _entry_cfg, sig.underlying, _leg.expiry_iso,
+                        _leg.strike, _leg.option_type, _leg.symbol,
+                    )
+                    if _ll and _ll > 0:
+                        _leg_prem = _ll
+                except Exception:
+                    pass
+
+                _leg_note = (
+                    f"{composite_notes_prefix}|"
+                    f"leg:{_idx+1}/{len(composite_legs)}({_leg.role})|"
+                    f"WHY: {sig.pattern_name} {sig.direction} signal. "
+                    f"Conf:{sig.confidence_score:.0%} IV:{round(_iv*100,1)}% IVR:{_iv_rank:.0%} "
+                    f"Strike:{_leg.strike}{_leg.option_type} Exp:{_leg.expiry_display}({_leg.expiry_dte}d)"
                 )
-                db.add(hedge)
-                portfolio.capital_deployed += h["premium"] * quantity + h_charges
-                portfolio.capital_current  -= h["premium"] * quantity + h_charges
-                logger.info(
-                    f"Hedge leg: {sig.underlying} {h['symbol']} BUY @ ₹{h['premium']:.2f} × {quantity} "
-                    f"(protects {instrument_sym} SELL)"
+
+                _leg_trade = Trade(
+                    signal_id    = sig.id, mode = TradeMode.PAPER,
+                    symbol       = _leg.symbol, underlying = sig.underlying,
+                    option_type  = _leg.option_type, strike = _leg.strike,
+                    lot_size     = sig.lot_size, expiry_date = _leg.expiry_iso,
+                    expiry_display = _leg.expiry_display,
+                    action       = _leg.action, direction = sig.direction,
+                    quantity     = quantity,
+                    entry_price  = _leg_prem, current_price = _leg_prem,
+                    target_price = _leg_target, stop_loss = _leg_stop,
+                    charges_entry = _leg_charges, unrealized_pnl = 0.0,
+                    status       = TradeStatus.OPEN, entry_time = now,
+                    notes        = _leg_note,
+                    capital_at_risk_pct = round((_leg_cost / max(portfolio.capital_current, 1)) * 100, 4),
+                    instrument_token = _entry_token if _idx == 0 else None,
+                    trade_group_id = group_id,
+                    leg_role       = _leg.role,
                 )
+                db.add(_leg_trade)
+                total_deployed += _leg_cost
+
+            portfolio.capital_deployed += total_deployed
+            portfolio.capital_current  -= total_deployed
 
             logger.info(
-                f"Paper trade: {sig.underlying} {sig.instrument} {action} "
-                f"@ ₹{premium:.2f} × {quantity} | entry charges ₹{entry_charges:.2f}"
-                + (f" | hedged via {hedge_trade_data['symbol']}" if hedge_trade_data else " | unhedged BUY")
+                f"Composite [{_strat}]: {sig.underlying} "
+                f"{len(composite_legs)} legs | net {total_deployed:.0f} | group {group_id[:8]}"
             )
-            # Update Redis portfolio heat tracker
             try:
                 from app.core.risk.gate import record_deployed as _record_deployed
-                _record_deployed(premium * quantity + entry_charges)
-                if hedge_trade_data:
-                    _record_deployed(hedge_trade_data["premium"] * quantity)
+                _record_deployed(total_deployed)
             except Exception:
                 pass
         except Exception as exc:
-            logger.error(f"Trade insert failed for {sig.underlying} {action}, rolling back: {exc}")
+            logger.error(f"Composite trade insert failed for {sig.underlying}: {exc}")
             await db.rollback()
             continue
 

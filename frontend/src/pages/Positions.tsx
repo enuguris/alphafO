@@ -551,6 +551,120 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
 
 // ── Trade row ─────────────────────────────────────────────────────────────────
 
+// ── Composite strategy group row ──────────────────────────────────────────────
+
+const ROLE_LABEL: Record<string, string> = {
+  primary: 'PRIMARY', hedge: 'HEDGE',
+  calendar_short: 'CAL SHORT', calendar_long: 'CAL LONG',
+  condor_short_ce: 'SHORT CE', condor_short_pe: 'SHORT PE',
+  condor_wing_ce: 'WING CE', condor_wing_pe: 'WING PE',
+}
+const ROLE_COLOR: Record<string, string> = {
+  primary: 'var(--blue)', hedge: 'var(--txt3)',
+  calendar_short: 'var(--dn)', calendar_long: 'var(--up)',
+  condor_short_ce: 'var(--dn)', condor_short_pe: 'var(--dn)',
+  condor_wing_ce: 'var(--txt2)', condor_wing_pe: 'var(--txt2)',
+}
+
+function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices: Record<string, number>; onClose: (id: number) => void }) {
+  const [expanded, setExpanded] = useState(false)
+  const isOpen = legs.some(l => l.status === 'open')
+  const strat  = legs[0]?.strategy ?? 'Composite'
+  const sym    = legs[0]?.underlying ?? ''
+
+  // Net composite P&L = sum of all legs (BUY legs gain when price rises, SELL legs gain when price falls)
+  const netPnl = legs.reduce((sum, l) => {
+    const cur = isOpen ? (l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price) : l.exit_price
+    return sum + (cur != null ? livePnl(l, cur) : (l.unrealized_pnl ?? 0))
+  }, 0)
+
+  const totalCharges = legs.reduce((s, l) => s + (isOpen ? (l.charges_entry ?? 0) : (l.charges_total ?? 0)), 0)
+
+  // Net debit/credit at entry
+  const netEntry = legs.reduce((s, l) => {
+    const sign = l.action === 'BUY' ? 1 : -1
+    return s + sign * l.entry_price * l.quantity
+  }, 0)
+
+  const winLeg  = legs.find(l => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return livePnl(l, cur) > 0 })
+  const lossLeg = legs.find(l => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return livePnl(l, cur) < 0 })
+
+  return (
+    <>
+      {/* Composite header row */}
+      <tr
+        onClick={() => setExpanded(e => !e)}
+        style={{ borderBottom: expanded ? 'none' : '2px solid var(--border)', cursor: 'pointer',
+          background: expanded ? 'var(--bg2)' : 'rgba(41,98,255,0.04)',
+          borderTop: '2px solid rgba(41,98,255,0.2)' }}
+        onMouseEnter={e => { if (!expanded) e.currentTarget.style.background = 'rgba(41,98,255,0.07)' }}
+        onMouseLeave={e => { if (!expanded) e.currentTarget.style.background = 'rgba(41,98,255,0.04)' }}
+      >
+        <td style={{ padding: '9px 6px 9px 12px', color: 'var(--blue)', fontSize: 10 }}>{expanded ? '▼' : '▶'}</td>
+        <td style={{ padding: '9px 10px', fontWeight: 700, color: 'var(--blue)', fontSize: 12 }} colSpan={2}>
+          {sym} — {strat}
+          <span style={{ fontSize: 9, color: 'var(--txt3)', fontWeight: 400, marginLeft: 8 }}>{legs.length} legs · group {legs[0]?.trade_group_id?.slice(0,8)}</span>
+          {winLeg && lossLeg && isOpen && (
+            <span style={{ fontSize: 9, color: 'var(--up)', marginLeft: 8, fontWeight: 600 }}>
+              {winLeg.symbol.split('2')[1]?.slice(0,8)} winning → offsets {lossLeg.symbol.split('2')[1]?.slice(0,8)} loss
+            </span>
+          )}
+        </td>
+        <td colSpan={2} />
+        <td style={{ padding: '9px 10px', fontFamily: 'monospace', fontSize: 11, color: 'var(--txt3)' }}>
+          Net debit: ₹{Math.abs(netEntry).toFixed(0)}/unit
+        </td>
+        <td style={{ padding: '9px 10px', fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11 }}>{legs[0]?.quantity}</td>
+        <td style={{ padding: '9px 10px', fontFamily: 'monospace', fontWeight: 800, fontSize: 14,
+          color: netPnl >= 0 ? 'var(--up)' : 'var(--dn)' }}>
+          {fmtINR(netPnl)}
+          <span style={{ fontSize: 10, fontWeight: 400, marginLeft: 4, color: 'var(--txt3)' }}>net</span>
+        </td>
+        <td style={{ padding: '9px 10px', fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11 }}>{fmtINR(totalCharges)}</td>
+        <td colSpan={3} />
+      </tr>
+      {/* Individual leg rows when expanded */}
+      {expanded && legs.map((l: any) => (
+        <tr key={l.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)', background: 'var(--bg2)' }}>
+          <td style={{ padding: '7px 6px 7px 24px', color: 'var(--txt3)', fontSize: 9 }}>└</td>
+          <td style={{ padding: '7px 10px', fontFamily: 'monospace', fontSize: 11, color: 'var(--txt)' }}>
+            {l.symbol}
+            <span style={{ fontSize: 9, marginLeft: 5, padding: '1px 4px', borderRadius: 2,
+              background: `${(ROLE_COLOR[l.leg_role] || 'var(--txt3)').replace(')', ',0.12)').replace('var(', 'rgba(')}`,
+              color: ROLE_COLOR[l.leg_role] || 'var(--txt3)', fontWeight: 700 }}>
+              {ROLE_LABEL[l.leg_role] || l.leg_role || 'LEG'}
+            </span>
+          </td>
+          <td>{l.option_type ? pill(l.option_type, l.option_type === 'CE' ? 'rgba(41,98,255,0.12)' : 'rgba(233,30,99,0.12)', l.option_type === 'CE' ? 'var(--blue)' : '#e91e63') : '—'}</td>
+          <td style={{ fontFamily: 'monospace', color: 'var(--txt2)', fontSize: 12, padding: '7px 10px' }}>{l.strike?.toLocaleString('en-IN')}</td>
+          <td style={{ padding: '7px 10px' }}>{pill(l.action, l.action === 'BUY' ? 'rgba(38,166,154,0.12)' : 'rgba(239,83,80,0.12)', l.action === 'BUY' ? 'var(--up)' : 'var(--dn)')}</td>
+          <td style={{ fontFamily: 'monospace', fontSize: 11, padding: '7px 10px' }}>
+            <span style={{ color: 'var(--txt)' }}>{fmtPrem(l.entry_price)}</span>
+            {l.current_price != null && <span style={{ color: 'var(--blue)' }}> → {fmtPrem(l.current_price)}</span>}
+            <span style={{ fontSize: 9, color: 'var(--txt3)', marginLeft: 4 }}>{l.expiry_display}</span>
+          </td>
+          <td style={{ fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11, padding: '7px 10px' }}>{l.quantity}</td>
+          <td style={{ fontFamily: 'monospace', fontSize: 12, padding: '7px 10px', color: (() => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return livePnl(l, cur) >= 0 ? 'var(--up)' : 'var(--dn)' })() }}>
+            {(() => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return fmtINR(livePnl(l, cur)) })()}
+          </td>
+          <td style={{ fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11, padding: '7px 10px' }}>{fmtPrem(l.charges_entry ?? 0)}</td>
+          <td style={{ color: 'var(--txt3)', fontSize: 10, padding: '7px 10px' }}>{fmtDt(l.entry_time)}</td>
+          <td colSpan={2} style={{ padding: '7px 10px' }}>
+            {l.status === 'open' && (
+              <button onClick={e => { e.stopPropagation(); if (confirm(`Close ${l.symbol}?`)) onClose(l.id) }}
+                className="tv-btn" style={{ padding: '2px 8px', fontSize: 10, color: 'var(--dn)', border: '1px solid rgba(239,83,80,0.35)' }}>
+                Close
+              </button>
+            )}
+          </td>
+        </tr>
+      ))}
+      {/* Separator after group */}
+      {!expanded && null}
+    </>
+  )
+}
+
 function TradeRow({ t, spotPrices, onClose: closeFn }: {
   t: any; spotPrices: Record<string, number>; onClose: (id: number) => void
 }) {
@@ -644,14 +758,14 @@ function TradeRow({ t, spotPrices, onClose: closeFn }: {
 // ── Live P&L bar ──────────────────────────────────────────────────────────────
 
 function LivePnlBar({ trades, spotPrices }: { trades: any[]; spotPrices: Record<string, number> }) {
-  const mainTrades = trades.filter(t => !(t.notes ?? '').includes('spread_leg:hedge'))
-  const totalPnl = mainTrades.reduce((sum, t) => {
+  // ALL legs contribute to P&L (composite legs offset each other naturally)
+  const totalPnl = trades.reduce((sum, t) => {
     const cur = t.current_price ?? livePrice(t, spotPrices) ?? t.entry_price
     return sum + (cur != null ? livePnl(t, cur) : (t.unrealized_pnl ?? 0))
   }, 0)
 
   const byUnderlying: Record<string, number> = {}
-  for (const t of mainTrades) {
+  for (const t of trades) {
     const cur = t.current_price ?? livePrice(t, spotPrices) ?? t.entry_price
     const p = cur != null ? livePnl(t, cur) : (t.unrealized_pnl ?? 0)
     byUnderlying[t.underlying] = (byUnderlying[t.underlying] ?? 0) + p
@@ -770,15 +884,15 @@ export default function Positions() {
             <button key={t} onClick={() => setTab(t)} className={`tv-btn ${tab === t ? 'tv-btn-primary' : 'tv-btn-ghost'}`}
               style={{ fontSize: 11, padding: '4px 14px' }}>
               {t === 'open'
-                ? `Open (${openTrades.filter(x => !(x.notes ?? '').includes('hedge')).length})`
-                : `History (${mainClosed.length})`}
+                ? `Open (${new Set(openTrades.map((x: any) => x.trade_group_id ?? x.id)).size})`
+                : `History (${new Set(closedTrades.map((x: any) => x.trade_group_id ?? x.id)).size})`}
             </button>
           ))}
         </div>
       </div>
 
       {/* Live P&L bar — open tab only */}
-      {tab === 'open' && openTrades.filter(t => !(t.notes ?? '').includes('hedge')).length > 0 && (
+      {tab === 'open' && openTrades.length > 0 && (
         <LivePnlBar trades={openTrades} spotPrices={spotPrices} />
       )}
 
@@ -810,22 +924,39 @@ export default function Positions() {
         </div>
       )}
 
-      {displayTrades.length > 0 && (
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-          <thead>
-            <tr style={{ borderBottom: '2px solid var(--border)', color: 'var(--txt3)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-              {COLS.map((h, i) => (
-                <th key={i} style={{ padding: '5px 10px', textAlign: 'left', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
+      {displayTrades.length > 0 && (() => {
+        // Group composite trades by trade_group_id; ungrouped trades render as single rows
+        const groups: Map<string, any[]> = new Map()
+        const ungrouped: any[] = []
+        for (const t of displayTrades) {
+          if (t.trade_group_id) {
+            const g = groups.get(t.trade_group_id) ?? []
+            g.push(t)
+            groups.set(t.trade_group_id, g)
+          } else {
+            ungrouped.push(t)
+          }
+        }
+        return (
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+            <thead>
+              <tr style={{ borderBottom: '2px solid var(--border)', color: 'var(--txt3)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                {COLS.map((h, i) => (
+                  <th key={i} style={{ padding: '5px 10px', textAlign: 'left', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {Array.from(groups.entries()).map(([gid, legs]) => (
+                <CompositeGroup key={gid} legs={legs} spotPrices={spotPrices} onClose={(id) => close.mutate(id)} />
               ))}
-            </tr>
-          </thead>
-          <tbody>
-            {displayTrades.map((t: any) => (
-              <TradeRow key={t.id} t={t} spotPrices={spotPrices} onClose={(id) => close.mutate(id)} />
-            ))}
-          </tbody>
-        </table>
-      )}
+              {ungrouped.map((t: any) => (
+                <TradeRow key={t.id} t={t} spotPrices={spotPrices} onClose={(id) => close.mutate(id)} />
+              ))}
+            </tbody>
+          </table>
+        )
+      })()}
     </div>
   )
 }

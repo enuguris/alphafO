@@ -80,3 +80,8 @@ class Trade(Base):
     kite_order_id: Mapped[str|None]    = mapped_column(String(50), nullable=True)
     notes:         Mapped[str|None]    = mapped_column(Text, nullable=True)
     created_at:    Mapped[datetime]    = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Composite strategy fields — all legs of the same trade share a trade_group_id
+    # leg_role: primary | hedge | short_wing | long_wing | calendar_short | calendar_long
+    trade_group_id: Mapped[str|None]  = mapped_column(String(36), nullable=True, index=True)
+    leg_role:       Mapped[str|None]  = mapped_column(String(30), nullable=True)

@@ -33,6 +33,9 @@ def _trade_dict(t: Trade) -> dict:
         "capital_at_risk_pct": t.capital_at_risk_pct, "notes": t.notes,
         "is_hedge": bool(t.notes and t.notes.startswith("spread_leg:hedge")),
         "pattern": (t.notes.split("pattern:")[-1].split("|")[0] if t.notes and "pattern:" in t.notes else None),
+        "trade_group_id": t.trade_group_id,
+        "leg_role": t.leg_role,
+        "strategy": (t.notes.split("STRATEGY:")[1].split("|")[0] if t.notes and "STRATEGY:" in t.notes else None),
     }
 
 
