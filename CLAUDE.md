@@ -63,9 +63,10 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - Applied via `document.documentElement.setAttribute('data-theme', theme)`
 - CSS vars in `frontend/src/index.css` under `[data-theme="..."]` selectors
 
-### Celery Beat — 15 tasks
+### Celery Beat — 16 tasks
 - See `backend/app/workers/celery_app.py` for full schedule
 - Key tasks: `scan-priority-15m` (*/15min), `mtm-update` (*/2min), `eod-close-intraday` (15:20 IST Mon-Fri), `generate-briefing` (08:45 IST Mon-Fri)
+- `health-scan` (*/5min, all day) — auto-heals Redis drift, stale signals, halts (see below)
 - Manual trigger via `POST /api/v1/system/run-task/{task_name}` — use beat schedule name (with hyphens, not underscores)
 - `task_last_run:<label>` Redis key written after each task succeeds — shown in /system/schedule
 - scan-all-1h, scan-eod, scan-premarket each write their **own** label key (not shared), passed via `task_label` kwarg in beat schedule
@@ -94,11 +95,32 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - IV column in bhav-based OHLCV: uses India VIX history (`fetch_india_vix()`) merged by date via `pd.merge_asof`; falls back to flat 18% if VIX cache unavailable
 - BANKNIFTY uses same VIX values as NIFTY (VIX only covers NIFTY index; close enough for regime detection)
 
+### Composite multi-leg strategies (no naked positions)
+- Every auto-executed trade is a multi-leg composite spanning **two different expiry dates** — no single naked legs
+- `build_composite()` in `backend/app/core/strategies/composite.py` selects strategy by IV rank + pattern type:
+  - `BUY_PATTERNS` low IV (< 0.40):  **Wide Diagonal** — Buy near ATM + Sell far OTM (2 steps), near=weekly/monthly, far=next expiry
+  - `BUY_PATTERNS` mid IV (0.40-0.65): **Diagonal Spread** — Buy near ATM + Sell far OTM (1 step)
+  - `BUY_PATTERNS` high IV (> 0.65): **Calendar Spread** — Sell near ATM + Buy far ATM (same strike, different expiry)
+  - `SELL_PATTERNS` any IV: **Iron Condor** — Sell OTM CE + Sell OTM PE + Buy wing CE + Buy wing PE (nearest expiry)
+- NIFTY (weekly): near=Jul-7, far=Jul-14 (7 days apart). BANKNIFTY (monthly only): near=Jul-28, far=Aug-25 (28 days apart)
+- All legs share a `trade_group_id` (UUID). `leg_role` field: `primary | hedge | calendar_short | calendar_long | condor_short_ce | condor_short_pe | condor_wing_ce | condor_wing_pe`
+- `strategy_name()` and `net_debit()` utilities in `composite.py` for display and risk sizing
+- **Symbol building**: `_build_symbol()` in `composite.py` generates correct Kite format — monthly (`BANKNIFTY26JUL57000PE`) or weekly (`NIFTY2671424000CE`). `strike_selector.py` also uses this (old `expiry['short']` format caused `BANKNIFTY28JUL26...` bug — fixed)
+
 ### Trade decision explanation
 - Every paper trade's `notes` field is populated by `_build_trade_notes()` in `tasks.py`
-- Contains: pattern name, direction, confidence %, IV%, IV rank, strike/expiry, entry/target/stop prices, signal explanation excerpt, hedge leg info, risk per lot
-- Hedge leg notes contain `spread_leg:hedge|main:{symbol}` for correlation with main leg
-- Main leg notes contain `spread_leg:main|` prefix when hedged
+- Contains: pattern name, direction, confidence %, IV%, IV rank, strike/expiry, entry/target/stop prices, signal explanation excerpt, strategy rationale, risk per lot
+- Composite notes include `STRATEGY:{name}|{rationale}|legs:{n}|group:{id[:8]}`
+
+### Health-check scanner
+- `health-scan` Celery task runs every 5 minutes (all day, not restricted to market hours)
+- Checks and auto-fixes four conditions:
+  1. **Redis deployed-capital drift** — if Redis vs DB open-trade sum diverges > ₹5,000, resyncs Redis to DB
+  2. **Stale ACTIVE signals** — signals older than 2h are expired (SQL `NOW() - INTERVAL '2 hours'`), allowing scanner to generate fresh ones
+  3. **Kill-switch auto-clear** — if halted > 30 min AND daily loss has recovered to within 80% of limit, auto-resumes
+  4. **Empty signal queue** — logs WARNING if no ACTIVE signals exist (scanner stall indicator)
+- Returns `{status, issues, fixes_applied, active_signals, redis_deployed, db_deployed, ts_ist}`
+- Note: uses `Signal.created_at < text("NOW() - INTERVAL '2 hours'")` to avoid asyncpg naive-datetime issues with `DateTime` columns
 
 ### NSE lot sizes — live from Kite
 - `get_lot_size(sym)` in `instruments.py` reads Redis key `kite:nfo_lot_sizes` (set at startup by `kite_ticker.py`)
@@ -123,6 +145,7 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 ### Redis deployed capital drift
 - `record_deployed()` uses `incrbyfloat` which can drift due to floating-point imprecision
 - `reset_daily_pnl()` at 9:15 IST resets to 0 then re-seeds from actual open trades in DB
+- `health-scan` (*/5min) auto-corrects drift > ₹5,000 by resyncing Redis to DB sum
 - Manual fix: trigger `reset-daily-pnl` task from SystemHealth → Run button
 
 ### Kite option token resolution — rate limit and quote limitation
@@ -150,11 +173,10 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - IV fraction→percentage: `current_iv = raw_iv * 100 if raw_iv < 2.0 else raw_iv`
 - `high_ivr = iv_rank >= 0.6`; low IVR → buy options; high IVR → sell OTM options
 
-### Hedge leg (credit spread)
-- SELL trades get an OTM BUY hedge to cap max loss
-- Guard: `hedge_prem < premium * 0.85` — if hedge costs ≥85% of main, skip hedge (avoid debit spread)
-- `_hedge_premium()` tries live chain LTP first, then BS with ATM chain IV (not fixed sigma=0.18)
-- Trades 53+54 opened before this fix may show debit spread P&L (closed, can't retrofix)
+### Positions UI — spot price and ITM/OTM badge
+- Both composite group headers and individual trade rows show current spot price fetched via WebSocket
+- ITM/OTM badge: CE ITM when `spot > strike`; PE ITM when `spot < strike`
+- Composite group header shows net P&L across all legs, strategy name, group ID (first 8 chars), expiry dates
 
 ---
 
