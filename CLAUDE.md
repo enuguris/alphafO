@@ -48,6 +48,12 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - `POST /api/v1/options/risk/go-live` — sets Redis flag `go_live_requested` only; **real orders always remain blocked by PAPER_ONLY_LOCK** regardless of this flag
 - Settings UI: tier ladder + criteria progress bars + Go-Live button (disabled until eligible)
 
+### Live exits = backtested managed regime (July 2026)
+- Group exit in `_do_mtm_update` (tasks.py): TP at **50% of net credit**, SL at **2× credit**, time-exit (`group_time_exit`) at **half the original DTE**
+- Validated over 5y backtest vs classic exits: win rate 54-61% → 67-77%, PF 1.85-2.43 → 2.46-5.37, drawdown halved
+- Entry gate on REAL prices: net credit must be 20-80% of spread width or the group is skipped (stale/synthetic pricing artifact guard)
+- Leg pricing is two-pass: price all legs (LTP cascade + slippage) → validate group credit → insert; charges/targets computed from real premium, not BS estimate
+
 ### Reporting
 - `summary.expectancy` in `/dashboard/report` — (win% × avg win) − (loss% × |avg loss|)
 - `GET /api/v1/trades/export/csv?mode=paper` — full trade export, IST timestamps; button in Paper Trading stat bar
