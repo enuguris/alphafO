@@ -545,7 +545,10 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                 legs = build_legs(strategy, spot, iv, ivr, dte, step)
                 nc   = net_credit(legs)
                 sw   = spread_width(legs, step)
-                if nc < sw * 0.20:
+                # Credit must be 20-80% of width. Below 20% isn't worth the risk;
+                # above 80% is a BS pricing artifact (near-zero max risk) that
+                # produces absurd % returns — no real market fills there.
+                if nc < sw * 0.20 or nc > sw * 0.80:
                     continue
 
                 # Capital required = max possible loss × lot_size
