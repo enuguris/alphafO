@@ -372,6 +372,27 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             sp, wp = bs(spot, sk, T, RF, iv, "CE"), bs(spot, wk, T, RF, iv, "CE")
             wp = min(wp, sp * 0.70)
             return [("CE","SELL",sk,round(sp,2)),("CE","BUY",wk,round(wp,2))]
+        elif strategy == "BullCallDebit":
+            # Buy ATM CE, sell OTM CE 2 steps up — bullish, works when IV cheap
+            bk, sk = atm, atm + 2 * step
+            bp = bs(spot, bk, T, RF, iv, "CE")
+            sp = min(bs(spot, sk, T, RF, iv, "CE"), bp * 0.60)
+            return [("CE","BUY",bk,round(bp,2)),("CE","SELL",sk,round(sp,2))]
+        elif strategy == "BearPutDebit":
+            # Buy ATM PE, sell OTM PE 2 steps down — bearish, works when IV cheap
+            bk, sk = atm, atm - 2 * step
+            bp = bs(spot, bk, T, RF, iv, "PE")
+            sp = min(bs(spot, sk, T, RF, iv, "PE"), bp * 0.60)
+            return [("PE","BUY",bk,round(bp,2)),("PE","SELL",sk,round(sp,2))]
+        elif strategy == "IronButterfly":
+            # Sell ATM straddle + buy wings ±3 steps — high credit, needs pin
+            sc = bs(spot, atm, T, RF, iv, "CE")
+            sp2 = bs(spot, atm, T, RF, iv, "PE")
+            wc_k, wp_k = atm + 3*step, atm - 3*step
+            wc  = min(bs(spot, wc_k, T, RF, iv, "CE"), sc * 0.40)
+            wp2 = min(bs(spot, wp_k, T, RF, iv, "PE"), sp2 * 0.40)
+            return [("CE","SELL",atm,round(sc,2)),("PE","SELL",atm,round(sp2,2)),
+                    ("CE","BUY",wc_k,round(wc,2)),("PE","BUY",wp_k,round(wp2,2))]
         else:  # IronCondor
             w = 3 if ivr > 0.65 else 2
             sc_k, sp_k = atm + w*step, atm - w*step
@@ -454,6 +475,18 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             return (f"Price ₹{spot:,.0f} below 10-SMA ₹{sma:,.0f} → bearish bias. "
                     f"IV rank {ivr_pct:.0f}% → selling OTM CE credit spread. "
                     f"IV {iv_pct}%, {dte}d to expiry. ATM={atm}.")
+        elif strategy == "BullCallDebit":
+            return (f"Price ₹{spot:,.0f} above 10-SMA ₹{sma:,.0f} + IV rank {ivr_pct:.0f}% (cheap) "
+                    f"→ buying ATM CE / selling +2-step CE debit spread. Long direction with "
+                    f"defined risk = debit paid. IV {iv_pct}%, {dte}d to expiry. ATM={atm}.")
+        elif strategy == "BearPutDebit":
+            return (f"Price ₹{spot:,.0f} below 10-SMA ₹{sma:,.0f} + IV rank {ivr_pct:.0f}% (cheap) "
+                    f"→ buying ATM PE / selling −2-step PE debit spread. Short direction with "
+                    f"defined risk = debit paid. IV {iv_pct}%, {dte}d to expiry. ATM={atm}.")
+        elif strategy == "IronButterfly":
+            return (f"IV rank {ivr_pct:.0f}% > 55% → very rich ATM premium, Iron Butterfly. "
+                    f"Selling ATM straddle + buying ±3-step wings. Max profit if spot pins "
+                    f"near {atm} at expiry. IV {iv_pct}%, {dte}d to expiry.")
         else:
             return (f"IV rank {ivr_pct:.0f}% > 40% threshold → elevated premium, Iron Condor. "
                     f"Selling OTM strangles both sides to collect theta. "
@@ -512,7 +545,8 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             lo, hi = min(win), max(win)
             return 0.3 if hi == lo else (float(ivs[i]) - lo) / (hi - lo)
 
-        strategies = ["BullPut", "BearCall", "IronCondor"]
+        strategies = ["BullPut", "BearCall", "IronCondor",
+                      "BullCallDebit", "BearPutDebit", "IronButterfly"]
         last_entry = {s: -10 for s in strategies}
         all_trades: dict[str, list] = {s: [] for s in strategies}
 
@@ -535,31 +569,48 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     continue
                 dte = (expiry - entry_date).days
 
+                # Credit strategies sell premium (high IV); debit strategies buy
+                # direction cheaply (low IV). Same trend filter, opposite IV regime.
                 if strategy == "BullPut" and not trend_up:
                     continue
                 if strategy == "BearCall" and trend_up:
                     continue
                 if strategy == "IronCondor" and ivr <= 0.40:
                     continue
+                if strategy == "BullCallDebit" and (not trend_up or ivr > 0.45):
+                    continue
+                if strategy == "BearPutDebit" and (trend_up or ivr > 0.45):
+                    continue
+                if strategy == "IronButterfly" and ivr <= 0.55:
+                    continue
 
                 legs = build_legs(strategy, spot, iv, ivr, dte, step)
                 nc   = net_credit(legs)
                 sw   = spread_width(legs, step)
-                # Credit must be 20-80% of width. Below 20% isn't worth the risk;
-                # above 80% is a BS pricing artifact (near-zero max risk) that
-                # produces absurd % returns — no real market fills there.
-                if nc < sw * 0.20 or nc > sw * 0.80:
-                    continue
+                is_debit = nc < 0
 
-                # Capital required = max possible loss × lot_size
-                max_risk_per_unit = sw - nc
-                capital_used = round(max_risk_per_unit * lot_size, 2)
-
-                # Profit target: 5-8% on capital → aim for 6% midpoint
-                # nc * 0.70 naturally achieves ~5-8%; also enforce 5% floor
-                target_pnl_pct = 0.06  # 6% target on capital
-                take_profit = max(nc * 0.70, capital_used * target_pnl_pct / lot_size)
-                stop_loss   = -(max_risk_per_unit * 0.50)
+                if is_debit:
+                    debit = -nc
+                    # Debit must be < 60% of width or the reward isn't there
+                    if debit > sw * 0.60 or debit < sw * 0.10:
+                        continue
+                    # Capital at risk = the debit paid
+                    max_risk_per_unit = debit
+                    capital_used = round(debit * lot_size, 2)
+                    max_reward = sw - debit
+                    take_profit = max_reward * 0.60          # 60% of max profit
+                    stop_loss   = -(debit * 0.50)            # lose half the debit
+                else:
+                    # Credit must be 20-80% of width. Below 20% isn't worth the
+                    # risk; above 80% is a BS pricing artifact (near-zero max
+                    # risk → absurd % returns) — no real market fills there.
+                    if nc < sw * 0.20 or nc > sw * 0.80:
+                        continue
+                    max_risk_per_unit = sw - nc
+                    capital_used = round(max_risk_per_unit * lot_size, 2)
+                    target_pnl_pct = 0.06  # 6% target on capital
+                    take_profit = max(nc * 0.70, capital_used * target_pnl_pct / lot_size)
+                    stop_loss   = -(max_risk_per_unit * 0.50)
 
                 exit_date = expiry
                 exit_reason = "expiry"

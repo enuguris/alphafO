@@ -43,10 +43,14 @@ interface SavedMeta {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const STRATEGY_META: Record<string, { color: string; shortDesc: string }> = {
-  BullPut:    { color: '#26c6a0', shortDesc: 'Sell ATM PE + Buy OTM PE (bullish)' },
-  BearCall:   { color: '#ff7043', shortDesc: 'Sell ATM CE + Buy OTM CE (bearish)' },
-  IronCondor: { color: '#5b9bff', shortDesc: 'Sell OTM strangle + Buy wings (range/theta)' },
+  BullPut:       { color: '#26c6a0', shortDesc: 'Sell ATM PE + Buy OTM PE (bullish credit)' },
+  BearCall:      { color: '#ff7043', shortDesc: 'Sell ATM CE + Buy OTM CE (bearish credit)' },
+  IronCondor:    { color: '#5b9bff', shortDesc: 'Sell OTM strangle + Buy wings (range/theta)' },
+  BullCallDebit: { color: '#66bb6a', shortDesc: 'Buy ATM CE + Sell OTM CE (bullish, low IV)' },
+  BearPutDebit:  { color: '#ef5350', shortDesc: 'Buy ATM PE + Sell OTM PE (bearish, low IV)' },
+  IronButterfly: { color: '#ab47bc', shortDesc: 'Sell ATM straddle + wings (pin, high IV)' },
 }
+const ALL_STRATEGIES = Object.keys(STRATEGY_META)
 const EXIT_COLOR: Record<string, string> = {
   take_profit: 'var(--up)', stop_loss: 'var(--dn)', expiry: 'var(--txt3)',
 }
@@ -305,7 +309,7 @@ function SummaryTable({ data }: { data: BacktestData }) {
           </tr>
         </thead>
         <tbody>
-          {['BullPut', 'BearCall', 'IronCondor'].map(strat => (
+          {ALL_STRATEGIES.map(strat => (
             <tr key={strat} style={{ borderBottom: '1px solid var(--border2)' }}>
               <td style={{ padding: '7px 10px', fontWeight: 700, color: STRATEGY_META[strat]?.color }}>{strat}</td>
               {data.results.map(r => {
