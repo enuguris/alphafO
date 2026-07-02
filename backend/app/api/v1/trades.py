@@ -35,6 +35,7 @@ def _trade_dict(t: Trade) -> dict:
         "pattern": (t.notes.split("pattern:")[-1].split("|")[0] if t.notes and "pattern:" in t.notes else None),
         "trade_group_id": t.trade_group_id,
         "leg_role": t.leg_role,
+        "entry_price_source": t.entry_price_source,
         "strategy": (t.notes.split("STRATEGY:")[1].split("|")[0] if t.notes and "STRATEGY:" in t.notes else None),
     }
 
@@ -600,7 +601,7 @@ async def export_trades_csv(mode: str = "paper", db: AsyncSession = Depends(get_
     w.writerow(["id", "group_id", "leg_role", "symbol", "underlying", "type", "strike",
                 "expiry", "action", "qty", "entry_ist", "exit_ist", "entry_price",
                 "exit_price", "gross_pnl", "charges", "net_pnl", "pnl_pct",
-                "status", "exit_reason", "strategy"])
+                "status", "exit_reason", "strategy", "price_source"])
     for t in trades:
         strat = (t.notes.split("STRATEGY:")[1].split("|")[0]
                  if t.notes and "STRATEGY:" in t.notes else "")
@@ -610,7 +611,7 @@ async def export_trades_csv(mode: str = "paper", db: AsyncSession = Depends(get_
                     t.entry_price, t.exit_price or "", t.gross_pnl or "",
                     t.charges_total or "", t.pnl or "", t.pnl_pct or "",
                     t.status.value if hasattr(t.status, "value") else t.status,
-                    t.exit_reason or "", strat])
+                    t.exit_reason or "", strat, t.entry_price_source or ""])
     buf.seek(0)
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=alphafo_trades_{mode}.csv"})

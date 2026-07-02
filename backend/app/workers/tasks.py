@@ -252,7 +252,11 @@ async def _auto_paper_trade(signals, db):
         else:
             providers = (["upstox", "kite"] if kite_ok else ["upstox"]) if upstox_ok else (["kite"] if kite_ok else [])
 
+        from time import perf_counter as _pc
+        from app.core.data.provider_health import record_success, record_failure
+
         for provider in providers:
+            _t0 = _pc()
             try:
                 if provider == "kite" and kite_ok:
                     from kiteconnect import KiteConnect as _KCS
@@ -266,14 +270,19 @@ async def _auto_paper_trade(signals, db):
                         p = v.get("last_price", 0)
                         if p > 0:
                             tok = v.get("instrument_token")
+                            record_success("kite", (_pc() - _t0) * 1000)
                             return float(p), "kite", (int(tok) if tok else None)
+                    record_failure("kite", f"empty ltp for {kite_s}")
                 elif provider == "upstox" and upstox_ok:
                     from app.core.data.upstox_ltp import get_ltp as _upltp
                     token = _dec(cfg.upstox_access_token_enc)
                     p = _upltp(token, underlying, expiry_iso, strike, opt_type)
                     if p and p > 0:
+                        record_success("upstox", (_pc() - _t0) * 1000)
                         return p, "upstox", None
+                    record_failure("upstox", f"no ltp for {our_sym}")
             except Exception as _e:
+                record_failure(provider, str(_e))
                 logger.debug(f"LTP provider {provider} failed for {our_sym}: {_e}")
 
         return None, "none", None
@@ -596,10 +605,15 @@ async def _auto_paper_trade(signals, db):
                     except Exception:
                         pass
 
-                if _leg_price_src not in ("bs",):
-                    logger.debug(f"Leg {_leg.symbol} price={_leg_prem:.2f} source={_leg_price_src}")
+                # Slippage: assume we cross half the bid-ask spread on entry.
+                # BUY fills at ask (pay more), SELL fills at bid (receive less).
+                _slip = max(0.25, _leg_prem * 0.005)
+                if _leg.action == "BUY":
+                    _leg_prem = round(_leg_prem + _slip, 2)
                 else:
-                    logger.debug(f"Leg {_leg.symbol} price={_leg_prem:.2f} source=bs (BS estimate)")
+                    _leg_prem = round(max(0.05, _leg_prem - _slip), 2)
+
+                logger.debug(f"Leg {_leg.symbol} price={_leg_prem:.2f} source={_leg_price_src} slip={_slip:.2f}")
 
                 _leg_note = (
                     f"{composite_notes_prefix}|"
@@ -626,6 +640,7 @@ async def _auto_paper_trade(signals, db):
                     instrument_token = _entry_token if _idx == 0 else None,
                     trade_group_id = group_id,
                     leg_role       = _leg.role,
+                    entry_price_source = _leg_price_src,
                 )
                 db.add(_leg_trade)
                 total_deployed += _leg_cost
@@ -1211,6 +1226,14 @@ async def _close_trade(trade, exit_price: float, reason: str, db):
     from app.models.portfolio import Portfolio
     from app.core.charges import calculate_charges
     from sqlalchemy import select
+
+    # Exit slippage: closing a BUY means selling at bid (receive less);
+    # closing a SELL means buying at ask (pay more).
+    _slip = max(0.25, exit_price * 0.005)
+    if trade.action == "BUY":
+        exit_price = round(max(0.05, exit_price - _slip), 2)
+    else:
+        exit_price = round(exit_price + _slip, 2)
 
     charges = calculate_charges(
         entry_premium=trade.entry_price,

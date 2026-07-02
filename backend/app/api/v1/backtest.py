@@ -226,7 +226,7 @@ async def credit_spread_data_range():
     try:
         from app.core.backtest.market_data import build_ohlcv_from_bhav
         import pandas as _pd
-        df = build_ohlcv_from_bhav("NIFTY")
+        df = build_ohlcv_from_bhav("NIFTY", rows=800)
         if df is not None and "timestamp" in df.columns:
             dates = _pd.to_datetime(df["timestamp"]).dt.date
             return {"data_start": str(dates.min()), "data_end": str(dates.max()), "bars": len(df)}
@@ -466,7 +466,7 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
 
         try:
             from app.core.backtest.market_data import build_ohlcv_from_bhav
-            df = build_ohlcv_from_bhav(underlying)
+            df = build_ohlcv_from_bhav(underlying, rows=800)
         except Exception as e:
             return {"underlying": underlying, "error": str(e), "strategies": []}
 

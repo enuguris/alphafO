@@ -383,19 +383,23 @@ async def go_live_status(db: AsyncSession = Depends(get_db)):
                count(*) FILTER (WHERE pnl > 0)       AS wins,
                COALESCE(sum(pnl) FILTER (WHERE pnl > 0), 0)      AS gross_win,
                COALESCE(abs(sum(pnl) FILTER (WHERE pnl < 0)), 0) AS gross_loss,
-               count(DISTINCT date(exit_time))       AS trading_days
+               count(DISTINCT date(exit_time))       AS trading_days,
+               count(*) FILTER (WHERE entry_price_source IN ('kite','upstox')) AS real_priced
         FROM trades
         WHERE mode = 'PAPER' AND status IN ('CLOSED', 'EXPIRED') AND pnl IS NOT NULL
     """))).mappings().first()
 
     total = int(row["total"] or 0)
     wins  = int(row["wins"] or 0)
+    real_priced = int(row["real_priced"] or 0)
     win_rate = round(wins / total * 100, 1) if total else 0.0
     gl = float(row["gross_loss"] or 0)
     pf = round(float(row["gross_win"] or 0) / gl, 2) if gl > 0 else (99.0 if wins else 0.0)
 
     criteria = {
         "min_trades":   {"required": GO_LIVE_MIN_TRADES,   "actual": total,    "pass": total >= GO_LIVE_MIN_TRADES},
+        "real_priced_trades": {"required": GO_LIVE_MIN_TRADES, "actual": real_priced,
+                               "pass": real_priced >= GO_LIVE_MIN_TRADES},
         "win_rate_pct": {"required": GO_LIVE_MIN_WIN_RATE, "actual": win_rate, "pass": win_rate >= GO_LIVE_MIN_WIN_RATE},
         "profit_factor": {"required": GO_LIVE_MIN_PF,      "actual": pf,       "pass": pf >= GO_LIVE_MIN_PF},
     }

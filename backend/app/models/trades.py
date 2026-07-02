@@ -81,6 +81,10 @@ class Trade(Base):
     notes:         Mapped[str|None]    = mapped_column(Text, nullable=True)
     created_at:    Mapped[datetime]    = mapped_column(DateTime, default=datetime.utcnow)
 
+    # Price fidelity: where entry_price came from — kite | upstox | chain | bs
+    # Only kite/upstox are real market fills; chain may be synthetic fallback.
+    entry_price_source: Mapped[str|None] = mapped_column(String(20), nullable=True)
+
     # Composite strategy fields — all legs of the same trade share a trade_group_id
     # leg_role: primary | hedge | short_wing | long_wing | calendar_short | calendar_long
     trade_group_id: Mapped[str|None]  = mapped_column(String(36), nullable=True, index=True)
