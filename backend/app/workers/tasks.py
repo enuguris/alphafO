@@ -1048,6 +1048,11 @@ async def _do_mtm_update():
                 pass
 
         now = datetime.utcnow()
+        # Legs whose MTM price came from an estimate (chain/BS) rather than a
+        # real broker LTP. If a leg entered at a REAL price, exiting it on an
+        # estimated price books phantom P&L (BS can be ₹500+ off deep options).
+        _est_repriced: set[int] = set()
+
         for trade in trades:
             current = prices.get(trade.symbol)
 
@@ -1064,6 +1069,7 @@ async def _do_mtm_update():
                             _ltp2 = float(_row2[ltp_col2].iloc[0])
                             if _ltp2 > 0.5:
                                 current = _ltp2
+                                _est_repriced.add(trade.id)
                 except Exception:
                     pass
 
@@ -1104,6 +1110,7 @@ async def _do_mtm_update():
                         current = round(_bs_price(spot, float(trade.strike), T,
                                                    RISK_FREE_RATE, iv, trade.option_type), 2)
                         current = max(0.05, current)
+                        _est_repriced.add(trade.id)
                 except Exception as e:
                     logger.debug(f"BS fallback failed for {trade.symbol}: {e}")
 
@@ -1129,6 +1136,12 @@ async def _do_mtm_update():
                 action=trade.action,
             )
             trade.unrealized_pnl = round(gross - charges.total, 2)
+
+            # Composite legs NEVER exit individually — closing one leg of a
+            # spread alone breaks the hedge and books phantom P&L. The group
+            # loop below applies the managed exit regime to all legs at once.
+            if trade.trade_group_id:
+                continue
 
             # ── Trailing stop: activate once up 30%, lock in 50% of gain ────────
             if trade.action == "BUY" and trade.entry_price > 0:
@@ -1233,6 +1246,14 @@ async def _do_mtm_update():
             except Exception:
                 pass
 
+            # Price-source consistency: never trigger an exit when a leg that
+            # entered at a REAL price is currently marked from an estimate
+            # (chain/BS) — the model-vs-market gap books phantom P&L.
+            _mixed_pricing = any(
+                t.id in _est_repriced and (t.entry_price_source in ("kite", "upstox"))
+                for t in group_trades
+            )
+
             reason = None
             if net_entry_cost > 0 and net_unrealized >= take_profit_threshold:
                 reason = "group_target"
@@ -1240,6 +1261,13 @@ async def _do_mtm_update():
                 reason = "group_stop"
             elif time_exit_due:
                 reason = "group_time_exit"
+
+            if reason and _mixed_pricing:
+                logger.warning(
+                    f"Group {group_id[:8]}: exit '{reason}' SUPPRESSED — real-entry legs "
+                    f"currently priced by estimate (no live LTP). Waiting for real prices."
+                )
+                reason = None
 
             if reason:
                 logger.info(

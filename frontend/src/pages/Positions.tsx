@@ -573,13 +573,30 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
   const strat  = legs[0]?.strategy ?? 'Composite'
   const sym    = legs[0]?.underlying ?? ''
 
-  // Net composite P&L = sum of all legs (BUY legs gain when price rises, SELL legs gain when price falls)
+  // Net composite P&L:
+  //  - closed/expired legs: use the STORED realized pnl (nets ALL charges,
+  //    entry + exit side). Recomputing from exit_price undercounts charges.
+  //  - open legs: MTM estimate from current price minus entry charges.
   const netPnl = legs.reduce((sum, l) => {
-    const cur = isOpen ? (l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price) : l.exit_price
-    return sum + (cur != null ? livePnl(l, cur) : (l.unrealized_pnl ?? 0))
+    if (l.status === 'closed' || l.status === 'expired') {
+      return sum + (l.pnl ?? l.realized_pnl ?? 0)
+    }
+    const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price
+    return sum + livePnl(l, cur)
   }, 0)
 
   const totalCharges = legs.reduce((s, l) => s + (isOpen ? (l.charges_entry ?? 0) : (l.charges_total ?? 0)), 0)
+
+  // Placed / closed timing for the header
+  const entryTimes = legs.map(l => l.entry_time).filter(Boolean).sort()
+  const exitTimes  = legs.map(l => l.exit_time).filter(Boolean).sort()
+  const placedAt   = entryTimes[0] ?? null
+  const closedAt   = !isOpen && exitTimes.length ? exitTimes[exitTimes.length - 1] : null
+  const holdMs     = placedAt && closedAt ? (new Date(closedAt + 'Z').getTime() - new Date(placedAt + 'Z').getTime()) : null
+  const holdStr    = holdMs != null
+    ? (holdMs >= 86400000 ? `${(holdMs / 86400000).toFixed(1)}d` : holdMs >= 3600000 ? `${(holdMs / 3600000).toFixed(1)}h` : `${Math.max(1, Math.round(holdMs / 60000))}m`)
+    : null
+  const exitReason = !isOpen ? (legs.find(l => l.exit_reason)?.exit_reason ?? null) : null
 
   // Net debit/credit at entry
   const netEntry = legs.reduce((s, l) => {
@@ -605,6 +622,18 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
         <td style={{ padding: '9px 10px', fontWeight: 700, color: 'var(--blue)', fontSize: 12 }} colSpan={2}>
           {sym} — {strat}
           <span style={{ fontSize: 9, color: 'var(--txt3)', fontWeight: 400, marginLeft: 8 }}>{legs.length} legs · group {legs[0]?.trade_group_id?.slice(0,8)}</span>
+          <div style={{ fontSize: 10, color: 'var(--txt3)', fontWeight: 400, marginTop: 3, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span>📍 Placed <b style={{ color: 'var(--txt2)' }}>{fmtDt(placedAt)}</b></span>
+            {closedAt && <span>→ Closed <b style={{ color: 'var(--txt2)' }}>{fmtDt(closedAt)}</b></span>}
+            {holdStr && <span style={{ color: 'var(--txt3)' }}>({holdStr} held)</span>}
+            {exitReason && (
+              <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 3,
+                color: exitReason.includes('target') ? 'var(--up)' : exitReason.includes('stop') ? 'var(--dn)' : 'var(--orange)',
+                background: `color-mix(in srgb, ${exitReason.includes('target') ? 'var(--up)' : exitReason.includes('stop') ? 'var(--dn)' : 'var(--orange)'} 12%, transparent)` }}>
+                {exitReason.replace(/_/g, ' ').toUpperCase()}
+              </span>
+            )}
+          </div>
           {winLeg && lossLeg && isOpen && (
             <span style={{ fontSize: 9, color: 'var(--up)', marginLeft: 8, fontWeight: 600 }}>
               {winLeg.symbol.split('2')[1]?.slice(0,8)} winning → offsets {lossLeg.symbol.split('2')[1]?.slice(0,8)} loss
@@ -649,15 +678,27 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
           <td style={{ padding: '7px 10px' }}>{pill(l.action, l.action === 'BUY' ? 'rgba(38,166,154,0.12)' : 'rgba(239,83,80,0.12)', l.action === 'BUY' ? 'var(--up)' : 'var(--dn)')}</td>
           <td style={{ fontFamily: 'monospace', fontSize: 11, padding: '7px 10px' }}>
             <span style={{ color: 'var(--txt)' }}>{fmtPrem(l.entry_price)}</span>
-            {l.current_price != null && <span style={{ color: 'var(--blue)' }}> → {fmtPrem(l.current_price)}</span>}
+            {l.status === 'open' && l.current_price != null && <span style={{ color: 'var(--blue)' }}> → {fmtPrem(l.current_price)}</span>}
+            {l.status !== 'open' && l.exit_price != null && <span style={{ color: 'var(--orange)' }}> → {fmtPrem(l.exit_price)}</span>}
             <span style={{ fontSize: 9, color: 'var(--txt3)', marginLeft: 4 }}>{l.expiry_display}</span>
+            {l.entry_price_source && (
+              <span style={{ fontSize: 8, fontWeight: 700, marginLeft: 4, padding: '1px 4px', borderRadius: 2,
+                color: ['kite','upstox'].includes(l.entry_price_source) ? 'var(--up)' : 'var(--txt3)',
+                background: `color-mix(in srgb, ${['kite','upstox'].includes(l.entry_price_source) ? 'var(--up)' : 'var(--txt3)'} 12%, transparent)` }}
+                title={['kite','upstox'].includes(l.entry_price_source) ? 'Real market fill price' : 'Estimated price (chain/Black-Scholes)'}>
+                {l.entry_price_source.toUpperCase()}
+              </span>
+            )}
           </td>
           <td style={{ fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11, padding: '7px 10px' }}>{l.quantity}</td>
-          <td style={{ fontFamily: 'monospace', fontSize: 12, padding: '7px 10px', color: (() => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return livePnl(l, cur) >= 0 ? 'var(--up)' : 'var(--dn)' })() }}>
-            {(() => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return fmtINR(livePnl(l, cur)) })()}
+          <td style={{ fontFamily: 'monospace', fontSize: 12, padding: '7px 10px', color: (() => { const v = l.status !== 'open' ? (l.pnl ?? 0) : livePnl(l, l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price); return v >= 0 ? 'var(--up)' : 'var(--dn)' })() }}>
+            {(() => { const v = l.status !== 'open' ? (l.pnl ?? 0) : livePnl(l, l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price); return fmtINR(v) })()}
           </td>
-          <td style={{ fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11, padding: '7px 10px' }}>{fmtPrem(l.charges_entry ?? 0)}</td>
-          <td style={{ color: 'var(--txt3)', fontSize: 10, padding: '7px 10px' }}>{fmtDt(l.entry_time)}</td>
+          <td style={{ fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11, padding: '7px 10px' }}>{fmtPrem(l.status !== 'open' ? (l.charges_total ?? l.charges_entry ?? 0) : (l.charges_entry ?? 0))}</td>
+          <td style={{ color: 'var(--txt3)', fontSize: 10, padding: '7px 10px', whiteSpace: 'nowrap' }}>
+            <div>{fmtDt(l.entry_time)}</div>
+            {l.exit_time && <div style={{ color: 'var(--orange)' }}>✕ {fmtDt(l.exit_time)}</div>}
+          </td>
           <td colSpan={2} style={{ padding: '7px 10px' }}>
             {l.status === 'open' && (
               <button onClick={e => { e.stopPropagation(); if (confirm(`Close ${l.symbol}?`)) onClose(l.id) }}
