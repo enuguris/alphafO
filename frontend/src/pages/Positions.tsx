@@ -635,8 +635,9 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
             )}
           </div>
           {winLeg && lossLeg && isOpen && (
-            <span style={{ fontSize: 9, color: 'var(--up)', marginLeft: 8, fontWeight: 600 }}>
-              {winLeg.symbol.split('2')[1]?.slice(0,8)} winning → offsets {lossLeg.symbol.split('2')[1]?.slice(0,8)} loss
+            <span style={{ fontSize: 9, color: 'var(--up)', marginLeft: 8, fontWeight: 600 }}
+              title="One leg profits while the other loses — that's the hedge doing its job. What matters is the NET P&L.">
+              hedge active: {winLeg.strike?.toLocaleString('en-IN')}{winLeg.option_type} gain offsets {lossLeg.strike?.toLocaleString('en-IN')}{lossLeg.option_type} loss
             </span>
           )}
         </td>
