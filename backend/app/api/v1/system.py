@@ -232,3 +232,10 @@ async def run_task(task_name: str):
     except Exception as e:
         from fastapi import HTTPException
         raise HTTPException(500, f"Failed to queue task: {e}")
+
+
+@router.get("/providers")
+async def data_provider_health():
+    """Round-robin data provider health — success/fail counts, latency, next turn."""
+    from app.core.data.provider_health import get_health
+    return get_health()

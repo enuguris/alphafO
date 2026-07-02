@@ -30,6 +30,30 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 
 ---
 
+## Options Strategy Intelligence Module (July 2026)
+
+### Payoff diagrams
+- `GET /api/v1/trades/payoff/{group_id}` — expiry + T+0 (BS-repriced) P&L curves, breakevens, max P/L, net Greeks for a composite trade group (also accepts a single numeric trade id)
+- Uses ATM chain IV (fallback 18%); far-expiry legs repriced at the near-expiry horizon
+- Frontend: `components/PayoffChart.tsx` (pure SVG, hover crosshair, theme-aware) — rendered in Positions when a composite group is expanded
+
+### Round-robin data providers
+- Round-robin core lives in `_ltp_round_robin` in `tasks.py` (Redis key `ltp_turn` flips 0=Kite/1=Upstox each call, automatic failover)
+- Health tracking: `core/data/provider_health.py` — Redis hashes `data_provider:{kite|upstox|nse_chain}` with ok/fail counts, consecutive failures, EMA latency
+- `GET /api/v1/system/providers` — status per provider (healthy/degraded/down/idle); shown as a card in SystemHealth
+
+### Progressive risk tiers + Go-Live gate
+- `GET /api/v1/options/risk/tier` — tier ladder driven by `paper_capital`: T1 (defined-risk only, 2%/trade) → T2 ≥₹25L → T3 ≥₹50L → T4 ≥₹1Cr
+- `GET /api/v1/options/risk/go-live-status` — criteria: ≥100 closed trades, ≥80% win rate, PF ≥1.5
+- `POST /api/v1/options/risk/go-live` — sets Redis flag `go_live_requested` only; **real orders always remain blocked by PAPER_ONLY_LOCK** regardless of this flag
+- Settings UI: tier ladder + criteria progress bars + Go-Live button (disabled until eligible)
+
+### Reporting
+- `summary.expectancy` in `/dashboard/report` — (win% × avg win) − (loss% × |avg loss|)
+- `GET /api/v1/trades/export/csv?mode=paper` — full trade export, IST timestamps; button in Paper Trading stat bar
+
+---
+
 ## Key Architecture Decisions
 
 ### Signal pipeline

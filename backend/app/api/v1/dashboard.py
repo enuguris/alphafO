@@ -517,6 +517,15 @@ async def trading_report(db: AsyncSession = Depends(get_db)):
     summary["avg_hold_hours"]     = avg_hold_hours
     summary["max_drawdown_pct"]   = max_drawdown_pct
 
+    # Expectancy per trade: (win% × avg win) − (loss% × |avg loss|)
+    if total:
+        wr = len(winners) / total
+        expectancy = wr * (win_pnl / len(winners) if winners else 0) \
+                   - (1 - wr) * (loss_pnl / len(losers) if losers else 0)
+        summary["expectancy"] = round(expectancy, 2)
+    else:
+        summary["expectancy"] = 0.0
+
     # ── Per-underlying breakdown ───────────────────────────────────────────────
     by_underlying: dict = {}
     for sym in ["NIFTY", "BANKNIFTY"]:

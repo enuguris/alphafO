@@ -12,6 +12,7 @@ import PatternFinder from './pages/PatternFinder'
 import Report from './pages/Report'
 import SystemHealth from './pages/SystemHealth'
 import Architecture from './pages/Architecture'
+import SpreadBacktest from './pages/SpreadBacktest'
 import { useModeStore } from './store/modeStore'
 import { useThemeStore, THEMES } from './store/themeStore'
 
@@ -26,6 +27,7 @@ const NAV = [
   { to: '/settings',        label: 'Settings' },
   { to: '/system',          label: 'System' },
   { to: '/architecture',    label: 'Architecture' },
+  { to: '/spread-backtest', label: 'Spread BT' },
 ]
 
 const MODE_COLOR: Record<string, string> = {
@@ -163,6 +165,7 @@ export default function App() {
             <Route path="/settings"   element={<Settings />} />
             <Route path="/system"     element={<SystemHealth />} />
             <Route path="/architecture" element={<Architecture />} />
+            <Route path="/spread-backtest" element={<SpreadBacktest />} />
           </Routes>
         </div>
         <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} />

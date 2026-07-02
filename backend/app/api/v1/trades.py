@@ -422,3 +422,195 @@ async def close_trade_manual(trade_id: int, db: AsyncSession = Depends(get_db)):
 
     await db.commit()
     return {"message": "Trade closed", "trade_id": trade_id, "exit_price": exit_price, "pnl": round(net_pnl, 2)}
+
+
+# ── Payoff diagram ────────────────────────────────────────────────────────────
+
+def _spot_from_redis(underlying: str) -> float | None:
+    try:
+        import redis as _r
+        from app.config import settings as _st
+        r = _r.from_url(_st.redis_url, decode_responses=True)
+        v = r.get(f"spot:{underlying}")
+        return float(v) if v else None
+    except Exception:
+        return None
+
+
+@router.get("/payoff/{group_id}")
+async def payoff_diagram(group_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Payoff diagram for a composite trade group (or single trade id).
+
+    Returns expiry P&L curve, T+0 (today, BS-repriced) curve, breakevens,
+    max profit/loss within the plotted range, and net Greeks at current spot.
+    All P&L values are in rupees for the full position (per-unit × quantity),
+    net of nothing — charges are shown separately as `charges_entry_total`.
+    """
+    from datetime import date as _date
+    from app.core.options.greeks import _bs_price, compute_greeks, RISK_FREE_RATE
+    from app.core.instruments import BASE_PRICES
+
+    # Fetch legs: try group id first, then single numeric trade id
+    result = await db.execute(select(Trade).where(Trade.trade_group_id == group_id))
+    legs = result.scalars().all()
+    if not legs and group_id.isdigit():
+        result = await db.execute(select(Trade).where(Trade.id == int(group_id)))
+        t = result.scalar_one_or_none()
+        legs = [t] if t else []
+    if not legs:
+        raise HTTPException(404, "No trades found for this group id")
+
+    underlying = legs[0].underlying
+    spot = _spot_from_redis(underlying) or BASE_PRICES.get(underlying, 0.0)
+    if spot <= 0:
+        raise HTTPException(500, f"No spot price available for {underlying}")
+
+    # Per-leg IV: prefer ATM chain IV, fallback 18%
+    chain_iv = 0.18
+    try:
+        from app.core.options.chain_service import ChainService
+        chain = ChainService().get_chain(underlying)
+        if chain is not None and len(chain):
+            atm_row = chain.iloc[(chain["strike"] - spot).abs().argmin()]
+            iv_raw = float(atm_row.get("ce_iv") or atm_row.get("pe_iv") or 18.0)
+            iv_frac = iv_raw / 100.0 if iv_raw > 2.0 else iv_raw
+            if 0.05 <= iv_frac <= 1.5:
+                chain_iv = iv_frac
+    except Exception:
+        pass
+
+    today = _date.today()
+    lot = legs[0].lot_size or 1
+
+    leg_specs = []
+    for t in legs:
+        if not t.strike or not t.option_type:
+            continue
+        try:
+            exp = _date.fromisoformat(t.expiry_date) if t.expiry_date else today
+        except Exception:
+            exp = today
+        dte = max((exp - today).days, 0)
+        leg_specs.append({
+            "id": t.id, "role": t.leg_role, "action": t.action,
+            "option_type": t.option_type, "strike": float(t.strike),
+            "entry_price": float(t.entry_price or 0.0),
+            "quantity": int(t.quantity or lot),
+            "expiry": t.expiry_date, "dte": dte,
+            "sign": 1.0 if t.action == "BUY" else -1.0,
+            "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+            "current_price": t.current_price,
+        })
+    if not leg_specs:
+        raise HTTPException(400, "No option legs with strike/type in this group")
+
+    # Spot range: ±8% around current spot, 121 points
+    lo, hi = spot * 0.92, spot * 1.08
+    n = 121
+    xs = [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+
+    # Nearest expiry among legs = the horizon for the "expiry" curve.
+    # Far-expiry legs (calendar/diagonal) are BS-repriced at that horizon.
+    min_dte = min(l["dte"] for l in leg_specs)
+
+    def leg_value(l, S: float, days_from_now: int) -> float:
+        """Option value of a leg at spot S, `days_from_now` days ahead."""
+        T = max(l["dte"] - days_from_now, 0) / 365.0
+        if T <= 0:
+            if l["option_type"] == "CE":
+                return max(S - l["strike"], 0.0)
+            return max(l["strike"] - S, 0.0)
+        try:
+            return _bs_price(S, l["strike"], T, RISK_FREE_RATE, chain_iv, l["option_type"])
+        except Exception:
+            return 0.0
+
+    def group_pnl(S: float, days_from_now: int) -> float:
+        total = 0.0
+        for l in leg_specs:
+            total += l["sign"] * (leg_value(l, S, days_from_now) - l["entry_price"]) * l["quantity"]
+        return total
+
+    expiry_curve = [round(group_pnl(x, min_dte), 2) for x in xs]
+    t0_curve     = [round(group_pnl(x, 0), 2) for x in xs]
+
+    # Breakevens on the expiry curve (linear interpolation at sign changes)
+    breakevens = []
+    for i in range(1, n):
+        a, b = expiry_curve[i - 1], expiry_curve[i]
+        if a == 0:
+            breakevens.append(round(xs[i - 1], 1))
+        elif (a < 0 < b) or (a > 0 > b):
+            frac = abs(a) / (abs(a) + abs(b))
+            breakevens.append(round(xs[i - 1] + (xs[i] - xs[i - 1]) * frac, 1))
+
+    # Net Greeks at current spot (per unit × quantity)
+    net = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    for l in leg_specs:
+        T = max(l["dte"], 1) / 365.0
+        try:
+            g = compute_greeks(spot, l["strike"], T, chain_iv, l["option_type"])
+            for k in net:
+                net[k] += l["sign"] * getattr(g, k) * l["quantity"]
+        except Exception:
+            pass
+
+    charges_entry_total = sum(float(t.charges_entry or 0.0) for t in legs)
+    current_pnl = sum(float(t.unrealized_pnl or t.pnl or 0.0) for t in legs)
+
+    return {
+        "underlying": underlying,
+        "spot": round(spot, 2),
+        "iv_used": round(chain_iv * 100, 2),
+        "horizon_days": min_dte,
+        "legs": leg_specs,
+        "spots": [round(x, 1) for x in xs],
+        "expiry_pnl": expiry_curve,
+        "t0_pnl": t0_curve,
+        "breakevens": breakevens,
+        "max_profit": round(max(expiry_curve), 2),
+        "max_loss": round(min(expiry_curve), 2),
+        "net_greeks": {k: round(v, 4) for k, v in net.items()},
+        "charges_entry_total": round(charges_entry_total, 2),
+        "current_pnl": round(current_pnl, 2),
+        "note": ("Far-expiry legs are BS-repriced at the near-expiry horizon; "
+                 "curves use ATM chain IV (fallback 18%) and are approximate."),
+    }
+
+
+@router.get("/export/csv")
+async def export_trades_csv(mode: str = "paper", db: AsyncSession = Depends(get_db)):
+    """Export all trades as CSV for offline analysis. Timestamps are IST."""
+    import csv, io
+    from datetime import timedelta as _td
+    from fastapi.responses import StreamingResponse
+    from app.models.trades import TradeMode
+
+    result = await db.execute(
+        select(Trade).where(Trade.mode == TradeMode(mode.lower()))
+        .order_by(Trade.entry_time.desc()))
+    trades = result.scalars().all()
+
+    def ist(dt):
+        return (dt + _td(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "group_id", "leg_role", "symbol", "underlying", "type", "strike",
+                "expiry", "action", "qty", "entry_ist", "exit_ist", "entry_price",
+                "exit_price", "gross_pnl", "charges", "net_pnl", "pnl_pct",
+                "status", "exit_reason", "strategy"])
+    for t in trades:
+        strat = (t.notes.split("STRATEGY:")[1].split("|")[0]
+                 if t.notes and "STRATEGY:" in t.notes else "")
+        w.writerow([t.id, t.trade_group_id or "", t.leg_role or "", t.symbol, t.underlying,
+                    t.option_type or "", t.strike or "", t.expiry_date or "",
+                    t.action, t.quantity, ist(t.entry_time), ist(t.exit_time),
+                    t.entry_price, t.exit_price or "", t.gross_pnl or "",
+                    t.charges_total or "", t.pnl or "", t.pnl_pct or "",
+                    t.status.value if hasattr(t.status, "value") else t.status,
+                    t.exit_reason or "", strat])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=alphafo_trades_{mode}.csv"})

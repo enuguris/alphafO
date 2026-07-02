@@ -43,6 +43,12 @@ export default function PaperTrading() {
             <div className="mono" style={{ fontSize: 15, fontWeight: 700, color }}>{val}</div>
           </div>
         ))}
+        <div style={{ flex: 1 }} />
+        <a href="/api/v1/trades/export/csv?mode=paper" download
+          className="tv-btn tv-btn-ghost"
+          style={{ alignSelf: 'center', marginRight: 12, padding: '5px 12px', fontSize: 11, textDecoration: 'none' }}>
+          ⬇ Export CSV
+        </a>
       </div>
 
       {/* Tabs */}

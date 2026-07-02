@@ -4,8 +4,11 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
 
 from app.core.options.regime import RegimeDetector
 from app.core.options.chain_service import ChainService
@@ -319,3 +322,113 @@ async def reset_risk_params():
     _redis.from_url(_s.redis_url, decode_responses=True).delete(RISK_PARAMS_KEY)
     from app.core.risk.gate import get_risk_params
     return {"message": "Risk parameters reset to defaults", "params": get_risk_params()}
+
+
+# ── Progressive risk tiers + Go-Live readiness ────────────────────────────────
+
+RISK_TIERS = [
+    # (min corpus ₹, name, strategies allowed, max risk/trade %, max heat %)
+    (0,          "T1 Defined-Risk Only", ["credit_spreads", "iron_condor", "calendar", "diagonal"], 2.0, 10.0),
+    (2_500_000,  "T2 Add Debit Spreads", ["T1", "debit_spreads"], 2.5, 12.0),
+    (5_000_000,  "T3 Add Ratio/Broken-Wing", ["T2", "ratio_spreads", "broken_wing"], 3.0, 15.0),
+    (10_000_000, "T4 Full Book", ["T3", "naked_short_with_hedge_mandate"], 3.0, 20.0),
+]
+
+GO_LIVE_MIN_TRADES   = 100
+GO_LIVE_MIN_WIN_RATE = 80.0   # %
+GO_LIVE_MIN_PF       = 1.5
+GO_LIVE_FLAG_KEY     = "go_live_requested"
+
+
+@router.get("/risk/tier")
+async def risk_tier():
+    """Current progressive risk tier based on paper corpus size."""
+    from app.core.risk.gate import get_risk_params
+    rp = get_risk_params()
+    corpus = float(rp.get("paper_capital") or 0)
+    tier_idx = max(i for i, t in enumerate(RISK_TIERS) if corpus >= t[0])
+    cur = RISK_TIERS[tier_idx]
+    nxt = RISK_TIERS[tier_idx + 1] if tier_idx + 1 < len(RISK_TIERS) else None
+    return {
+        "corpus": corpus,
+        "tier": tier_idx + 1,
+        "tier_name": cur[1],
+        "allowed_strategies": cur[2],
+        "max_risk_per_trade_pct": cur[3],
+        "max_heat_pct": cur[4],
+        "next_tier_at": nxt[0] if nxt else None,
+        "next_tier_name": nxt[1] if nxt else None,
+        "ladder": [
+            {"tier": i + 1, "min_corpus": t[0], "name": t[1],
+             "max_risk_pct": t[3], "max_heat_pct": t[4], "active": i == tier_idx}
+            for i, t in enumerate(RISK_TIERS)
+        ],
+    }
+
+
+@router.get("/risk/go-live-status")
+async def go_live_status(db: AsyncSession = Depends(get_db)):
+    """
+    Go-Live readiness: win rate, profit factor, and sample size across all
+    CLOSED paper trades. The toggle stays locked until every criterion passes.
+    Even when unlocked, live orders remain blocked by PAPER_ONLY_LOCK in
+    tasks.py — removing that requires explicit written approval.
+    """
+    from sqlalchemy import text as _text
+    import redis as _redis
+    from app.config import settings as _s
+
+    row = (await db.execute(_text("""
+        SELECT count(*)                              AS total,
+               count(*) FILTER (WHERE pnl > 0)       AS wins,
+               COALESCE(sum(pnl) FILTER (WHERE pnl > 0), 0)      AS gross_win,
+               COALESCE(abs(sum(pnl) FILTER (WHERE pnl < 0)), 0) AS gross_loss,
+               count(DISTINCT date(exit_time))       AS trading_days
+        FROM trades
+        WHERE mode = 'PAPER' AND status IN ('CLOSED', 'EXPIRED') AND pnl IS NOT NULL
+    """))).mappings().first()
+
+    total = int(row["total"] or 0)
+    wins  = int(row["wins"] or 0)
+    win_rate = round(wins / total * 100, 1) if total else 0.0
+    gl = float(row["gross_loss"] or 0)
+    pf = round(float(row["gross_win"] or 0) / gl, 2) if gl > 0 else (99.0 if wins else 0.0)
+
+    criteria = {
+        "min_trades":   {"required": GO_LIVE_MIN_TRADES,   "actual": total,    "pass": total >= GO_LIVE_MIN_TRADES},
+        "win_rate_pct": {"required": GO_LIVE_MIN_WIN_RATE, "actual": win_rate, "pass": win_rate >= GO_LIVE_MIN_WIN_RATE},
+        "profit_factor": {"required": GO_LIVE_MIN_PF,      "actual": pf,       "pass": pf >= GO_LIVE_MIN_PF},
+    }
+    all_pass = all(c["pass"] for c in criteria.values())
+
+    r = _redis.from_url(_s.redis_url, decode_responses=True)
+    requested = r.get(GO_LIVE_FLAG_KEY) == "1"
+
+    return {
+        "eligible": all_pass,
+        "go_live_requested": requested,
+        "live_trading_active": False,   # PAPER_ONLY_LOCK is permanent until manually removed
+        "criteria": criteria,
+        "trading_days": int(row["trading_days"] or 0),
+        "note": ("Even when all criteria pass, real orders stay blocked by PAPER_ONLY_LOCK. "
+                 "Enabling live trading requires code change + explicit written approval."),
+    }
+
+
+class GoLiveRequest(BaseModel):
+    enable: bool
+
+
+@router.post("/risk/go-live")
+async def request_go_live(body: GoLiveRequest, db: AsyncSession = Depends(get_db)):
+    """Set/clear the go-live request flag. Does NOT enable real orders."""
+    import redis as _redis
+    from app.config import settings as _s
+    if body.enable:
+        status = await go_live_status(db)
+        if not status["eligible"]:
+            raise HTTPException(400, "Go-Live criteria not met yet — see /risk/go-live-status")
+    r = _redis.from_url(_s.redis_url, decode_responses=True)
+    r.set(GO_LIVE_FLAG_KEY, "1" if body.enable else "0")
+    return {"go_live_requested": body.enable,
+            "note": "Real orders remain blocked by PAPER_ONLY_LOCK regardless of this flag."}

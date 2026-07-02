@@ -50,6 +50,11 @@ export default function SystemHealth() {
     queryFn: fetchSystemSchedule,
     staleTime: 60_000,
   })
+  const { data: providers } = useQuery({
+    queryKey: ['system-providers'],
+    queryFn: async () => (await (await import('../api/client')).api.get('/system/providers')).data,
+    refetchInterval: 30_000,
+  })
 
   const [running, setRunning] = useState<string | null>(null)
   const [msgs, setMsgs] = useState<{ task: string; msg: string; ok: boolean }[]>([])
@@ -133,6 +138,42 @@ export default function SystemHealth() {
           ))}
         </div>
       </div>
+
+      {/* Data provider round-robin health */}
+      {providers && !providers._error && (
+        <div style={CARD}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt2)' }}>DATA PROVIDERS (round-robin)</span>
+            {providers._next_turn && (
+              <span style={{ fontSize: 10, color: 'var(--txt3)' }}>next turn: <b style={{ color: 'var(--blue)' }}>{providers._next_turn}</b></span>
+            )}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
+            {['kite', 'upstox', 'nse_chain'].map(p => {
+              const h = providers[p] || {}
+              const col = h.status === 'healthy' ? 'var(--up)' : h.status === 'degraded' ? 'var(--orange)'
+                        : h.status === 'down' ? 'var(--dn)' : 'var(--txt3)'
+              return (
+                <div key={p} style={{ padding: '8px 12px', background: 'var(--bg)', borderRadius: 4 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: col }} />
+                    <span style={{ fontSize: 12, fontWeight: 600 }}>{p}</span>
+                    <span style={{ fontSize: 9, color: col, marginLeft: 'auto', textTransform: 'uppercase' }}>{h.status ?? 'idle'}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--txt2)', lineHeight: 1.5 }}>
+                    <div>OK: {h.ok ?? 0} · Fail: {h.fail ?? 0}
+                      {h.success_rate != null && <> · {h.success_rate}%</>}</div>
+                    {h.avg_ms != null && <div>Avg latency: {h.avg_ms}ms</div>}
+                    {h.last_ok_ist && <div>Last OK: {h.last_ok_ist} IST</div>}
+                    {h.last_err && <div style={{ color: 'var(--dn)', fontSize: 10 }} title={h.last_err}>
+                      Err: {h.last_err.slice(0, 40)}…</div>}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Task log */}
       {msgs.length > 0 && (

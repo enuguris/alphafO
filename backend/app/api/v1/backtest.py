@@ -135,6 +135,593 @@ async def run_backtest(req: BacktestRequest, db: AsyncSession = Depends(get_db))
     }
 
 
+def _redis_conn():
+    import redis as _r
+    from app.config import settings as _st
+    return _r.from_url(_st.redis_url, decode_responses=True)
+
+SAVED_LIST_KEY = "bt_saved:list"
+SAVED_TTL      = 86400 * 30   # 30 days
+
+
+@router.get("/credit-spreads/saved")
+async def list_saved_backtests():
+    """Return the list of saved backtest runs (metadata only, no full data)."""
+    import json as _json
+    try:
+        r = _redis_conn()
+        raw = r.lrange(SAVED_LIST_KEY, 0, 49)
+        return {"saved": [_json.loads(x) for x in raw]}
+    except Exception:
+        return {"saved": []}
+
+
+@router.get("/credit-spreads/saved/{run_id}")
+async def load_saved_backtest(run_id: str):
+    """Load the full result for a saved backtest run."""
+    import json as _json
+    try:
+        r = _redis_conn()
+        raw = r.get(f"bt_saved:data:{run_id}")
+        if not raw:
+            raise HTTPException(404, "Saved run not found")
+        return _json.loads(raw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.delete("/credit-spreads/saved/{run_id}")
+async def delete_saved_backtest(run_id: str):
+    """Delete a saved backtest run."""
+    import json as _json
+    try:
+        r = _redis_conn()
+        r.delete(f"bt_saved:data:{run_id}")
+        # Remove from list
+        raw_list = r.lrange(SAVED_LIST_KEY, 0, 199)
+        r.delete(SAVED_LIST_KEY)
+        for item in raw_list:
+            meta = _json.loads(item)
+            if meta.get("id") != run_id:
+                r.rpush(SAVED_LIST_KEY, item)
+        return {"deleted": run_id}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.post("/credit-spreads/save")
+async def save_backtest_result(name: str, from_date: str | None = None, to_date: str | None = None):
+    """Save the most recent cached result for a date range under a user-defined name."""
+    import json as _json, uuid as _uuid, time as _time
+    CACHE_KEY = f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}"
+    try:
+        r = _redis_conn()
+        cached = r.get(CACHE_KEY)
+        if not cached:
+            raise HTTPException(400, "No cached result for this date range — run the backtest first")
+        run_id  = str(_uuid.uuid4())[:8]
+        meta    = {
+            "id":         run_id,
+            "name":       name,
+            "from_date":  from_date,
+            "to_date":    to_date,
+            "saved_at":   _time.strftime("%Y-%m-%d %H:%M IST", _time.gmtime(_time.time() + 19800)),
+        }
+        r.set(f"bt_saved:data:{run_id}", cached, ex=SAVED_TTL)
+        r.lpush(SAVED_LIST_KEY, _json.dumps(meta))   # newest first
+        r.ltrim(SAVED_LIST_KEY, 0, 49)               # keep last 50
+        r.expire(SAVED_LIST_KEY, SAVED_TTL)
+        return {"saved": True, "id": run_id, "name": name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/credit-spreads/data-range")
+async def credit_spread_data_range():
+    """Return the available bhav data date range without running any backtest."""
+    try:
+        from app.core.backtest.market_data import build_ohlcv_from_bhav
+        import pandas as _pd
+        df = build_ohlcv_from_bhav("NIFTY")
+        if df is not None and "timestamp" in df.columns:
+            dates = _pd.to_datetime(df["timestamp"]).dt.date
+            return {"data_start": str(dates.min()), "data_end": str(dates.max()), "bars": len(df)}
+    except Exception:
+        pass
+    return {"data_start": None, "data_end": None, "bars": 0}
+
+
+@router.post("/credit-spreads/run")
+async def run_credit_spread_backtest(
+    from_date: str | None = None,
+    to_date:   str | None = None,
+):
+    """
+    Explicitly run the credit spread backtest. Always executes fresh (no cache read).
+    Stores result in cache for 24h so it survives page reloads.
+    """
+    import json as _json
+    CACHE_KEY = f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}"
+    CACHE_TTL = 86400   # 24 hours — survive page reloads
+
+    import asyncio
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, _run_credit_spread_backtest, from_date, to_date
+    )
+
+    try:
+        r = _redis_conn()
+        r.setex(CACHE_KEY, CACHE_TTL, _json.dumps(result))
+    except Exception:
+        pass
+
+    return result
+
+
+@router.get("/credit-spreads")
+async def credit_spread_backtest(
+    from_date: str | None = None,
+    to_date:   str | None = None,
+):
+    """
+    Return cached backtest results for this date range. Does NOT run a new backtest.
+    Returns 204 (no content) if no cached result exists — client should call /run.
+    """
+    import json as _json
+    CACHE_KEY = f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}"
+    try:
+        r = _redis_conn()
+        cached = r.get(CACHE_KEY)
+        if cached:
+            return _json.loads(cached)
+    except Exception:
+        pass
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+
+@router.post("/credit-spreads/refresh")
+async def refresh_credit_spread_backtest(
+    from_date: str | None = None,
+    to_date:   str | None = None,
+):
+    """Alias for /run — kept for backward compatibility."""
+    import json as _json
+    CACHE_KEY = f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}"
+    try:
+        r = _redis_conn()
+        r.delete(CACHE_KEY)
+        r.delete("credit_spread_backtest:v1")
+    except Exception:
+        r = None
+
+    import asyncio
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, _run_credit_spread_backtest, from_date, to_date
+    )
+
+    try:
+        if r:
+            r.setex(CACHE_KEY, 3600, _json.dumps(result))
+    except Exception:
+        pass
+
+    return result
+
+
+def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | None = None) -> dict:
+    """CPU-bound backtest logic — runs in executor thread."""
+    import math
+    from datetime import date, timedelta, datetime
+
+    RF = 0.065
+    # NSE lot sizes
+    LOT_SIZES = {"NIFTY": 65, "BANKNIFTY": 30}
+
+    # ── Black-Scholes ──────────────────────────────────────────────────────────
+    def _norm_cdf(x):
+        t = 1.0 / (1.0 + 0.2316419 * abs(x))
+        poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+        cdf = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x) * poly
+        return cdf if x >= 0 else 1.0 - cdf
+
+    def bs(S, K, T, r, sigma, opt):
+        if T <= 0 or sigma <= 0:
+            return max(0.05, (S - K) if opt == "CE" else (K - S))
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        p = (S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)) if opt == "CE" \
+            else (K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1))
+        return max(0.05, p)
+
+    def rnd_k(price, step):
+        return int(round(price / step) * step)
+
+    # ── Expiry helpers ─────────────────────────────────────────────────────────
+    def next_tuesdays(from_dt, count=12):
+        tues, d = [], from_dt
+        while d.weekday() != 1:
+            d += timedelta(days=1)
+        for _ in range(count):
+            tues.append(d)
+            d += timedelta(days=7)
+        return tues
+
+    def select_expiry(entry_date, min_dte=7):
+        for t in next_tuesdays(entry_date + timedelta(days=1)):
+            if (t - entry_date).days >= min_dte:
+                return t
+        return None
+
+    # ── Leg builders ──────────────────────────────────────────────────────────
+    def build_legs(strategy, spot, iv, ivr, dte, step):
+        T = max(dte, 1) / 365.0
+        offset = step if ivr > 0.55 else 0
+        atm = rnd_k(spot, step)
+        if strategy == "BullPut":
+            sk, wk = atm - offset, atm - offset - 2 * step
+            sp, wp = bs(spot, sk, T, RF, iv, "PE"), bs(spot, wk, T, RF, iv, "PE")
+            wp = min(wp, sp * 0.70)
+            return [("PE","SELL",sk,round(sp,2)),("PE","BUY",wk,round(wp,2))]
+        elif strategy == "BearCall":
+            sk, wk = atm + offset, atm + offset + 2 * step
+            sp, wp = bs(spot, sk, T, RF, iv, "CE"), bs(spot, wk, T, RF, iv, "CE")
+            wp = min(wp, sp * 0.70)
+            return [("CE","SELL",sk,round(sp,2)),("CE","BUY",wk,round(wp,2))]
+        else:  # IronCondor
+            w = 3 if ivr > 0.65 else 2
+            sc_k, sp_k = atm + w*step, atm - w*step
+            wc_k, wp_k = sc_k + 2*step, sp_k - 2*step
+            sc  = bs(spot, sc_k, T, RF, iv, "CE")
+            sp2 = bs(spot, sp_k, T, RF, iv, "PE")
+            wc  = min(bs(spot, wc_k, T, RF, iv, "CE"), sc * 0.55)
+            wp2 = min(bs(spot, wp_k, T, RF, iv, "PE"), sp2 * 0.55)
+            return [("CE","SELL",sc_k,round(sc,2)),("PE","SELL",sp_k,round(sp2,2)),
+                    ("CE","BUY",wc_k,round(wc,2)),("PE","BUY",wp_k,round(wp2,2))]
+
+    def net_credit(legs):
+        return sum(p if a == "SELL" else -p for _,a,_,p in legs)
+
+    def spread_width(legs, step):
+        sells = [k for _,a,k,_ in legs if a == "SELL"]
+        buys  = [k for _,a,k,_ in legs if a == "BUY"]
+        return abs(sells[0] - buys[0]) if sells and buys else step * 2
+
+    def reprice_legs(legs, spot, dte, iv):
+        """Return per-leg current prices and net group P&L."""
+        T = max(dte, 0.5) / 365.0
+        total, leg_prices = 0.0, []
+        for opt, action, strike, entry_p in legs:
+            curr = bs(spot, strike, T, RF, iv, opt)
+            leg_prices.append(round(curr, 2))
+            total += (entry_p - curr) if action == "SELL" else (curr - entry_p)
+        return total, leg_prices
+
+    def intrinsic_legs(legs, spot):
+        total, leg_prices = 0.0, []
+        for opt, action, strike, entry_p in legs:
+            intr = max(0.0, spot - strike) if opt == "CE" else max(0.0, strike - spot)
+            leg_prices.append(round(intr, 2))
+            total += (entry_p - intr) if action == "SELL" else (intr - entry_p)
+        return total, leg_prices
+
+    # ── NSE charges (Zerodha, Jul 2026) ───────────────────────────────────────
+    def compute_charges(legs, exit_leg_prices, lot_size):
+        """
+        Compute all NSE F&O charges for one round-trip composite trade.
+        Returns dict with per-component breakdown and total.
+        """
+        entry_buy_to  = sum(p * lot_size for _,a,_,p in legs if a == "BUY")
+        entry_sell_to = sum(p * lot_size for _,a,_,p in legs if a == "SELL")
+        exit_buy_to   = sum(ep * lot_size for ((_,a,_,_), ep) in zip(legs, exit_leg_prices) if a == "SELL")  # buying back shorts
+        exit_sell_to  = sum(ep * lot_size for ((_,a,_,_), ep) in zip(legs, exit_leg_prices) if a == "BUY")   # selling longs
+
+        total_turnover = entry_buy_to + entry_sell_to + exit_buy_to + exit_sell_to
+        num_orders = len(legs) * 2  # entry + exit per leg
+
+        brokerage      = min(20.0 * num_orders, total_turnover * 0.0003)  # ₹20/order, capped at 0.03%
+        stt            = (entry_sell_to + exit_buy_to) * 0.001             # 0.1% on sell-side premium
+        exchange_fee   = total_turnover * 0.00053                          # NSE 0.053%
+        sebi_fee       = total_turnover * 0.000001                         # ₹1/lakh
+        gst            = (brokerage + exchange_fee + sebi_fee) * 0.18
+        stamp_duty     = (entry_buy_to + exit_sell_to) * 0.00003           # 0.003% on buy side
+        total_charges  = brokerage + stt + exchange_fee + sebi_fee + gst + stamp_duty
+
+        return {
+            "brokerage":    round(brokerage, 2),
+            "stt":          round(stt, 2),
+            "exchange_fee": round(exchange_fee, 2),
+            "sebi_fee":     round(sebi_fee, 2),
+            "gst":          round(gst, 2),
+            "stamp_duty":   round(stamp_duty, 2),
+            "total":        round(total_charges, 2),
+        }
+
+    # ── Trade reason builder ───────────────────────────────────────────────────
+    def build_reason(strategy, spot, sma, ivr, iv, dte, step):
+        iv_pct = round(iv * 100, 1)
+        ivr_pct = round(ivr * 100, 0)
+        atm = rnd_k(spot, step)
+        if strategy == "BullPut":
+            return (f"Price ₹{spot:,.0f} above 10-SMA ₹{sma:,.0f} → bullish bias. "
+                    f"IV rank {ivr_pct:.0f}% → selling OTM PE credit spread. "
+                    f"IV {iv_pct}%, {dte}d to expiry. ATM={atm}.")
+        elif strategy == "BearCall":
+            return (f"Price ₹{spot:,.0f} below 10-SMA ₹{sma:,.0f} → bearish bias. "
+                    f"IV rank {ivr_pct:.0f}% → selling OTM CE credit spread. "
+                    f"IV {iv_pct}%, {dte}d to expiry. ATM={atm}.")
+        else:
+            return (f"IV rank {ivr_pct:.0f}% > 40% threshold → elevated premium, Iron Condor. "
+                    f"Selling OTM strangles both sides to collect theta. "
+                    f"IV {iv_pct}%, {dte}d to expiry. ATM={atm}. "
+                    f"Wide strikes ({'3-step' if ivr > 0.65 else '2-step'}) for safety margin.")
+
+    # ── Main per-underlying runner ─────────────────────────────────────────────
+    def run_one(underlying, step):
+        lot_size = LOT_SIZES.get(underlying, 50)
+
+        try:
+            from app.core.backtest.market_data import build_ohlcv_from_bhav
+            df = build_ohlcv_from_bhav(underlying)
+        except Exception as e:
+            return {"underlying": underlying, "error": str(e), "strategies": []}
+
+        if df is None or len(df) < 30:
+            return {"underlying": underlying, "error": "insufficient data", "strategies": []}
+
+        # Use the timestamp column for real dates (index is always integer)
+        if "timestamp" in df.columns:
+            import pandas as _pd
+            df["_date"] = _pd.to_datetime(df["timestamp"]).dt.date
+        else:
+            # fallback: reconstruct dates from index position
+            _n = len(df)
+            df["_date"] = [date.today() - timedelta(days=_n - i) for i in range(_n)]
+
+        # Apply date range filter on real dates
+        if from_date or to_date:
+            fd = datetime.strptime(from_date, "%Y-%m-%d").date() if from_date else None
+            td = datetime.strptime(to_date,   "%Y-%m-%d").date() if to_date   else None
+            mask = df["_date"].apply(lambda d: (fd is None or d >= fd) and (td is None or d <= td))
+            n_keep = mask.sum()
+            if n_keep < 20:
+                actual_start = str(df["_date"].iloc[0])
+                actual_end   = str(df["_date"].iloc[-1])
+                return {"underlying": underlying,
+                        "error": (f"Only {n_keep} bars in selected range. "
+                                  f"Available data: {actual_start} → {actual_end}"),
+                        "strategies": []}
+            df = df[mask].reset_index(drop=True)
+
+        closes = df["close"].values
+        ivs    = df["iv"].values if "iv" in df.columns else [0.18] * len(df)
+
+        def get_date(i):
+            return df["_date"].iloc[i]
+
+        def sma10(i):
+            return float(sum(closes[max(0,i-10):i]) / min(10, i)) if i > 0 else float(closes[0])
+
+        def ivrank(i):
+            win = [float(ivs[j]) for j in range(max(0,i-252),i) if float(ivs[j]) > 0.01]
+            if len(win) < 10: return 0.3
+            lo, hi = min(win), max(win)
+            return 0.3 if hi == lo else (float(ivs[i]) - lo) / (hi - lo)
+
+        strategies = ["BullPut", "BearCall", "IronCondor"]
+        last_entry = {s: -10 for s in strategies}
+        all_trades: dict[str, list] = {s: [] for s in strategies}
+
+        for i in range(20, len(df)):
+            entry_date = get_date(i)
+            spot = float(closes[i])
+            iv   = float(ivs[i]) if float(ivs[i]) > 0.01 else 0.18
+            if iv > 2.0: iv /= 100.0
+            iv   = max(0.08, min(iv, 0.80))
+            ivr  = ivrank(i)
+            sma  = sma10(i)
+            trend_up = spot > sma
+
+            for strategy in strategies:
+                if i - last_entry[strategy] < 7:
+                    continue
+
+                expiry = select_expiry(entry_date, min_dte=7)
+                if not expiry:
+                    continue
+                dte = (expiry - entry_date).days
+
+                if strategy == "BullPut" and not trend_up:
+                    continue
+                if strategy == "BearCall" and trend_up:
+                    continue
+                if strategy == "IronCondor" and ivr <= 0.40:
+                    continue
+
+                legs = build_legs(strategy, spot, iv, ivr, dte, step)
+                nc   = net_credit(legs)
+                sw   = spread_width(legs, step)
+                if nc < sw * 0.20:
+                    continue
+
+                # Capital required = max possible loss × lot_size
+                max_risk_per_unit = sw - nc
+                capital_used = round(max_risk_per_unit * lot_size, 2)
+
+                # Profit target: 5-8% on capital → aim for 6% midpoint
+                # nc * 0.70 naturally achieves ~5-8%; also enforce 5% floor
+                target_pnl_pct = 0.06  # 6% target on capital
+                take_profit = max(nc * 0.70, capital_used * target_pnl_pct / lot_size)
+                stop_loss   = -(max_risk_per_unit * 0.50)
+
+                exit_date = expiry
+                exit_reason = "expiry"
+                pnl = 0.0
+                exit_leg_prices = [p for _,_,_,p in legs]  # default = entry prices
+
+                for j in range(i+1, min(i+60, len(df))):
+                    sim_date  = get_date(j)
+                    sim_spot  = float(closes[j])
+                    sim_iv    = float(ivs[j]) if float(ivs[j]) > 0.01 else iv
+                    if sim_iv > 2.0: sim_iv /= 100.0
+                    sim_iv    = max(0.08, min(sim_iv, 0.80))
+                    sim_dte   = (expiry - sim_date).days
+
+                    if sim_date >= expiry or sim_dte <= 0:
+                        pnl, exit_leg_prices = intrinsic_legs(legs, sim_spot)
+                        exit_date, exit_reason = sim_date, "expiry"
+                        break
+
+                    unreal, curr_prices = reprice_legs(legs, sim_spot, sim_dte, sim_iv)
+                    if unreal >= take_profit:
+                        pnl, exit_leg_prices = unreal, curr_prices
+                        exit_date, exit_reason = sim_date, "take_profit"
+                        break
+                    elif unreal <= stop_loss:
+                        pnl, exit_leg_prices = unreal, curr_prices
+                        exit_date, exit_reason = sim_date, "stop_loss"
+                        break
+                else:
+                    pnl, exit_leg_prices = intrinsic_legs(legs, float(closes[min(i+60, len(df)-1)]))
+
+                charges = compute_charges(legs, exit_leg_prices, lot_size)
+                pnl_after_charges = round(pnl - charges["total"] / lot_size, 2)
+                pnl_on_capital_pct = round(pnl_after_charges * lot_size / max(capital_used, 1) * 100, 2)
+
+                hold = (exit_date - entry_date).days
+
+                # Build per-leg display: entry and exit prices
+                leg_details = []
+                for (opt,action,strike,entry_p), exit_p in zip(legs, exit_leg_prices):
+                    prefix = "S" if action == "SELL" else "B"
+                    leg_details.append({
+                        "label":       f"{prefix}{int(strike)}{opt}",
+                        "action":      action,
+                        "opt_type":    opt,
+                        "strike":      int(strike),
+                        "entry_price": entry_p,
+                        "exit_price":  round(exit_p, 2),
+                        "pnl_per_unit": round((entry_p - exit_p) if action == "SELL" else (exit_p - entry_p), 2),
+                    })
+
+                all_trades[strategy].append({
+                    "entry_date":          str(entry_date),
+                    "exit_date":           str(exit_date),
+                    "exit_reason":         exit_reason,
+                    "spot":                round(spot, 0),
+                    "net_credit":          round(nc, 2),
+                    "spread_width":        round(sw, 2),
+                    "capital_used":        capital_used,
+                    "pnl":                 round(pnl, 2),
+                    "pnl_after_charges":   pnl_after_charges,
+                    "pnl_on_capital_pct":  pnl_on_capital_pct,
+                    "charges":             charges,
+                    "hold_days":           hold,
+                    "iv_rank":             round(ivr, 3),
+                    "iv_pct":              round(iv * 100, 1),
+                    "reason":              build_reason(strategy, spot, sma, ivr, iv, dte, step),
+                    "leg_details":         leg_details,
+                    # legacy compact string for summary display
+                    "legs": [f"{'S' if a=='SELL' else 'B'}{int(k)}{o}@{ep:.0f}→{xp:.0f}"
+                             for (o,a,k,ep),xp in zip(legs, exit_leg_prices)],
+                })
+                last_entry[strategy] = i
+
+        # ── Aggregate per strategy ─────────────────────────────────────────────
+        strategies_out = []
+        for strategy in strategies:
+            trades = all_trades[strategy]
+            if not trades:
+                strategies_out.append({"strategy": strategy, "trades": 0})
+                continue
+
+            wins   = [t for t in trades if t["pnl_after_charges"] > 0]
+            losses = [t for t in trades if t["pnl_after_charges"] <= 0]
+            total_pnl = sum(t["pnl_after_charges"] * lot_size for t in trades)
+            win_rate  = round(len(wins) / len(trades) * 100, 1)
+            avg_win   = round(sum(t["pnl_after_charges"] for t in wins)   / len(wins),   2) if wins   else 0
+            avg_loss  = round(sum(t["pnl_after_charges"] for t in losses) / len(losses), 2) if losses else 0
+            pf = round((avg_win * len(wins)) / max(abs(avg_loss * len(losses)), 0.01), 2)
+            avg_hold  = round(sum(t["hold_days"] for t in trades) / len(trades), 1)
+            avg_credit= round(sum(t["net_credit"] for t in trades) / len(trades), 1)
+            avg_capital = round(sum(t["capital_used"] for t in trades) / len(trades), 0)
+            avg_pnl_pct = round(sum(t["pnl_on_capital_pct"] for t in trades) / len(trades), 2)
+            total_charges = round(sum(t["charges"]["total"] for t in trades), 2)
+
+            equity, peak, max_dd = 0.0, 0.0, 0.0
+            equity_pts = []
+            for t in sorted(trades, key=lambda x: x["exit_date"]):
+                equity += t["pnl_after_charges"] * lot_size
+                if equity > peak: peak = equity
+                dd = peak - equity
+                if dd > max_dd: max_dd = dd
+                equity_pts.append({"date": t["exit_date"], "equity": round(equity, 2)})
+
+            exit_counts = {
+                "take_profit": sum(1 for t in trades if t["exit_reason"] == "take_profit"),
+                "stop_loss":   sum(1 for t in trades if t["exit_reason"] == "stop_loss"),
+                "expiry":      sum(1 for t in trades if t["exit_reason"] == "expiry"),
+            }
+
+            strategies_out.append({
+                "strategy":         strategy,
+                "lot_size":         lot_size,
+                "trades":           len(trades),
+                "win_rate":         win_rate,
+                "profit_factor":    pf,
+                "total_pnl":        round(total_pnl, 2),
+                "avg_credit":       avg_credit,
+                "avg_win":          avg_win,
+                "avg_loss":         avg_loss,
+                "avg_hold_days":    avg_hold,
+                "avg_capital_used": avg_capital,
+                "avg_pnl_pct":      avg_pnl_pct,
+                "total_charges":    total_charges,
+                "max_drawdown":     round(max_dd, 2),
+                "exit_counts":      exit_counts,
+                "equity_curve":     equity_pts,
+                "recent_trades":    sorted(trades, key=lambda x: x["entry_date"])[-20:],
+            })
+
+        return {
+            "underlying":  underlying,
+            "bars":        len(df),
+            "step":        step,
+            "lot_size":    lot_size,
+            "strategies":  strategies_out,
+        }
+
+    from datetime import datetime as _dt
+    # Detect the actual available date range from bhav files
+    try:
+        from app.core.backtest.market_data import build_ohlcv_from_bhav as _b
+        _probe = _b("NIFTY")
+        if _probe is not None and "timestamp" in _probe.columns:
+            import pandas as _pd
+            _dates = _pd.to_datetime(_probe["timestamp"]).dt.date
+            _data_start = str(_dates.min())
+            _data_end   = str(_dates.max())
+        else:
+            _data_start = _data_end = None
+    except Exception:
+        _data_start = _data_end = None
+
+    results = [run_one("NIFTY", 50), run_one("BANKNIFTY", 100)]
+    return {
+        "results":     results,
+        "run_at_ist":  (_dt.utcnow().strftime("%d %b %Y %H:%M") + " IST"),
+        "from_date":   from_date,
+        "to_date":     to_date,
+        "data_start":  _data_start,
+        "data_end":    _data_end,
+        "version":     "v2",
+    }
+
+
 @router.get("/results")
 async def list_backtests(limit: int = 20, db: AsyncSession = Depends(get_db)):
     q = select(BacktestRun).order_by(BacktestRun.created_at.desc()).limit(limit)

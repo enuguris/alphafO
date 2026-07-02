@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { createChart } from 'lightweight-charts'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket } from '../api/client'
+import PayoffChart from '../components/PayoffChart'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -667,6 +668,14 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
           </td>
         </tr>
       ))}
+      {/* Payoff diagram row */}
+      {expanded && legs[0]?.trade_group_id && (
+        <tr style={{ background: 'var(--bg2)', borderBottom: '2px solid var(--border)' }}>
+          <td colSpan={12} style={{ padding: '4px 24px 10px' }}>
+            <PayoffChart groupId={legs[0].trade_group_id} />
+          </td>
+        </tr>
+      )}
       {/* Separator after group */}
       {!expanded && null}
     </>

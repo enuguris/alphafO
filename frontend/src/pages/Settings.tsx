@@ -70,6 +70,11 @@ export default function Settings() {
     api_key: string; has_secret: boolean; token_valid: boolean; token_date: string | null
   } | null>(null)
 
+  // Go-Live + risk tier state
+  const [tier,    setTier]    = useState<any>(null)
+  const [goLive,  setGoLive]  = useState<any>(null)
+  const [glBusy,  setGlBusy]  = useState(false)
+
   // Anthropic key state
   const [anthropicKey,        setAnthropicKey]        = useState('')
   const [anthropicHasKey,     setAnthropicHasKey]     = useState(false)
@@ -89,7 +94,23 @@ export default function Settings() {
     fetchRiskStatus()
       .then(r => { setRiskStatus(r); if (r.params) { setRiskParams(r.params); const init: Record<string, string> = {}; Object.entries(r.params).forEach(([k,v]) => { init[k] = String(v) }); setEditingParams(init) } })
       .catch(() => {})
+    api.get('/options/risk/tier').then(r => setTier(r.data)).catch(() => {})
+    api.get('/options/risk/go-live-status').then(r => setGoLive(r.data)).catch(() => {})
   }, [])
+
+  const toggleGoLive = async () => {
+    if (!goLive) return
+    const next = !goLive.go_live_requested
+    if (next && !window.confirm('Request Go-Live? Real orders remain blocked by PAPER_ONLY_LOCK — this only records intent.')) return
+    setGlBusy(true)
+    try {
+      await api.post('/options/risk/go-live', { enable: next })
+      const r = await api.get('/options/risk/go-live-status')
+      setGoLive(r.data)
+    } catch (e: any) {
+      alert(e?.response?.data?.detail ?? 'Failed')
+    } finally { setGlBusy(false) }
+  }
 
   const saveAnthropicKeyHandler = async () => {
     if (!anthropicKey) return
@@ -701,6 +722,87 @@ export default function Settings() {
               <div style={{ fontSize: 10, color: 'var(--txt3)' }}>
                 Halt stops all auto-execution immediately. Resume clears the halt flag. Kill switch (permanent) requires Redis key deletion.
               </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ── Risk Tier + Go-Live gate ── */}
+        <section style={{ marginBottom: 20 }}>
+          <div className="section-title">Risk Tier & Go-Live Readiness</div>
+          <div className="form-section">
+            <div className="form-section-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+              {/* Tier ladder */}
+              {tier && (
+                <div>
+                  <div style={{ fontSize: 11, color: 'var(--txt2)', marginBottom: 8 }}>
+                    Corpus <b style={{ fontFamily: 'monospace' }}>₹{tier.corpus?.toLocaleString('en-IN')}</b> →
+                    <b style={{ color: 'var(--blue)', marginLeft: 5 }}>{tier.tier_name}</b>
+                    {tier.next_tier_at && (
+                      <span style={{ color: 'var(--txt3)', marginLeft: 8 }}>
+                        next tier at ₹{tier.next_tier_at.toLocaleString('en-IN')}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {tier.ladder?.map((t: any) => (
+                      <div key={t.tier} style={{ flex: 1, padding: '8px 10px', borderRadius: 5,
+                        background: t.active ? 'rgba(41,98,255,0.10)' : 'var(--bg)',
+                        border: `1px solid ${t.active ? 'var(--blue)' : 'var(--border)'}` }}>
+                        <div style={{ fontSize: 10, fontWeight: 700, color: t.active ? 'var(--blue)' : 'var(--txt2)' }}>{t.name}</div>
+                        <div style={{ fontSize: 9, color: 'var(--txt3)', marginTop: 3 }}>
+                          ≥₹{(t.min_corpus / 100000).toFixed(0)}L · risk {t.max_risk_pct}%/trade · heat {t.max_heat_pct}%
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Go-Live criteria */}
+              {goLive && (
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt)' }}>Go-Live Criteria</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 3,
+                      color: goLive.eligible ? 'var(--up)' : 'var(--orange)',
+                      background: goLive.eligible ? 'rgba(38,166,154,0.12)' : 'rgba(255,152,0,0.12)' }}>
+                      {goLive.eligible ? 'ELIGIBLE' : 'NOT YET ELIGIBLE'}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                    {Object.entries(goLive.criteria || {}).map(([key, c]: [string, any]) => (
+                      <div key={key} style={{ background: 'var(--bg)', borderRadius: 5, padding: '8px 10px',
+                        border: `1px solid ${c.pass ? 'rgba(38,166,154,0.4)' : 'var(--border)'}` }}>
+                        <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+                          {key.replace(/_/g, ' ')}
+                        </div>
+                        <div style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: 13,
+                          color: c.pass ? 'var(--up)' : 'var(--txt)' }}>
+                          {c.actual} <span style={{ fontSize: 10, color: 'var(--txt3)', fontWeight: 400 }}>/ {c.required} req.</span>
+                          <span style={{ marginLeft: 5 }}>{c.pass ? '✓' : '✗'}</span>
+                        </div>
+                        {/* progress bar */}
+                        <div style={{ height: 4, borderRadius: 2, background: 'var(--border)', marginTop: 5, overflow: 'hidden' }}>
+                          <div style={{ height: '100%', borderRadius: 2, background: c.pass ? 'var(--up)' : 'var(--orange)',
+                            width: `${Math.min(100, (c.actual / c.required) * 100)}%` }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+                    <button onClick={toggleGoLive} disabled={glBusy || (!goLive.eligible && !goLive.go_live_requested)}
+                      className="tv-btn"
+                      style={{ padding: '6px 16px', fontWeight: 700,
+                        color: goLive.go_live_requested ? 'var(--dn)' : 'var(--txt2)',
+                        border: `1px solid ${goLive.go_live_requested ? 'rgba(239,83,80,0.5)' : 'var(--border2)'}`,
+                        opacity: (!goLive.eligible && !goLive.go_live_requested) ? 0.45 : 1 }}>
+                      {goLive.go_live_requested ? '⏹ Withdraw Go-Live Request' : '🔒 Request Go-Live'}
+                    </button>
+                    <span style={{ fontSize: 10, color: 'var(--txt3)', flex: 1 }}>{goLive.note}</span>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </section>
