@@ -1005,7 +1005,28 @@ export default function Positions() {
   const avgLoss      = losers.length > 0 ? Math.abs(losers.reduce((s, t) => s + (t.pnl ?? 0), 0) / losers.length) : 0
   const profitFactor = avgLoss > 0 ? (avgWin * winners.length) / (avgLoss * losers.length) : 0
 
-  const displayTrades = tab === 'open' ? openTrades : closedTrades
+  // ── Filters: date range (entry date), underlying, strategy ────────────────
+  const [fFrom,  setFFrom]  = useState('')
+  const [fTo,    setFTo]    = useState('')
+  const [fUl,    setFUl]    = useState('all')
+  const [fStrat, setFStrat] = useState('all')
+
+  const baseTrades = tab === 'open' ? openTrades : closedTrades
+  const ulOptions    = Array.from(new Set(baseTrades.map((t: any) => t.underlying).filter(Boolean))).sort()
+  const stratOptions = Array.from(new Set(baseTrades.map((t: any) => t.strategy).filter(Boolean))).sort()
+
+  const displayTrades = baseTrades.filter((t: any) => {
+    if (fUl !== 'all' && t.underlying !== fUl) return false
+    if (fStrat !== 'all' && t.strategy !== fStrat) return false
+    if (fFrom || fTo) {
+      const d = (t.entry_time ?? '').slice(0, 10)
+      if (fFrom && d < fFrom) return false
+      if (fTo && d > fTo) return false
+    }
+    return true
+  })
+  const filtersActive = fUl !== 'all' || fStrat !== 'all' || fFrom || fTo
+
   const COLS = tab === 'open'
     ? ['', 'Symbol', 'Type', 'Strike', 'Act', 'Entry → Live', 'Qty', 'Live P&L', 'Charges', 'Entry time', 'DTE', '']
     : ['', 'Symbol', 'Type', 'Strike', 'Act', 'Entry → Exit', 'Qty', 'Net P&L', 'Charges', 'Exit time', 'Reason', '']
@@ -1052,12 +1073,49 @@ export default function Positions() {
         </div>
       )}
 
+      {/* ── Filter bar ── */}
+      {baseTrades.length > 0 && (
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12,
+          padding: '8px 12px', background: 'var(--bg2)', borderRadius: 6, border: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Filter</span>
+          <label style={{ fontSize: 11, color: 'var(--txt3)' }}>From</label>
+          <input type="date" value={fFrom} onChange={e => setFFrom(e.target.value)}
+            style={{ fontSize: 11, padding: '3px 7px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }} />
+          <label style={{ fontSize: 11, color: 'var(--txt3)' }}>To</label>
+          <input type="date" value={fTo} onChange={e => setFTo(e.target.value)}
+            style={{ fontSize: 11, padding: '3px 7px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }} />
+          <select value={fUl} onChange={e => setFUl(e.target.value)}
+            style={{ fontSize: 11, padding: '4px 7px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }}>
+            <option value="all">All instruments</option>
+            {ulOptions.map(u => <option key={u} value={u}>{u}</option>)}
+          </select>
+          <select value={fStrat} onChange={e => setFStrat(e.target.value)}
+            style={{ fontSize: 11, padding: '4px 7px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }}>
+            <option value="all">All strategies</option>
+            {stratOptions.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          {filtersActive && (
+            <>
+              <span style={{ fontSize: 11, color: 'var(--txt2)' }}>
+                {new Set(displayTrades.map((x: any) => x.trade_group_id ?? x.id)).size} of {new Set(baseTrades.map((x: any) => x.trade_group_id ?? x.id)).size} positions
+              </span>
+              <button onClick={() => { setFFrom(''); setFTo(''); setFUl('all'); setFStrat('all') }}
+                style={{ fontSize: 11, color: 'var(--dn)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+                Clear
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {(openLoading || histLoading) && <div style={{ color: 'var(--txt2)', fontSize: 13 }}>Loading…</div>}
 
       {!openLoading && !histLoading && displayTrades.length === 0 && (
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--txt3)', fontSize: 13,
           background: 'var(--bg2)', borderRadius: 8, border: '1px solid var(--border)' }}>
-          {tab === 'open' ? 'No open positions. Signals ≥72% confidence are auto-traded in paper mode.' : 'No closed trades yet.'}
+          {filtersActive
+            ? 'No positions match the current filters.'
+            : tab === 'open' ? 'No open positions. Signals ≥72% confidence are auto-traded in paper mode.' : 'No closed trades yet.'}
         </div>
       )}
 
