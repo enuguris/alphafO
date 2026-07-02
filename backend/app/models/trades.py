@@ -81,6 +81,10 @@ class Trade(Base):
     notes:         Mapped[str|None]    = mapped_column(Text, nullable=True)
     created_at:    Mapped[datetime]    = mapped_column(DateTime, default=datetime.utcnow)
 
+    # Margin blocked for this leg (group max-risk / n_legs). Capital accounting
+    # is margin-style for defined-risk spreads: heat = max loss, not premium value.
+    margin_blocked: Mapped[float|None] = mapped_column(Float, nullable=True)
+
     # Price fidelity: where entry_price came from — kite | upstox | chain | bs
     # Only kite/upstox are real market fills; chain may be synthetic fallback.
     entry_price_source: Mapped[str|None] = mapped_column(String(20), nullable=True)

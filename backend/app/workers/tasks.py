@@ -621,10 +621,22 @@ async def _auto_paper_trade(signals, db):
                 await db.rollback()
                 continue
 
+            # ── Margin-style capital accounting ───────────────────────────────
+            # A defined-risk spread's capital at risk is its MAX LOSS
+            # (width − credit), not the premium value of both legs. Counting
+            # premium turnover as "deployed" let ONE spread eat the whole heat
+            # cap (₹104k blocked for a trade risking ₹2.8k).
+            _group_margin = max((_width - _real_credit), _width * 0.20) * quantity
+            _margin_per_leg = _group_margin / len(_priced_legs)
+
             # ── Pass 2: insert all legs with validated real prices ────────────
+            _net_cash = 0.0
             for _idx, (_leg, _leg_prem, _leg_price_src) in enumerate(_priced_legs):
                 _leg_charges = charges_for_entry_only(_leg_prem, quantity, _leg.action)
-                _leg_cost    = _leg_prem * quantity + _leg_charges
+                # Cash flow: BUY pays premium, SELL receives it; charges always paid
+                _leg_cash = (-(_leg_prem * quantity) if _leg.action == "BUY"
+                             else (_leg_prem * quantity)) - _leg_charges
+                _leg_cost = _margin_per_leg + _leg_charges   # capital consumed (margin basis)
 
                 if _leg.action == "BUY":
                     _leg_target = round(_leg_prem * 1.50, 2)
@@ -659,16 +671,20 @@ async def _auto_paper_trade(signals, db):
                     trade_group_id = group_id,
                     leg_role       = _leg.role,
                     entry_price_source = _leg_price_src,
+                    margin_blocked = round(_margin_per_leg, 2),
                 )
                 db.add(_leg_trade)
-                total_deployed += _leg_cost
+                total_deployed += _leg_cost          # margin + charges (heat basis)
+                _net_cash      += _leg_cash
 
+            # Cash: credit received minus charges flows INTO capital; the margin
+            # is blocked separately via capital_deployed (heat), like a broker.
             portfolio.capital_deployed += total_deployed
-            portfolio.capital_current  -= total_deployed
+            portfolio.capital_current  += _net_cash - _group_margin
 
             logger.info(
-                f"Composite [{_strat}]: {sig.underlying} "
-                f"{len(composite_legs)} legs | net {total_deployed:.0f} | group {group_id[:8]}"
+                f"Composite [{_strat}]: {sig.underlying} {len(composite_legs)} legs | "
+                f"margin ₹{_group_margin:.0f} | net cash ₹{_net_cash:+.0f} | group {group_id[:8]}"
             )
             try:
                 from app.core.risk.gate import record_deployed as _record_deployed
@@ -1337,11 +1353,23 @@ async def _close_trade(trade, exit_price: float, reason: str, db):
     result = await db.execute(select(Portfolio).where(Portfolio.mode == trade.mode))
     portfolio = result.scalar_one_or_none()
     if portfolio:
-        # capital was originally deducted as: trade_cost + entry_charges
-        # On close: return that full amount, then add net_pnl (which already nets exit charges)
-        recovered = trade_cost + entry_charges_paid + net_pnl
-        portfolio.capital_current  += recovered
-        portfolio.capital_deployed  = max(0, portfolio.capital_deployed - trade_cost)
+        if trade.margin_blocked is not None:
+            # Margin-style accounting (spreads): entry took net cash flow and
+            # blocked margin. On close: settle the exit leg's cash and release
+            # the margin. Lifecycle net effect on capital == net_pnl exactly.
+            exit_charges = max(0.0, charges.total - entry_charges_paid)
+            if trade.action == "BUY":
+                cash = exit_price * trade.quantity - exit_charges   # sell to close
+            else:
+                cash = -(exit_price * trade.quantity) - exit_charges  # buy to close
+            portfolio.capital_current  += cash + trade.margin_blocked
+            portfolio.capital_deployed  = max(
+                0, portfolio.capital_deployed - trade.margin_blocked - entry_charges_paid)
+        else:
+            # Legacy premium-value accounting (pre-margin trades)
+            recovered = trade_cost + entry_charges_paid + net_pnl
+            portfolio.capital_current  += recovered
+            portfolio.capital_deployed  = max(0, portfolio.capital_deployed - trade_cost)
         portfolio.daily_pnl         = (portfolio.daily_pnl or 0) + net_pnl
         portfolio.total_pnl         = (portfolio.total_pnl or 0) + net_pnl
         portfolio.total_trades   = (portfolio.total_trades or 0) + 1
@@ -2186,8 +2214,13 @@ def health_scan():
                         Trade.mode  == TradeMode.PAPER,
                     )
                 )).scalars().all()
+                # Margin-style heat; legacy rows fall back to premium value.
+                # (Old code also multiplied lot_size × quantity — double count,
+                # since quantity already includes lot_size.)
                 return sum(
-                    (t.entry_price or 0) * (t.lot_size or 1) * (t.quantity or 1)
+                    (t.margin_blocked + (t.charges_entry or 0.0))
+                    if t.margin_blocked is not None
+                    else (t.entry_price or 0) * (t.quantity or 1)
                     for t in rows
                 )
 

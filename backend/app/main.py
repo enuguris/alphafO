@@ -74,8 +74,13 @@ async def _sync_portfolio_heat_from_db() -> None:
         from app.core.risk.gate import record_deployed
 
         async with AsyncSessionLocal() as db:
+            # Margin-style: heat = blocked margin + entry charges per leg.
+            # Legacy rows (margin_blocked NULL) fall back to premium value.
             result = await db.execute(
-                select(func.sum(Trade.entry_price * Trade.quantity)).where(
+                select(func.sum(func.coalesce(
+                    Trade.margin_blocked + func.coalesce(Trade.charges_entry, 0.0),
+                    Trade.entry_price * Trade.quantity,
+                ))).where(
                     Trade.status == TradeStatus.OPEN,
                     Trade.mode   == TradeMode.PAPER,
                 )
