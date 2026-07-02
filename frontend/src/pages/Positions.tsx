@@ -623,6 +623,18 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
           {sym} — {strat}
           <span style={{ fontSize: 9, color: 'var(--txt3)', fontWeight: 400, marginLeft: 8 }}>{legs.length} legs · group {legs[0]?.trade_group_id?.slice(0,8)}</span>
           <div style={{ fontSize: 10, color: 'var(--txt3)', fontWeight: 400, marginTop: 3, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            {(() => {
+              const exp = legs[0]?.expiry_display ?? legs[0]?.expiry_date
+              const days = dte(legs[0]?.expiry_date)
+              if (!exp) return null
+              const dteColor = days != null && days <= 2 ? 'var(--dn)' : days != null && days <= 5 ? 'var(--orange)' : 'var(--txt2)'
+              return (
+                <span>
+                  ⏳ Expiry <b style={{ color: 'var(--txt2)' }}>{exp}</b>
+                  {days != null && isOpen && <b style={{ color: dteColor, marginLeft: 4 }}>({days}d left)</b>}
+                </span>
+              )
+            })()}
             <span>📍 Placed <b style={{ color: 'var(--txt2)' }}>{fmtDt(placedAt)}</b></span>
             {closedAt && <span>→ Closed <b style={{ color: 'var(--txt2)' }}>{fmtDt(closedAt)}</b></span>}
             {holdStr && <span style={{ color: 'var(--txt3)' }}>({holdStr} held)</span>}
