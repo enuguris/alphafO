@@ -240,20 +240,24 @@ async def run_credit_spread_backtest(
     from_date: str | None = None,
     to_date:   str | None = None,
     exit_regime: str = "classic",
+    strike_mode: str = "atm",
 ):
     """
     Explicitly run the credit spread backtest. Always executes fresh (no cache read).
     Stores result in cache for 24h so it survives page reloads.
     exit_regime: "classic" (TP 70% credit, SL 50% max risk, hold to expiry)
                  "managed" (TP 50% credit, SL 2x credit, time-exit at 50% DTE)
+    strike_mode: "atm" (sell at/near the money — max premium, ~50% POP)
+                 "otm" (sell the ~30-delta strike — less premium, higher POP)
     """
     import json as _json
-    CACHE_KEY = f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}:{exit_regime}"
+    CACHE_KEY = (f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}"
+                 f":{exit_regime}:{strike_mode}")
     CACHE_TTL = 86400   # 24 hours — survive page reloads
 
     import asyncio
     result = await asyncio.get_running_loop().run_in_executor(
-        None, _run_credit_spread_backtest, from_date, to_date, exit_regime
+        None, _run_credit_spread_backtest, from_date, to_date, exit_regime, strike_mode
     )
 
     try:
@@ -317,7 +321,8 @@ async def refresh_credit_spread_backtest(
 
 
 def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | None = None,
-                                exit_regime: str = "classic") -> dict:
+                                exit_regime: str = "classic",
+                                strike_mode: str = "atm") -> dict:
     """CPU-bound backtest logic — runs in executor thread."""
     import math
     from datetime import date, timedelta, datetime
@@ -362,17 +367,43 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
         return None
 
     # ── Leg builders ──────────────────────────────────────────────────────────
-    def build_legs(strategy, spot, iv, ivr, dte, step):
+    def _delta(S, K, T, r, sigma, opt):
+        if T <= 0 or sigma <= 0:
+            return 1.0 if (opt == "CE" and S > K) or (opt == "PE" and S < K) else 0.0
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        nd1 = _norm_cdf(d1)
+        return nd1 if opt == "CE" else abs(nd1 - 1.0)
+
+    def _delta_strike(spot, T, iv, opt, step, target=0.30):
+        """Walk OTM from ATM until |delta| <= target (~30-delta short strike)."""
+        atm = rnd_k(spot, step)
+        k = atm
+        for _ in range(20):
+            k_next = k + step if opt == "CE" else k - step
+            if _delta(spot, k_next, T, RF, iv, opt) < target:
+                return k_next
+            k = k_next
+        return k
+
+    def build_legs(strategy, spot, iv, ivr, dte, step, strike_mode="atm"):
         T = max(dte, 1) / 365.0
         offset = step if ivr > 0.55 else 0
         atm = rnd_k(spot, step)
         if strategy == "BullPut":
-            sk, wk = atm - offset, atm - offset - 2 * step
+            if strike_mode == "otm":
+                sk = _delta_strike(spot, T, iv, "PE", step)
+                wk = sk - 2 * step
+            else:
+                sk, wk = atm - offset, atm - offset - 2 * step
             sp, wp = bs(spot, sk, T, RF, iv, "PE"), bs(spot, wk, T, RF, iv, "PE")
             wp = min(wp, sp * 0.70)
             return [("PE","SELL",sk,round(sp,2)),("PE","BUY",wk,round(wp,2))]
         elif strategy == "BearCall":
-            sk, wk = atm + offset, atm + offset + 2 * step
+            if strike_mode == "otm":
+                sk = _delta_strike(spot, T, iv, "CE", step)
+                wk = sk + 2 * step
+            else:
+                sk, wk = atm + offset, atm + offset + 2 * step
             sp, wp = bs(spot, sk, T, RF, iv, "CE"), bs(spot, wk, T, RF, iv, "CE")
             wp = min(wp, sp * 0.70)
             return [("CE","SELL",sk,round(sp,2)),("CE","BUY",wk,round(wp,2))]
@@ -588,7 +619,7 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                 if strategy == "IronButterfly" and ivr <= 0.55:
                     continue
 
-                legs = build_legs(strategy, spot, iv, ivr, dte, step)
+                legs = build_legs(strategy, spot, iv, ivr, dte, step, strike_mode)
                 nc   = net_credit(legs)
                 sw   = spread_width(legs, step)
                 is_debit = nc < 0
