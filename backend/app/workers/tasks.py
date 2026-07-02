@@ -572,6 +572,7 @@ async def _auto_paper_trade(signals, db):
                 # 3. BS estimate from composite builder (last resort)
                 _leg_prem = _leg.estimated_premium
                 _leg_price_src = "bs"
+                _leg_token = None   # Kite instrument token for THIS leg's symbol
                 try:
                     _ll, _ls, _lt = await _fetch_option_ltp(
                         _entry_cfg, sig.underlying, _leg.expiry_iso,
@@ -580,6 +581,7 @@ async def _auto_paper_trade(signals, db):
                     if _ll and _ll > 0:
                         _leg_prem = _ll
                         _leg_price_src = _ls
+                        _leg_token = _lt   # non-None only when Kite priced this exact leg
                 except Exception:
                     pass
 
@@ -604,14 +606,14 @@ async def _auto_paper_trade(signals, db):
                     _leg_prem = round(max(0.05, _leg_prem - _slip), 2)
 
                 logger.debug(f"Leg {_leg.symbol} price={_leg_prem:.2f} source={_leg_price_src} slip={_slip:.2f}")
-                _priced_legs.append((_leg, _leg_prem, _leg_price_src))
+                _priced_legs.append((_leg, _leg_prem, _leg_price_src, _leg_token))
 
             # ── Credit/width sanity gate on REAL prices (backtest rule) ───────
             # Credit must be 20-80% of spread width. <20% isn't worth the risk;
             # >80% means near-zero max risk — a stale/synthetic pricing artifact.
-            _real_credit = sum(p if l.action == "SELL" else -p for l, p, _ in _priced_legs)
-            _sells = [l.strike for l, _, _ in _priced_legs if l.action == "SELL"]
-            _buys  = [l.strike for l, _, _ in _priced_legs if l.action == "BUY"]
+            _real_credit = sum(p if l.action == "SELL" else -p for l, p, _, _ in _priced_legs)
+            _sells = [l.strike for l, _, _, _ in _priced_legs if l.action == "SELL"]
+            _buys  = [l.strike for l, _, _, _ in _priced_legs if l.action == "BUY"]
             _width = abs(_sells[0] - _buys[0]) if _sells and _buys else 2 * _step
             if not (_width * 0.20 <= _real_credit <= _width * 0.80):
                 logger.info(
@@ -631,7 +633,7 @@ async def _auto_paper_trade(signals, db):
 
             # ── Pass 2: insert all legs with validated real prices ────────────
             _net_cash = 0.0
-            for _idx, (_leg, _leg_prem, _leg_price_src) in enumerate(_priced_legs):
+            for _idx, (_leg, _leg_prem, _leg_price_src, _leg_token) in enumerate(_priced_legs):
                 _leg_charges = charges_for_entry_only(_leg_prem, quantity, _leg.action)
                 # Cash flow: BUY pays premium, SELL receives it; charges always paid
                 _leg_cash = (-(_leg_prem * quantity) if _leg.action == "BUY"
@@ -667,7 +669,10 @@ async def _auto_paper_trade(signals, db):
                     status       = TradeStatus.OPEN, entry_time = now,
                     notes        = _leg_note,
                     capital_at_risk_pct = round((_leg_cost / max(portfolio.capital_current, 1)) * 100, 4),
-                    instrument_token = _entry_token if _idx == 0 else None,
+                    # Token for THIS leg's symbol only — assigning the signal's
+                    # token to leg 0 priced legs with the WRONG option's LTP
+                    # (CE closed at PE's price → phantom P&L)
+                    instrument_token = _leg_token,
                     trade_group_id = group_id,
                     leg_role       = _leg.role,
                     entry_price_source = _leg_price_src,
