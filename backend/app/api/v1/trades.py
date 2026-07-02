@@ -36,6 +36,7 @@ def _trade_dict(t: Trade) -> dict:
         "trade_group_id": t.trade_group_id,
         "leg_role": t.leg_role,
         "entry_price_source": t.entry_price_source,
+        "margin_blocked": t.margin_blocked,
         "strategy": (t.notes.split("STRATEGY:")[1].split("|")[0] if t.notes and "STRATEGY:" in t.notes else None),
     }
 

@@ -642,7 +642,20 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
         </td>
         <td colSpan={2} />
         <td style={{ padding: '9px 10px', fontFamily: 'monospace', fontSize: 11, color: 'var(--txt3)' }}>
-          <div>Net debit: ₹{Math.abs(netEntry).toFixed(0)}/unit</div>
+          <div>
+            {netEntry < 0 ? 'Credit' : 'Debit'}: ₹{Math.abs(netEntry).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+          </div>
+          {(() => {
+            const margin = legs.reduce((s, l) => s + (l.margin_blocked ?? 0), 0)
+            return margin > 0 ? (
+              <div style={{ marginTop: 2 }}>
+                <span style={{ color: 'var(--txt3)' }}>Capital </span>
+                <span style={{ color: 'var(--orange)', fontWeight: 700 }}>
+                  ₹{margin.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </span>
+              </div>
+            ) : null
+          })()}
           {spotPrices[sym] && (
             <div style={{ marginTop: 2 }}>
               <span style={{ color: 'var(--txt3)' }}>Spot </span>
@@ -831,7 +844,7 @@ function TradeRow({ t, spotPrices, onClose: closeFn }: {
 
 // ── Live P&L bar ──────────────────────────────────────────────────────────────
 
-function LivePnlBar({ trades, spotPrices }: { trades: any[]; spotPrices: Record<string, number> }) {
+function LivePnlBar({ trades, spotPrices, risk }: { trades: any[]; spotPrices: Record<string, number>; risk?: any }) {
   // ALL legs contribute to P&L (composite legs offset each other naturally)
   const totalPnl = trades.reduce((sum, t) => {
     const cur = t.current_price ?? livePrice(t, spotPrices) ?? t.entry_price
@@ -863,6 +876,36 @@ function LivePnlBar({ trades, spotPrices }: { trades: any[]; spotPrices: Record<
           <div style={{ fontFamily: 'monospace', fontWeight: 700, color: p >= 0 ? 'var(--up)' : 'var(--dn)', fontSize: 14 }}>{fmtINR(p)}</div>
         </div>
       ))}
+      {risk && (
+        <>
+          <div style={{ width: 1, height: 36, background: 'var(--border)' }} />
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Capital Used</div>
+            <div style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: 14, color: 'var(--orange)' }}>
+              {fmtINR(risk.capital_deployed)}
+              <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--txt3)', marginLeft: 4 }}>
+                / {fmtINR(risk.max_heat_limit)} cap
+              </span>
+            </div>
+            {/* heat bar */}
+            <div style={{ width: 120, height: 4, borderRadius: 2, background: 'var(--border)', marginTop: 3, overflow: 'hidden' }}>
+              <div style={{ height: '100%', borderRadius: 2,
+                width: `${Math.min(100, (risk.capital_deployed / Math.max(risk.max_heat_limit, 1)) * 100)}%`,
+                background: risk.capital_deployed / Math.max(risk.max_heat_limit, 1) > 0.8 ? 'var(--dn)' : 'var(--orange)' }} />
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Available</div>
+            <div style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: 14, color: 'var(--up)' }}>
+              {fmtINR(Math.max(0, risk.max_heat_limit - risk.capital_deployed))}
+              <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--txt3)', marginLeft: 4 }}>heat room</span>
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 2 }}>
+              Corpus {fmtINR(risk.capital)}
+            </div>
+          </div>
+        </>
+      )}
       <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
         <div style={{ width: 7, height: 7, borderRadius: '50%', background: liveCount > 0 ? 'var(--up)' : 'var(--txt3)', animation: liveCount > 0 ? 'pulse 1.5s infinite' : 'none' }} />
         <span style={{ fontSize: 10, color: 'var(--txt3)' }}>{liveCount > 0 ? 'Live prices via WebSocket' : 'Waiting for price feed…'}</span>
@@ -906,6 +949,13 @@ export default function Positions() {
     },
     refetchInterval: 10_000,
     enabled: tab === 'open',
+  })
+
+  // Capital used / available for the header bar
+  const { data: riskStatus } = useQuery({
+    queryKey: ['risk-status'],
+    queryFn: () => import('../api/client').then(m => m.api.get('/options/risk/status').then(r => r.data)),
+    refetchInterval: 30_000,
   })
 
   const { data: openData, isLoading: openLoading } = useQuery({
@@ -967,7 +1017,7 @@ export default function Positions() {
 
       {/* Live P&L bar — open tab only */}
       {tab === 'open' && openTrades.length > 0 && (
-        <LivePnlBar trades={openTrades} spotPrices={spotPrices} />
+        <LivePnlBar trades={openTrades} spotPrices={spotPrices} risk={riskStatus} />
       )}
 
       {/* History stats */}
