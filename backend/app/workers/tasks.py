@@ -484,6 +484,15 @@ async def _auto_paper_trade(signals, db):
             logger.warning(f"Composite strategy builder returned < 2 legs for {sig.underlying} — skipping")
             continue
 
+        # DTE cap: beyond ~21 days theta accrual is too slow to beat friction
+        # (observed live 2026-07-02: BANKNIFTY 26-DTE decay invisible vs mark
+        # noise). Skip entries whose nearest expiry is too far out — mostly
+        # affects BANKNIFTY right after monthly expiry rolls.
+        _min_dte = min(l.expiry_dte for l in composite_legs)
+        if _min_dte > 21:
+            logger.info(f"Skipping {sig.underlying}: nearest expiry {_min_dte}d out (>21d DTE cap)")
+            continue
+
         _strat = _strat_name(composite_legs)
         _rationale = _strat_rationale(composite_legs, _iv_rank, sig.direction or "long")
 
