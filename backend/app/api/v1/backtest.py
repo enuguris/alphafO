@@ -239,18 +239,21 @@ async def credit_spread_data_range():
 async def run_credit_spread_backtest(
     from_date: str | None = None,
     to_date:   str | None = None,
+    exit_regime: str = "classic",
 ):
     """
     Explicitly run the credit spread backtest. Always executes fresh (no cache read).
     Stores result in cache for 24h so it survives page reloads.
+    exit_regime: "classic" (TP 70% credit, SL 50% max risk, hold to expiry)
+                 "managed" (TP 50% credit, SL 2x credit, time-exit at 50% DTE)
     """
     import json as _json
-    CACHE_KEY = f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}"
+    CACHE_KEY = f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}:{exit_regime}"
     CACHE_TTL = 86400   # 24 hours — survive page reloads
 
     import asyncio
     result = await asyncio.get_running_loop().run_in_executor(
-        None, _run_credit_spread_backtest, from_date, to_date
+        None, _run_credit_spread_backtest, from_date, to_date, exit_regime
     )
 
     try:
@@ -313,7 +316,8 @@ async def refresh_credit_spread_backtest(
     return result
 
 
-def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | None = None) -> dict:
+def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | None = None,
+                                exit_regime: str = "classic") -> dict:
     """CPU-bound backtest logic — runs in executor thread."""
     import math
     from datetime import date, timedelta, datetime
@@ -608,9 +612,15 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                         continue
                     max_risk_per_unit = sw - nc
                     capital_used = round(max_risk_per_unit * lot_size, 2)
-                    target_pnl_pct = 0.06  # 6% target on capital
-                    take_profit = max(nc * 0.70, capital_used * target_pnl_pct / lot_size)
-                    stop_loss   = -(max_risk_per_unit * 0.50)
+                    if exit_regime == "managed":
+                        # High-win-rate regime: take profits early, cut losers at
+                        # a multiple of credit (not of max risk), never hold late
+                        take_profit = nc * 0.50
+                        stop_loss   = -(nc * 2.0)
+                    else:
+                        target_pnl_pct = 0.06  # 6% target on capital
+                        take_profit = max(nc * 0.70, capital_used * target_pnl_pct / lot_size)
+                        stop_loss   = -(max_risk_per_unit * 0.50)
 
                 exit_date = expiry
                 exit_reason = "expiry"
@@ -638,6 +648,12 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     elif unreal <= stop_loss:
                         pnl, exit_leg_prices = unreal, curr_prices
                         exit_date, exit_reason = sim_date, "stop_loss"
+                        break
+                    elif exit_regime == "managed" and not is_debit and sim_dte <= dte * 0.5:
+                        # Time exit: half the DTE burned without hitting either
+                        # threshold — take whatever is on the table, avoid gamma
+                        pnl, exit_leg_prices = unreal, curr_prices
+                        exit_date, exit_reason = sim_date, "time_exit"
                         break
                 else:
                     pnl, exit_leg_prices = intrinsic_legs(legs, float(closes[min(i+60, len(df)-1)]))
@@ -716,7 +732,7 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                 equity_pts.append({"date": t["exit_date"], "equity": round(equity, 2)})
 
             exit_counts = {
-                "take_profit": sum(1 for t in trades if t["exit_reason"] == "take_profit"),
+                "take_profit": sum(1 for t in trades if t["exit_reason"] in ("take_profit", "time_exit")),
                 "stop_loss":   sum(1 for t in trades if t["exit_reason"] == "stop_loss"),
                 "expiry":      sum(1 for t in trades if t["exit_reason"] == "expiry"),
             }
