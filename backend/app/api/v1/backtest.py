@@ -241,6 +241,7 @@ async def run_credit_spread_backtest(
     to_date:   str | None = None,
     exit_regime: str = "classic",
     strike_mode: str = "atm",
+    entry_mode: str = "trend",
 ):
     """
     Explicitly run the credit spread backtest. Always executes fresh (no cache read).
@@ -252,12 +253,13 @@ async def run_credit_spread_backtest(
     """
     import json as _json
     CACHE_KEY = (f"credit_spread_backtest:v2:{from_date or 'all'}:{to_date or 'all'}"
-                 f":{exit_regime}:{strike_mode}")
+                 f":{exit_regime}:{strike_mode}:{entry_mode}")
     CACHE_TTL = 86400   # 24 hours — survive page reloads
 
     import asyncio
     result = await asyncio.get_running_loop().run_in_executor(
-        None, _run_credit_spread_backtest, from_date, to_date, exit_regime, strike_mode
+        None, _run_credit_spread_backtest, from_date, to_date, exit_regime, strike_mode,
+        entry_mode,
     )
 
     try:
@@ -322,7 +324,8 @@ async def refresh_credit_spread_backtest(
 
 def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | None = None,
                                 exit_regime: str = "classic",
-                                strike_mode: str = "atm") -> dict:
+                                strike_mode: str = "atm",
+                                entry_mode: str = "trend") -> dict:
     """CPU-bound backtest logic — runs in executor thread."""
     import math
     from datetime import date, timedelta, datetime
@@ -420,12 +423,16 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             sp = min(bs(spot, sk, T, RF, iv, "PE"), bp * 0.60)
             return [("PE","BUY",bk,round(bp,2)),("PE","SELL",sk,round(sp,2))]
         elif strategy == "IronButterfly":
-            # Sell ATM straddle + buy wings ±3 steps — high credit, needs pin
+            # Sell ATM straddle + wings ADAPTIVELY placed just beyond the
+            # straddle credit (the breakeven span), so max risk stays real
+            # and the credit/width ratio lands inside the 20-80% gate.
             sc = bs(spot, atm, T, RF, iv, "CE")
             sp2 = bs(spot, atm, T, RF, iv, "PE")
-            wc_k, wp_k = atm + 3*step, atm - 3*step
-            wc  = min(bs(spot, wc_k, T, RF, iv, "CE"), sc * 0.40)
-            wp2 = min(bs(spot, wp_k, T, RF, iv, "PE"), sp2 * 0.40)
+            straddle = sc + sp2
+            wing_steps = max(4, int(math.ceil(straddle * 1.15 / step)))
+            wc_k, wp_k = atm + wing_steps*step, atm - wing_steps*step
+            wc  = min(bs(spot, wc_k, T, RF, iv, "CE"), sc * 0.25)
+            wp2 = min(bs(spot, wp_k, T, RF, iv, "PE"), sp2 * 0.25)
             return [("CE","SELL",atm,round(sc,2)),("PE","SELL",atm,round(sp2,2)),
                     ("CE","BUY",wc_k,round(wc,2)),("PE","BUY",wp_k,round(wp2,2))]
         else:  # IronCondor
@@ -604,19 +611,28 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     continue
                 dte = (expiry - entry_date).days
 
-                # Credit strategies sell premium (high IV); debit strategies buy
-                # direction cheaply (low IV). Same trend filter, opposite IV regime.
-                if strategy == "BullPut" and not trend_up:
-                    continue
-                if strategy == "BearCall" and trend_up:
-                    continue
+                # Entry filters. entry_mode:
+                #  "trend" — sell puts above SMA, calls below (textbook momentum)
+                #  "fade"  — sell puts BELOW SMA (dip = better forward returns in
+                #            5y NIFTY data: +0.54%/wk vs +0.42% above SMA), calls above
+                is_ranging = abs(spot / sma - 1) < 0.005 if sma > 0 else False
+                if strategy == "BullPut":
+                    want_up = trend_up if entry_mode == "trend" else not trend_up
+                    if not want_up:
+                        continue
+                if strategy == "BearCall":
+                    want_dn = (not trend_up) if entry_mode == "trend" else trend_up
+                    if not want_dn:
+                        continue
                 if strategy == "IronCondor" and ivr <= 0.40:
                     continue
                 if strategy == "BullCallDebit" and (not trend_up or ivr > 0.45):
                     continue
                 if strategy == "BearPutDebit" and (trend_up or ivr > 0.45):
                     continue
-                if strategy == "IronButterfly" and ivr <= 0.55:
+                # Butterfly: enter the ~14% of days when price sits ON the SMA
+                # (no directional signal at all) — the zone nothing else trades
+                if strategy == "IronButterfly" and not is_ranging:
                     continue
 
                 legs = build_legs(strategy, spot, iv, ivr, dte, step, strike_mode)

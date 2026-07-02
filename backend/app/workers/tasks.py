@@ -2296,7 +2296,24 @@ def health_scan():
         if active_signals == 0:
             issues.append("no_active_signals: scanner may be stalled — trigger scan-priority-15m")
 
-        # ── 5. Summary ────────────────────────────────────────────────────────
+        # ── 5. Trade integrity verification ──────────────────────────────────
+        # Automated version of the manual checks that caught the phantom-P&L
+        # bugs: structural P&L bounds, charge recomputation, price-swap
+        # detection, group atomicity. Violations are surfaced, never silently
+        # fixed — a wrong number must be investigated, not papered over.
+        integrity_violations = _run_async(_verify_trade_integrity())
+        for v in integrity_violations:
+            issues.append(f"integrity: {v}")
+        try:
+            import json as _ij
+            r.setex("trade_integrity:last", 3600, _ij.dumps({
+                "violations": integrity_violations,
+                "checked_at_ist": (_dt.now(_tz.utc) + _td(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M IST"),
+            }))
+        except Exception:
+            pass
+
+        # ── 6. Summary ────────────────────────────────────────────────────────
         status = "ok" if not issues else "degraded"
         result = {
             "status":         status,
@@ -2320,3 +2337,109 @@ def health_scan():
     except Exception as exc:
         logger.error(f"health-scan failed: {exc}", exc_info=True)
         return {"status": "error", "error": str(exc)}
+
+
+async def _verify_trade_integrity() -> list[str]:
+    """
+    Verify every recent trade's numbers are arithmetically possible.
+    Returns a list of human-readable violations (empty = all good).
+
+    Checks (each one has caught a real bug before):
+      1. Group P&L bounds — a spread can never make more than its credit
+         or lose more than width−credit (catches wrong-instrument pricing)
+      2. Charges recomputation — stored charges must match calculate_charges
+         re-run on the same inputs (catches rate drift)
+      3. pnl == gross − charges consistency per closed leg
+      4. CE/PE price-swap detection — same-strike same-expiry CE and PE
+         having crossed prices vs entry (catches token mix-ups)
+      5. Group atomicity — all legs of a group must share OPEN/closed state
+      6. Price sanity — entry/exit in (0, 20% of strike]
+    """
+    from sqlalchemy import select as _sel
+    from app.database import AsyncSessionLocal
+    from app.models.trades import Trade, TradeStatus, TradeMode
+    from app.core.charges import calculate_charges
+    from collections import defaultdict
+
+    violations: list[str] = []
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            _sel(Trade).where(
+                Trade.mode == TradeMode.PAPER,
+                Trade.status.in_([TradeStatus.OPEN, TradeStatus.CLOSED]),
+            ).order_by(Trade.entry_time.desc()).limit(200)
+        )).scalars().all()
+
+    groups: dict[str, list] = defaultdict(list)
+    for t in rows:
+        if t.trade_group_id:
+            groups[t.trade_group_id].append(t)
+
+    for gid, legs in groups.items():
+        g = gid[:8]
+
+        # 5. Atomicity: no group may be half-open
+        states = {str(t.status.value if hasattr(t.status, "value") else t.status) for t in legs}
+        if len(states) > 1:
+            violations.append(f"group {g}: legs in mixed states {states} — atomicity broken")
+
+        # 1. Structural P&L bounds (closed groups)
+        closed = [t for t in legs if t.exit_price is not None and t.pnl is not None]
+        if len(closed) == len(legs) and len(legs) >= 2:
+            qty = legs[0].quantity or 1
+            sells = [t for t in legs if t.action == "SELL"]
+            buys  = [t for t in legs if t.action == "BUY"]
+            if sells and buys and sells[0].strike and buys[0].strike:
+                width  = abs(sells[0].strike - buys[0].strike)
+                credit = sum(t.entry_price for t in sells) - sum(t.entry_price for t in buys)
+                group_pnl = sum(t.pnl for t in legs)
+                max_profit = credit * qty * 1.05 + 50          # 5% + ₹50 tolerance
+                max_loss   = (width - credit) * qty * 1.05 + 50
+                if group_pnl > max_profit:
+                    violations.append(
+                        f"group {g}: pnl ₹{group_pnl:.0f} EXCEEDS max profit ₹{credit*qty:.0f} — pricing corrupt")
+                if group_pnl < -max_loss:
+                    violations.append(
+                        f"group {g}: loss ₹{group_pnl:.0f} EXCEEDS max loss ₹{-(width-credit)*qty:.0f} — pricing corrupt")
+
+    for t in rows:
+        sym = t.symbol
+        # 6. Price sanity
+        for label, px in (("entry", t.entry_price), ("exit", t.exit_price)):
+            if px is not None and t.strike and not (0 < px <= t.strike * 0.20):
+                violations.append(f"{sym} #{t.id}: {label} price ₹{px} implausible for strike {t.strike:.0f}")
+
+        # 2+3. Charges + P&L recomputation on closed legs
+        if t.status == TradeStatus.CLOSED and t.exit_price is not None and t.pnl is not None:
+            c = calculate_charges(t.entry_price, t.exit_price, t.quantity or 1, t.action or "BUY")
+            if t.charges_total is not None and abs(c.total - t.charges_total) > max(1.0, c.total * 0.02):
+                violations.append(
+                    f"{sym} #{t.id}: stored charges ₹{t.charges_total:.2f} ≠ recomputed ₹{c.total:.2f}")
+            gross = ((t.exit_price - t.entry_price) if t.action == "BUY"
+                     else (t.entry_price - t.exit_price)) * (t.quantity or 1)
+            expect_pnl = gross - c.total
+            if abs((t.pnl or 0) - expect_pnl) > max(5.0, abs(expect_pnl) * 0.02):
+                violations.append(
+                    f"{sym} #{t.id}: pnl ₹{t.pnl:.2f} ≠ gross−charges ₹{expect_pnl:.2f}")
+
+    # 4. CE/PE swap heuristic: same strike+expiry, both legs moved >15% in
+    # opposite directions AND each leg's current price is within 3% of the
+    # OTHER leg's entry — the signature of a token mix-up.
+    by_key: dict[tuple, list] = defaultdict(list)
+    for t in rows:
+        if t.status == TradeStatus.OPEN and t.strike and t.option_type and t.current_price:
+            by_key[(t.underlying, t.strike, t.expiry_date)].append(t)
+    for key, pair in by_key.items():
+        ces = [t for t in pair if t.option_type == "CE"]
+        pes = [t for t in pair if t.option_type == "PE"]
+        if ces and pes:
+            ce, pe = ces[0], pes[0]
+            if (abs(ce.current_price - pe.entry_price) < pe.entry_price * 0.03 and
+                    abs(pe.current_price - ce.entry_price) < ce.entry_price * 0.03 and
+                    abs(ce.current_price - ce.entry_price) > ce.entry_price * 0.15):
+                violations.append(
+                    f"{ce.symbol}/{pe.symbol}: CE and PE prices appear SWAPPED (token mix-up?)")
+
+    if violations:
+        logger.warning(f"TRADE INTEGRITY violations: {violations}")
+    return violations

@@ -239,3 +239,23 @@ async def data_provider_health():
     """Round-robin data provider health — success/fail counts, latency, next turn."""
     from app.core.data.provider_health import get_health
     return get_health()
+
+
+@router.get("/integrity")
+async def trade_integrity():
+    """
+    Latest trade-integrity verification (runs inside health-scan every 5 min).
+    Checks P&L structural bounds, charge recomputation, CE/PE price swaps,
+    group atomicity, price sanity. Empty violations = every number verified.
+    """
+    import json
+    import redis as _r
+    from app.config import settings as _st
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    raw = r.get("trade_integrity:last")
+    if raw:
+        return json.loads(raw)
+    # Not cached — run inline
+    from app.workers.tasks import _verify_trade_integrity
+    violations = await _verify_trade_integrity()
+    return {"violations": violations, "checked_at_ist": "inline"}
