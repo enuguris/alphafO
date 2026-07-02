@@ -160,19 +160,24 @@ async def pre_market_briefing(db: AsyncSession = Depends(get_db)):
         fii_df = await asyncio.get_running_loop().run_in_executor(None, fetch_fii_fo_data)
         if fii_df is not None and not fii_df.empty:
             latest = fii_df.iloc[-1]
+            # fii_net_idx is net index-futures CONTRACTS (NSE participant OI
+            # file), not crores. FII running 100-300k net short contracts is
+            # structurally normal — signal on the level, not tiny thresholds.
             net = float(latest.get("fii_net_idx", 0))
-            if net > 2000:
+            if net > 50_000:
                 fii_signal = "FII strong buyers — bullish"
-            elif net > 500:
+            elif net > 10_000:
                 fii_signal = "FII net long — mild bullish"
-            elif net > -500:
+            elif net > -50_000:
                 fii_signal = "FII neutral"
-            elif net > -2000:
+            elif net > -150_000:
                 fii_signal = "FII net short — mild bearish"
             else:
-                fii_signal = "FII strong sellers — bearish"
+                fii_signal = "FII heavily net short — bearish"
             fii_data = {
-                "net_cr": round(net, 0),
+                "net_contracts": round(net, 0),
+                "net_cr": round(net, 0),   # legacy key kept for older UI builds
+                "unit": "contracts",
                 "signal": fii_signal,
                 "date": str(latest.get("date", ""))[:10],
             }

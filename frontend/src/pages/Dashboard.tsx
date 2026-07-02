@@ -1024,11 +1024,11 @@ export default function Dashboard() {
 
                     {/* FII */}
                     <div className="tv-card" style={{ padding: 12 }}>
-                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>FII F&O Net</div>
+                      <div style={{ fontSize: 10, color: 'var(--txt3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>FII Index Futures Net</div>
                       {preMarket.fii ? (
                         <>
                           <div className="mono" style={{ fontSize: 18, fontWeight: 700, color: preMarket.fii.net_cr > 0 ? 'var(--up)' : 'var(--dn)' }}>
-                            {preMarket.fii.net_cr > 0 ? '+' : ''}{preMarket.fii.net_cr.toLocaleString('en-IN')} Cr
+                            {preMarket.fii.net_cr > 0 ? '+' : ''}{preMarket.fii.net_cr.toLocaleString('en-IN')} <span style={{ fontSize: 11, fontWeight: 400 }}>contracts</span>
                           </div>
                           <div style={{ fontSize: 10, color: 'var(--txt2)', marginTop: 4 }}>{preMarket.fii.signal}</div>
                           {preMarket.fii.date && <div style={{ fontSize: 10, color: 'var(--txt3)', marginTop: 2 }}>as of {preMarket.fii.date}</div>}

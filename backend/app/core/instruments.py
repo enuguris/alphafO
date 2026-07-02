@@ -30,8 +30,8 @@ class Instrument(TypedDict):
 INDICES: list[Instrument] = [
     # lot_size revised Oct 2024 (SEBI ≥₹15L contract value mandate)
     # NIFTY: 65 confirmed by user Jul 2026. BANKNIFTY: 30 estimated — verify via `verify-lot-sizes` task.
-    {"sym": "NIFTY",      "name": "Nifty 50",        "sector": "Index",   "lot_size": 65,  "base_price": 24800,  "expiry_type": "weekly"},
-    {"sym": "BANKNIFTY",  "name": "Bank Nifty",       "sector": "Index",   "lot_size": 30,  "base_price": 57000,  "expiry_type": "weekly"},
+    {"sym": "NIFTY",      "name": "Nifty 50",        "sector": "Index",   "lot_size": 65,  "base_price": 24100,  "expiry_type": "weekly"},
+    {"sym": "BANKNIFTY",  "name": "Bank Nifty",       "sector": "Index",   "lot_size": 30,  "base_price": 58150,  "expiry_type": "weekly"},
     {"sym": "FINNIFTY",   "name": "Fin Nifty",        "sector": "Index",   "lot_size": 65,  "base_price": 24100,  "expiry_type": "weekly"},
     {"sym": "MIDCPNIFTY", "name": "Midcap Nifty",     "sector": "Index",   "lot_size": 120, "base_price": 13500,  "expiry_type": "weekly"},
     {"sym": "SENSEX",     "name": "BSE Sensex",       "sector": "Index",   "lot_size": 20,  "base_price": 82000,  "expiry_type": "weekly"},

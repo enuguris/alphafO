@@ -239,8 +239,15 @@ All risk parameters (`max_portfolio_heat`, `max_daily_loss_pct`, `max_risk_per_t
 - Portfolio table stores mode as lowercase `'paper'` / `'live'` varchar
 - Use `WHERE mode='paper'` NOT `WHERE mode='PAPER'`
 
+### Container bind mount — IMPORTANT
+- `/app` in the backend container is **bind-mounted to `./backend`** — edits to local files are live in the container (restart to reload Python). `docker cp` is unnecessary; `docker exec rm -rf /app/<dir>` DELETES THE LOCAL DIRECTORY.
+
+### Unit tests
+- `backend/tests/` — run with `docker exec alphafo-backend-1 sh -c "cd /app && python -m pytest tests/ -q"`
+- Covers: charges (STT 0.1% sell-side), BS greeks (put-call parity, IV roundtrip), composite builder (structures, symbols, net credit), managed exit arithmetic + credit gate, data freshness (bhav/PCR/VIX ≤7 days old, BASE_PRICES within 20% of bhav close)
+
 ### PCR / Market data
-- PCR cache files live at `backend/app/market_data/bhav/pcr_NIFTY.csv` etc.
+- PCR cache files live at `backend/market_data/pcr_NIFTY.csv` (container `/app/market_data/pcr_NIFTY.csv`) — NOT in the bhav/ subdir
 - Bootstrap from existing bhav files: call `build_pcr_from_cached_bhav("NIFTY")`
 - FII cache (`fii_fo.csv`) populates via background NSE download — may take time
 

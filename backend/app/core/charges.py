@@ -48,7 +48,7 @@ def calculate_charges(
 
     NSE F&O options rates (Zerodha, 2025-26):
         Brokerage:          ₹20 per order or 0.03% of premium (lower), each leg
-        STT:                0.0125% on sell side premium (options sold to close)
+        STT:                0.1% on sell side premium (rate effective Oct 2024)
         Exchange txn charge:0.053% of total premium turnover (both legs)
         GST:                18% on (brokerage + exchange txn charge)
         SEBI charges:       ₹10 per crore of turnover
@@ -65,7 +65,7 @@ def calculate_charges(
     brokerage = brokerage_entry + brokerage_exit
 
     # ── STT ────────────────────────────────────────────────────────────────────
-    # 0.0125% on sell-side premium only
+    # 0.1% on sell-side premium (raised from 0.0625% effective 1 Oct 2024).
     # For BUY-to-open: sell happens at exit
     # For SELL-to-open: sell happens at entry
     if action.upper() == "BUY":
@@ -73,7 +73,7 @@ def calculate_charges(
     else:
         stt_turnover = entry_turnover     # sell to open
 
-    stt = stt_turnover * 0.000125
+    stt = stt_turnover * 0.001
 
     # ── Exchange transaction charge ────────────────────────────────────────────
     exchange_txn = total_turnover * 0.00053
