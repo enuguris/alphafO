@@ -1541,6 +1541,13 @@ async def _do_eod_close_intraday():
 
         closed = 0
         for trade in open_trades:
+            # Composite spreads are POSITIONAL by construction: defined-risk,
+            # margin-blocked, 7-26 DTE, with their own managed exits (TP/SL/
+            # half-DTE). Squaring them off same-day guaranteed a friction loss
+            # (~₹400-900/group) and made live holds 3h vs backtest 5-12 days.
+            if trade.trade_group_id:
+                continue
+
             sig = sig_map.get(trade.signal_id) if trade.signal_id else None
             style = sig.trading_style if sig else "intraday"  # default assume intraday
 
