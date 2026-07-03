@@ -634,6 +634,7 @@ function StrangleIntradaySection() {
   const [running, setRun]   = useState(false)
   const [err, setErr]       = useState<string | null>(null)
   const [showAll, setShowAll] = useState(false)
+  const [sortAsc, setSortAsc] = useState(false)   // false = newest first
 
   useEffect(() => {
     api.get('/backtest/strangle-intraday').then(r => { if (r.data?.trades) setData(r.data) }).catch(() => {})
@@ -649,8 +650,15 @@ function StrangleIntradaySection() {
     } finally { setRun(false) }
   }
 
-  const rows = (data?.trade_rows ?? [])
-  const visible = showAll ? rows : rows.slice(-10)
+  const rows = [...(data?.trade_rows ?? [])].sort((a: any, b: any) =>
+    sortAsc ? a.entry_date.localeCompare(b.entry_date) : b.entry_date.localeCompare(a.entry_date))
+  const visible = showAll ? rows : rows.slice(0, 10)
+
+  const dteOf = (t: any) => {
+    try {
+      return Math.round((new Date(t.expiry).getTime() - new Date(t.entry_date).getTime()) / 86400000)
+    } catch { return null }
+  }
 
   return (
     <div style={{ marginTop: 24, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8 }}>
@@ -698,17 +706,26 @@ function StrangleIntradaySection() {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                {['Entry', 'Exit', 'Spot', 'Strikes', 'PE in→out', 'CE in→out', 'Credit→Debit', 'Net P&L'].map(h => (
-                  <th key={h} style={{ padding: '4px 8px', textAlign: h === 'Entry' || h === 'Exit' || h === 'Strikes' ? 'left' : 'right',
+                <th onClick={() => setSortAsc(a => !a)}
+                  style={{ padding: '4px 8px', textAlign: 'left', color: 'var(--txt2)', fontWeight: 600,
+                    fontSize: 10, cursor: 'pointer', userSelect: 'none' }}
+                  title="Click to toggle sort order">
+                  Entry {sortAsc ? '▲' : '▼'}
+                </th>
+                {['Exit', 'Expiry (DTE)', 'Spot', 'Strikes', 'PE in→out', 'CE in→out', 'Credit→Debit', 'Net P&L'].map(h => (
+                  <th key={h} style={{ padding: '4px 8px', textAlign: ['Exit', 'Expiry (DTE)', 'Strikes'].includes(h) ? 'left' : 'right',
                     color: 'var(--txt3)', fontWeight: 500, fontSize: 10 }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {visible.slice().reverse().map((t: any, i: number) => (
+              {visible.map((t: any, i: number) => (
                 <tr key={i} style={{ borderBottom: '1px solid var(--border2)' }}>
                   <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--txt3)' }}>{t.entry_date}</td>
                   <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--txt3)' }}>{t.exit_date}</td>
+                  <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--orange)' }}>
+                    {t.expiry}{dteOf(t) != null && <span style={{ color: 'var(--txt3)' }}> ({dteOf(t)}d)</span>}
+                  </td>
                   <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'monospace', color: 'var(--txt2)' }}>{t.spot?.toLocaleString('en-IN')}</td>
                   <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--txt)' }}>{t.pe_strike}P / {t.ce_strike}C</td>
                   <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'monospace', color: 'var(--txt2)' }}>{t.pe_in} → {t.pe_out}</td>
