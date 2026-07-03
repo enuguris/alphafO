@@ -632,6 +632,35 @@ async def _auto_paper_trade(signals, db):
                 await db.rollback()
                 continue
 
+            # ── Dynamic lot sizing toward the heat budget (user: use 50% of
+            # capital). Each spread targets heat_cap / max_concurrent_spreads
+            # of margin, bounded by max_risk_per_trade and remaining heat room.
+            try:
+                from app.core.risk.gate import get_risk_params as _grp
+                import redis as _rl
+                from app.config import settings as _stl
+                _rp2 = _grp()
+                _cap = float(_rp2.get("paper_capital") or 1_000_000)
+                _heat_budget = _cap * float(_rp2.get("max_portfolio_heat") or 10) / 100.0
+                _max_spreads = max(1, int(_rp2.get("max_concurrent_trades") or 20) // 2)
+                _per_trade_target = min(
+                    _heat_budget / _max_spreads,
+                    _cap * float(_rp2.get("max_risk_per_trade") or 1) / 100.0,
+                )
+                _rr = _rl.from_url(_stl.redis_url, decode_responses=True)
+                _heat_used = float(_rr.get("daily_deployed") or 0)
+                _heat_room = max(0.0, _heat_budget - _heat_used)
+                _margin_per_lot = max((_width - _real_credit), _width * 0.20) * sig.lot_size
+                _lots = int(min(_per_trade_target, _heat_room) // _margin_per_lot)
+                _lots = max(1, min(_lots, 20))   # hard cap 20 lots/spread
+            except Exception as _se:
+                logger.warning(f"Lot sizing failed ({_se}) — defaulting to 1 lot")
+                _lots = 1
+            quantity = _lots * sig.lot_size
+            if _lots > 1:
+                logger.info(f"Sizing {sig.underlying} {_strat}: {_lots} lots "
+                            f"(target ₹{_per_trade_target:.0f}/trade, margin/lot ₹{_margin_per_lot:.0f})")
+
             # ── Margin-style capital accounting ───────────────────────────────
             # A defined-risk spread's capital at risk is its MAX LOSS
             # (width − credit), not the premium value of both legs. Counting
