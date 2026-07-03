@@ -469,16 +469,39 @@ async def _auto_paper_trade(signals, db):
         _iv_rank = getattr(sig, "iv_rank", 0.3) or 0.3
 
         _avail = _avail_exp(sig.underlying, date.today())
-        composite_legs = build_composite(
-            underlying        = sig.underlying,
-            spot              = _spot_now,
-            direction         = sig.direction or "long",
-            iv_rank           = _iv_rank,
-            iv                = _iv,
-            pattern_name      = sig.pattern_name,
-            available_expiries= _avail,
-            step              = _step,
-        )
+
+        # ── Live condor experiment (2026-07-03): every 3rd directional signal
+        # opens a skewed condor at 1 lot instead of a plain spread, so both
+        # structures face identical markets. Compare via strategy filter in
+        # Positions. BS backtest rejected condors; this tests REAL credits.
+        _is_condor_exp = False
+        if (sig.pattern_name or "").lower() not in ("iv_crush", "expiry_week"):
+            try:
+                import redis as _rc
+                from app.config import settings as _sc
+                _cnt = _rc.from_url(_sc.redis_url, decode_responses=True).incr("exp_condor_counter")
+                _is_condor_exp = (_cnt % 3 == 0)
+            except Exception:
+                pass
+
+        if _is_condor_exp:
+            from app.core.strategies.composite import build_skewed_condor
+            composite_legs = build_skewed_condor(
+                underlying=sig.underlying, spot=_spot_now,
+                direction=sig.direction or "long", iv=_iv, iv_rank=_iv_rank,
+                available_expiries=_avail, step=_step,
+            )
+        else:
+            composite_legs = build_composite(
+                underlying        = sig.underlying,
+                spot              = _spot_now,
+                direction         = sig.direction or "long",
+                iv_rank           = _iv_rank,
+                iv                = _iv,
+                pattern_name      = sig.pattern_name,
+                available_expiries= _avail,
+                step              = _step,
+            )
 
         if not composite_legs or len(composite_legs) < 2:
             logger.warning(f"Composite strategy builder returned < 2 legs for {sig.underlying} — skipping")
@@ -656,6 +679,8 @@ async def _auto_paper_trade(signals, db):
             except Exception as _se:
                 logger.warning(f"Lot sizing failed ({_se}) — defaulting to 1 lot")
                 _lots = 1
+            if _is_condor_exp:
+                _lots = 1   # experiments always run at minimum size
             quantity = _lots * sig.lot_size
             if _lots > 1:
                 logger.info(f"Sizing {sig.underlying} {_strat}: {_lots} lots "
