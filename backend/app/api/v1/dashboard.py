@@ -417,6 +417,7 @@ async def trading_report(db: AsyncSession = Depends(get_db)):
             Trade.mode   == TradeMode.PAPER,
             Trade.underlying.in_(focus),
             Trade.entry_price > 10,    # exclude ₹0.05 garbage from synthetic/expiry
+            func.coalesce(Trade.leg_role, "") != "manual",  # user's own broker trades excluded
         ).order_by(Trade.exit_time)
     )
     trades = all_q.scalars().all()

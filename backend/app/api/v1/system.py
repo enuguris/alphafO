@@ -259,3 +259,20 @@ async def trade_integrity():
     from app.workers.tasks import _verify_trade_integrity
     violations = await _verify_trade_integrity()
     return {"violations": violations, "checked_at_ist": "inline"}
+
+
+@router.get("/market-watch")
+async def market_watch(day: str | None = None):
+    """
+    Market/book snapshots recorded every 15 min on trading days (7-day retention).
+    day: YYYY-MM-DD, defaults to today (IST).
+    """
+    import json
+    from datetime import datetime, timedelta, timezone
+    import redis as _r
+    from app.config import settings as _st
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    if not day:
+        day = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    raw = r.lrange(f"market_watch:{day}", 0, -1)
+    return {"day": day, "snapshots": [json.loads(x) for x in raw], "count": len(raw)}

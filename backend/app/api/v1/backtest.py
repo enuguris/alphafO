@@ -392,12 +392,15 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
         T = max(dte, 1) / 365.0
         offset = step if ivr > 0.55 else 0
         atm = rnd_k(spot, step)
+        # "wide" variant: 4-step wings (200 pts NIFTY) — 2026 regime has median
+        # daily move 155 pts, larger than the classic 2-step width
+        wing_steps = 4 if strike_mode == "wide" else 2
         if strategy == "BullPut":
             if strike_mode == "otm":
                 sk = _delta_strike(spot, T, iv, "PE", step)
                 wk = sk - 2 * step
             else:
-                sk, wk = atm - offset, atm - offset - 2 * step
+                sk, wk = atm - offset, atm - offset - wing_steps * step
             sp, wp = bs(spot, sk, T, RF, iv, "PE"), bs(spot, wk, T, RF, iv, "PE")
             wp = min(wp, sp * 0.70)
             return [("PE","SELL",sk,round(sp,2)),("PE","BUY",wk,round(wp,2))]
@@ -406,10 +409,39 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                 sk = _delta_strike(spot, T, iv, "CE", step)
                 wk = sk + 2 * step
             else:
-                sk, wk = atm + offset, atm + offset + 2 * step
+                sk, wk = atm + offset, atm + offset + wing_steps * step
             sp, wp = bs(spot, sk, T, RF, iv, "CE"), bs(spot, wk, T, RF, iv, "CE")
             wp = min(wp, sp * 0.70)
             return [("CE","SELL",sk,round(sp,2)),("CE","BUY",wk,round(wp,2))]
+        elif strategy == "OvernightStrangle":
+            # User's live strategy (Jul 2026): sell ~2.8%-OTM strangle on the
+            # monthly (21-35 DTE), harvest one day of decay, exit next close.
+            # Far wings (12 steps) approximate the naked position for the engine.
+            pk = rnd_k(spot * 0.972, step)   # ~2.8% OTM put
+            ck = rnd_k(spot * 1.024, step)   # ~2.4% OTM call (mirrors user's strikes)
+            pw2, cw2 = pk - 12 * step, ck + 12 * step
+            sp_s = bs(spot, pk, T, RF, iv, "PE"); wp_s = min(bs(spot, pw2, T, RF, iv, "PE"), sp_s * 0.30)
+            sc_s = bs(spot, ck, T, RF, iv, "CE"); wc_s = min(bs(spot, cw2, T, RF, iv, "CE"), sc_s * 0.30)
+            return [("PE","SELL",pk,round(sp_s,2)),("PE","BUY",pw2,round(wp_s,2)),
+                    ("CE","SELL",ck,round(sc_s,2)),("CE","BUY",cw2,round(wc_s,2))]
+        elif strategy == "BullCondor":
+            # Skewed condor, bullish: main credit from near-ATM put spread +
+            # extra credit from an OTM call spread. Wins on up AND sideways;
+            # capped loss both directions.
+            ps, pw = atm - offset, atm - offset - 2 * step        # put side (main)
+            cs2, cw2 = atm + 2 * step, atm + 4 * step             # call side (kicker)
+            sp_p = bs(spot, ps, T, RF, iv, "PE"); wp_p = min(bs(spot, pw, T, RF, iv, "PE"), sp_p * 0.70)
+            sc_c = bs(spot, cs2, T, RF, iv, "CE"); wc_c = min(bs(spot, cw2, T, RF, iv, "CE"), sc_c * 0.70)
+            return [("PE","SELL",ps,round(sp_p,2)),("PE","BUY",pw,round(wp_p,2)),
+                    ("CE","SELL",cs2,round(sc_c,2)),("CE","BUY",cw2,round(wc_c,2))]
+        elif strategy == "BearCondor":
+            # Mirror: main credit from near-ATM call spread + OTM put spread kicker
+            cs2, cw2 = atm + offset, atm + offset + 2 * step
+            ps, pw = atm - 2 * step, atm - 4 * step
+            sc_c = bs(spot, cs2, T, RF, iv, "CE"); wc_c = min(bs(spot, cw2, T, RF, iv, "CE"), sc_c * 0.70)
+            sp_p = bs(spot, ps, T, RF, iv, "PE"); wp_p = min(bs(spot, pw, T, RF, iv, "PE"), sp_p * 0.70)
+            return [("CE","SELL",cs2,round(sc_c,2)),("CE","BUY",cw2,round(wc_c,2)),
+                    ("PE","SELL",ps,round(sp_p,2)),("PE","BUY",pw,round(wp_p,2))]
         elif strategy == "BullCallDebit":
             # Buy ATM CE, sell OTM CE 2 steps up — bullish, works when IV cheap
             bk, sk = atm, atm + 2 * step
@@ -588,7 +620,8 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             return 0.3 if hi == lo else (float(ivs[i]) - lo) / (hi - lo)
 
         strategies = ["BullPut", "BearCall", "IronCondor",
-                      "BullCallDebit", "BearPutDebit", "IronButterfly"]
+                      "BullCallDebit", "BearPutDebit", "IronButterfly",
+                      "BullCondor", "BearCondor", "OvernightStrangle"]
         last_entry = {s: -10 for s in strategies}
         all_trades: dict[str, list] = {s: [] for s in strategies}
 
@@ -603,28 +636,42 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             trend_up = spot > sma
 
             for strategy in strategies:
-                if i - last_entry[strategy] < 7:
+                _is_ons = strategy == "OvernightStrangle"
+                # OvernightStrangle enters EVERY day (user's daily-harvest thesis)
+                if i - last_entry[strategy] < (1 if _is_ons else 7):
                     continue
 
-                expiry = select_expiry(entry_date, min_dte=7)
+                expiry = select_expiry(entry_date, min_dte=(21 if _is_ons else 7))
                 if not expiry:
                     continue
                 dte = (expiry - entry_date).days
+
+                # Vol-clustering filter (entry_mode suffix "_calm"): 10y data
+                # shows the day after a >1.5% move is 71% more volatile than
+                # average — skip new entries in the storm.
+                if entry_mode.endswith("_calm"):
+                    if i >= 1 and abs(closes[i] / closes[i-1] - 1) > 0.015:
+                        continue
 
                 # Entry filters. entry_mode:
                 #  "trend" — sell puts above SMA, calls below (textbook momentum)
                 #  "fade"  — sell puts BELOW SMA (dip = better forward returns in
                 #            5y NIFTY data: +0.54%/wk vs +0.42% above SMA), calls above
                 is_ranging = abs(spot / sma - 1) < 0.005 if sma > 0 else False
+                _base_mode = entry_mode.replace("_calm", "")
                 if strategy == "BullPut":
-                    want_up = trend_up if entry_mode == "trend" else not trend_up
+                    want_up = trend_up if _base_mode == "trend" else not trend_up
                     if not want_up:
                         continue
                 if strategy == "BearCall":
-                    want_dn = (not trend_up) if entry_mode == "trend" else trend_up
+                    want_dn = (not trend_up) if _base_mode == "trend" else trend_up
                     if not want_dn:
                         continue
                 if strategy == "IronCondor" and ivr <= 0.40:
+                    continue
+                if strategy == "BullCondor" and not (trend_up if entry_mode == "trend" else not trend_up):
+                    continue
+                if strategy == "BearCondor" and (trend_up if entry_mode == "trend" else not trend_up):
                     continue
                 if strategy == "BullCallDebit" and (not trend_up or ivr > 0.45):
                     continue
@@ -655,7 +702,9 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     # Credit must be 20-80% of width. Below 20% isn't worth the
                     # risk; above 80% is a BS pricing artifact (near-zero max
                     # risk → absurd % returns) — no real market fills there.
-                    if nc < sw * 0.20 or nc > sw * 0.80:
+                    # (OvernightStrangle is exempt: far wings make credit/width
+                    # tiny by construction — that IS the naked-risk profile.)
+                    if not _is_ons and (nc < sw * 0.20 or nc > sw * 0.80):
                         continue
                     max_risk_per_unit = sw - nc
                     capital_used = round(max_risk_per_unit * lot_size, 2)
@@ -681,6 +730,13 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     if sim_iv > 2.0: sim_iv /= 100.0
                     sim_iv    = max(0.08, min(sim_iv, 0.80))
                     sim_dte   = (expiry - sim_date).days
+
+                    # OvernightStrangle: unconditional exit at the NEXT close —
+                    # models the user's book-profit-next-day discipline
+                    if _is_ons:
+                        pnl, exit_leg_prices = reprice_legs(legs, sim_spot, sim_dte, sim_iv)
+                        exit_date, exit_reason = sim_date, "time_exit"
+                        break
 
                     if sim_date >= expiry or sim_dte <= 0:
                         pnl, exit_leg_prices = intrinsic_legs(legs, sim_spot)

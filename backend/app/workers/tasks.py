@@ -469,16 +469,39 @@ async def _auto_paper_trade(signals, db):
         _iv_rank = getattr(sig, "iv_rank", 0.3) or 0.3
 
         _avail = _avail_exp(sig.underlying, date.today())
-        composite_legs = build_composite(
-            underlying        = sig.underlying,
-            spot              = _spot_now,
-            direction         = sig.direction or "long",
-            iv_rank           = _iv_rank,
-            iv                = _iv,
-            pattern_name      = sig.pattern_name,
-            available_expiries= _avail,
-            step              = _step,
-        )
+
+        # ── Live condor experiment (2026-07-03): every 3rd directional signal
+        # opens a skewed condor at 1 lot instead of a plain spread, so both
+        # structures face identical markets. Compare via strategy filter in
+        # Positions. BS backtest rejected condors; this tests REAL credits.
+        _is_condor_exp = False
+        if (sig.pattern_name or "").lower() not in ("iv_crush", "expiry_week"):
+            try:
+                import redis as _rc
+                from app.config import settings as _sc
+                _cnt = _rc.from_url(_sc.redis_url, decode_responses=True).incr("exp_condor_counter")
+                _is_condor_exp = (_cnt % 3 == 0)
+            except Exception:
+                pass
+
+        if _is_condor_exp:
+            from app.core.strategies.composite import build_skewed_condor
+            composite_legs = build_skewed_condor(
+                underlying=sig.underlying, spot=_spot_now,
+                direction=sig.direction or "long", iv=_iv, iv_rank=_iv_rank,
+                available_expiries=_avail, step=_step,
+            )
+        else:
+            composite_legs = build_composite(
+                underlying        = sig.underlying,
+                spot              = _spot_now,
+                direction         = sig.direction or "long",
+                iv_rank           = _iv_rank,
+                iv                = _iv,
+                pattern_name      = sig.pattern_name,
+                available_expiries= _avail,
+                step              = _step,
+            )
 
         if not composite_legs or len(composite_legs) < 2:
             logger.warning(f"Composite strategy builder returned < 2 legs for {sig.underlying} — skipping")
@@ -631,6 +654,37 @@ async def _auto_paper_trade(signals, db):
                 )
                 await db.rollback()
                 continue
+
+            # ── Dynamic lot sizing toward the heat budget (user: use 50% of
+            # capital). Each spread targets heat_cap / max_concurrent_spreads
+            # of margin, bounded by max_risk_per_trade and remaining heat room.
+            try:
+                from app.core.risk.gate import get_risk_params as _grp
+                import redis as _rl
+                from app.config import settings as _stl
+                _rp2 = _grp()
+                _cap = float(_rp2.get("paper_capital") or 1_000_000)
+                _heat_budget = _cap * float(_rp2.get("max_portfolio_heat") or 10) / 100.0
+                _max_spreads = max(1, int(_rp2.get("max_concurrent_trades") or 20) // 2)
+                _per_trade_target = min(
+                    _heat_budget / _max_spreads,
+                    _cap * float(_rp2.get("max_risk_per_trade") or 1) / 100.0,
+                )
+                _rr = _rl.from_url(_stl.redis_url, decode_responses=True)
+                _heat_used = float(_rr.get("daily_deployed") or 0)
+                _heat_room = max(0.0, _heat_budget - _heat_used)
+                _margin_per_lot = max((_width - _real_credit), _width * 0.20) * sig.lot_size
+                _lots = int(min(_per_trade_target, _heat_room) // _margin_per_lot)
+                _lots = max(1, min(_lots, 20))   # hard cap 20 lots/spread
+            except Exception as _se:
+                logger.warning(f"Lot sizing failed ({_se}) — defaulting to 1 lot")
+                _lots = 1
+            if _is_condor_exp:
+                _lots = 1   # experiments always run at minimum size
+            quantity = _lots * sig.lot_size
+            if _lots > 1:
+                logger.info(f"Sizing {sig.underlying} {_strat}: {_lots} lots "
+                            f"(target ₹{_per_trade_target:.0f}/trade, margin/lot ₹{_margin_per_lot:.0f})")
 
             # ── Margin-style capital accounting ───────────────────────────────
             # A defined-risk spread's capital at risk is its MAX LOSS
@@ -1230,6 +1284,11 @@ async def _do_mtm_update():
                 group_buckets[t.trade_group_id].append(t)
 
         for group_id, group_trades in group_buckets.items():
+            # User's own broker positions (manual tracking) are NEVER auto-
+            # closed — the system monitors them, the user manages them.
+            if any((t.leg_role or "") == "manual" for t in group_trades):
+                continue
+
             # Sum net cost (absolute) of the group at entry — this is our risk capital
             net_entry_cost = 0.0
             net_unrealized = 0.0
@@ -2312,6 +2371,23 @@ def health_scan():
         if active_signals == 0:
             issues.append("no_active_signals: scanner may be stalled — trigger scan-priority-15m")
 
+        # ── 4b. Real-tick heartbeat (market hours only) ───────────────────────
+        # If the Kite WebSocket dies, spot: keys silently degrade to synthetic
+        # random-walk values — wrong strikes for new entries. Flag staleness.
+        try:
+            _now_ist = _dt.now(_tz.utc) + _td(hours=5, minutes=30)
+            _mkt_open = (_now_ist.weekday() < 5 and
+                         (9, 20) <= (_now_ist.hour, _now_ist.minute) <= (15, 30))
+            if _mkt_open:
+                _hb = r.get("ticker:last_real_tick")
+                import time as _time
+                if not _hb or (_time.time() - float(_hb)) > 180:
+                    issues.append(
+                        "ticker_stale: no REAL Kite tick in >3 min during market hours — "
+                        "spot: keys may be synthetic; restart backend to reconnect WebSocket")
+        except Exception:
+            pass
+
         # ── 5. Trade integrity verification ──────────────────────────────────
         # Automated version of the manual checks that caught the phantom-P&L
         # bugs: structural P&L bounds, charge recomputation, price-swap
@@ -2459,3 +2535,67 @@ async def _verify_trade_integrity() -> list[str]:
     if violations:
         logger.warning(f"TRADE INTEGRITY violations: {violations}")
     return violations
+
+
+# ── Persistent market watch — snapshots every 15 min on trading days ─────────
+
+async def _do_market_watch_snapshot():
+    """
+    Record a market snapshot to Redis so learning survives across sessions:
+    spot levels, per-group unrealized P&L, closes so far, integrity status.
+    List key market_watch:YYYY-MM-DD (7-day TTL), one JSON entry per snapshot.
+    """
+    import json as _json
+    import redis as _r
+    from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2
+    from sqlalchemy import select as _sel, text as _text
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.trades import Trade, TradeStatus, TradeMode
+
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    now_ist = _dt2.now(_tz2.utc) + _td2(hours=5, minutes=30)
+    if now_ist.weekday() >= 5 or not ((9, 15) <= (now_ist.hour, now_ist.minute) <= (15, 35)):
+        return  # only during market hours on weekdays
+
+    snap = {"ts_ist": now_ist.strftime("%H:%M"),
+            "nifty": r.get("spot:NIFTY"), "banknifty": r.get("spot:BANKNIFTY"),
+            "real_ticks": bool(r.get("ticker:last_real_tick"))}
+
+    async with AsyncSessionLocal() as db:
+        open_rows = (await db.execute(
+            _sel(Trade).where(Trade.status == TradeStatus.OPEN, Trade.mode == TradeMode.PAPER)
+        )).scalars().all()
+        groups: dict = {}
+        for t in open_rows:
+            g = groups.setdefault((t.trade_group_id or "?")[:8], {"pnl": 0.0, "ul": t.underlying})
+            g["pnl"] += float(t.unrealized_pnl or 0)
+        snap["open_groups"] = {k: round(v["pnl"]) for k, v in groups.items()}
+
+        closed = (await db.execute(_text(
+            "SELECT COALESCE(ROUND(SUM(pnl)),0), count(DISTINCT trade_group_id), "
+            "COALESCE(string_agg(DISTINCT exit_reason, ','),'') "
+            "FROM trades WHERE status='CLOSED' AND exit_time >= CURRENT_DATE"))).first()
+        snap["closed_today"] = {"net": float(closed[0]), "groups": int(closed[1]), "reasons": closed[2]}
+
+    try:
+        integ = r.get("trade_integrity:last")
+        snap["integrity_violations"] = len(_json.loads(integ)["violations"]) if integ else None
+    except Exception:
+        snap["integrity_violations"] = None
+
+    key = f"market_watch:{now_ist.strftime('%Y-%m-%d')}"
+    r.rpush(key, _json.dumps(snap))
+    r.expire(key, 86400 * 7)
+    logger.info(f"market-watch snapshot: N={snap['nifty']} B={snap['banknifty']} "
+                f"open={len(snap['open_groups'])} closed_net={snap['closed_today']['net']}")
+
+
+@celery_app.task(name="workers.market_watch_snapshot")
+def market_watch_snapshot():
+    """Persist a market/book snapshot every 15 min on trading days."""
+    try:
+        _run_async(_do_market_watch_snapshot())
+        _stamp_task_run("workers.market_watch_snapshot")
+    except Exception as exc:
+        logger.error(f"market-watch snapshot failed: {exc}")

@@ -387,6 +387,7 @@ async def go_live_status(db: AsyncSession = Depends(get_db)):
                count(*) FILTER (WHERE entry_price_source IN ('kite','upstox')) AS real_priced
         FROM trades
         WHERE mode = 'PAPER' AND status IN ('CLOSED', 'EXPIRED') AND pnl IS NOT NULL
+          AND COALESCE(leg_role,'') != 'manual'
     """))).mappings().first()
 
     total = int(row["total"] or 0)

@@ -296,6 +296,10 @@ def max_loss(legs: list[Leg], step: int) -> float:
 
 def strategy_name(legs: list[Leg]) -> str:
     roles = {leg.role for leg in legs}
+    if any(r.startswith("bullcondor") for r in roles):
+        return "Bull Condor (exp)"
+    if any(r.startswith("bearcondor") for r in roles):
+        return "Bear Condor (exp)"
     if "condor_short_ce" in roles:
         return "Iron Condor"
     if "primary" in roles:
@@ -334,3 +338,56 @@ def strategy_rationale(legs: list[Leg], iv_rank: float, direction: str) -> str:
                 f"{int(b.strike) if b else '?'}CE. Profit if {legs[0].symbol[:10].rstrip('0')} "
                 f"stays below {int(s.strike) if s else '?'}. {nd_str}.")
     return f"{name}: {nd_str}."
+
+
+def build_skewed_condor(
+    underlying: str, spot: float, direction: str, iv: float, iv_rank: float,
+    available_expiries: list[dict], step: int = 50,
+) -> list[Leg]:
+    """
+    LIVE EXPERIMENT (2026-07-03): skewed condor — near-ATM main credit spread
+    in the signal direction + an OTM kicker spread on the other side.
+    Backtest (BS-priced) rejected this (PF 0.19-0.73); user wants a live-data
+    test since real chain credits may differ from BS. Runs at 1 lot only,
+    every 3rd directional signal, tagged bull/bear condor for comparison.
+    """
+    valid = [e for e in available_expiries if e["dte"] >= _MIN_DTE]
+    if not valid:
+        return []
+    if iv > 2.0:
+        iv = iv / 100.0
+    iv = max(0.08, min(iv, 0.80))
+    expiry = valid[0]
+    dte = expiry["dte"]
+    atm = _round_strike(spot, step)
+    offset = step if iv_rank > 0.55 else 0
+    tag = "bull" if direction == "long" else "bear"
+
+    if direction == "long":
+        main_s, main_w = atm - offset, atm - offset - 2 * step   # put credit spread
+        main_t = "PE"
+        kick_s, kick_w = atm + 2 * step, atm + 4 * step          # call kicker
+        kick_t = "CE"
+    else:
+        main_s, main_w = atm + offset, atm + offset + 2 * step   # call credit spread
+        main_t = "CE"
+        kick_s, kick_w = atm - 2 * step, atm - 4 * step          # put kicker
+        kick_t = "PE"
+
+    def _leg(strike, ot, action, role):
+        prem = _bs_premium(spot, strike, dte, iv, ot)
+        return Leg(strike=strike, option_type=ot, action=action,
+                   expiry_iso=expiry["date"], expiry_display=expiry["display"],
+                   expiry_dte=dte, role=role, estimated_premium=round(prem, 2),
+                   symbol=_build_symbol(underlying, expiry["date"], strike, ot))
+
+    legs = [
+        _leg(main_s, main_t, "SELL", f"{tag}condor_main_sell"),
+        _leg(main_w, main_t, "BUY",  f"{tag}condor_main_wing"),
+        _leg(kick_s, kick_t, "SELL", f"{tag}condor_kick_sell"),
+        _leg(kick_w, kick_t, "BUY",  f"{tag}condor_kick_wing"),
+    ]
+    # Wings must be cheaper than their shorts
+    legs[1].estimated_premium = round(min(legs[1].estimated_premium, legs[0].estimated_premium * 0.70), 2)
+    legs[3].estimated_premium = round(min(legs[3].estimated_premium, legs[2].estimated_premium * 0.70), 2)
+    return legs if net_credit(legs) > 0 else []
