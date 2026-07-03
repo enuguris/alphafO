@@ -392,12 +392,15 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
         T = max(dte, 1) / 365.0
         offset = step if ivr > 0.55 else 0
         atm = rnd_k(spot, step)
+        # "wide" variant: 4-step wings (200 pts NIFTY) — 2026 regime has median
+        # daily move 155 pts, larger than the classic 2-step width
+        wing_steps = 4 if strike_mode == "wide" else 2
         if strategy == "BullPut":
             if strike_mode == "otm":
                 sk = _delta_strike(spot, T, iv, "PE", step)
                 wk = sk - 2 * step
             else:
-                sk, wk = atm - offset, atm - offset - 2 * step
+                sk, wk = atm - offset, atm - offset - wing_steps * step
             sp, wp = bs(spot, sk, T, RF, iv, "PE"), bs(spot, wk, T, RF, iv, "PE")
             wp = min(wp, sp * 0.70)
             return [("PE","SELL",sk,round(sp,2)),("PE","BUY",wk,round(wp,2))]
@@ -406,7 +409,7 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                 sk = _delta_strike(spot, T, iv, "CE", step)
                 wk = sk + 2 * step
             else:
-                sk, wk = atm + offset, atm + offset + 2 * step
+                sk, wk = atm + offset, atm + offset + wing_steps * step
             sp, wp = bs(spot, sk, T, RF, iv, "CE"), bs(spot, wk, T, RF, iv, "CE")
             wp = min(wp, sp * 0.70)
             return [("CE","SELL",sk,round(sp,2)),("CE","BUY",wk,round(wp,2))]
