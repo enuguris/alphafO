@@ -608,6 +608,31 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
   const winLeg  = legs.find(l => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return livePnl(l, cur) > 0 })
   const lossLeg = legs.find(l => { const cur = l.current_price ?? livePrice(l, spotPrices) ?? l.entry_price; return livePnl(l, cur) < 0 })
 
+  // ── At-expiry projection (open groups) ─────────────────────────────────────
+  // Expiry P&L if spot stays at the current level (intrinsic values only),
+  // plus the structural max profit (= net credit) and max loss (= width−credit).
+  const expiryProj = (() => {
+    if (!isOpen) return null
+    const spot = spotPrices[sym]
+    const qty = legs[0]?.quantity ?? 1
+    const sells = legs.filter(l => l.action === 'SELL' && l.strike)
+    const buys  = legs.filter(l => l.action === 'BUY' && l.strike)
+    if (!sells.length || !buys.length) return null
+    const credit = sells.reduce((s, l) => s + l.entry_price, 0) - buys.reduce((s, l) => s + l.entry_price, 0)
+    const width  = Math.abs(sells[0].strike - buys[0].strike)
+    const maxProfit = credit * qty
+    const maxLoss   = (width - credit) * qty
+    let flat: number | null = null
+    if (spot) {
+      flat = legs.reduce((s, l) => {
+        const intrinsic = l.option_type === 'CE' ? Math.max(0, spot - l.strike) : Math.max(0, l.strike - spot)
+        const perUnit = l.action === 'SELL' ? (l.entry_price - intrinsic) : (intrinsic - l.entry_price)
+        return s + perUnit * (l.quantity ?? qty)
+      }, 0)
+    }
+    return { flat, maxProfit, maxLoss }
+  })()
+
   return (
     <>
       {/* Composite header row */}
@@ -636,6 +661,20 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
                 </span>
               )
             })()}
+            {expiryProj && (
+              <span title="P&L if the index stays at the current level until expiry (intrinsic only, before exit charges) · structural best/worst case">
+                🎯 At expiry:{' '}
+                {expiryProj.flat != null ? (
+                  <b style={{ color: expiryProj.flat >= 0 ? 'var(--up)' : 'var(--dn)' }}>
+                    {fmtINR(expiryProj.flat)}
+                  </b>
+                ) : <b style={{ color: 'var(--txt3)' }}>—</b>}
+                <span style={{ color: 'var(--txt3)', marginLeft: 4 }}>
+                  (max <span style={{ color: 'var(--up)' }}>+{fmtINR(expiryProj.maxProfit).replace('₹','₹')}</span>
+                  {' / '}<span style={{ color: 'var(--dn)' }}>−{fmtINR(expiryProj.maxLoss)}</span>)
+                </span>
+              </span>
+            )}
             <span>📍 Placed <b style={{ color: 'var(--txt2)' }}>{fmtDt(placedAt)}</b></span>
             {closedAt && <span>→ Closed <b style={{ color: 'var(--txt2)' }}>{fmtDt(closedAt)}</b></span>}
             {holdStr && <span style={{ color: 'var(--txt3)' }}>({holdStr} held)</span>}
