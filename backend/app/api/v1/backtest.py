@@ -1085,11 +1085,22 @@ async def run_strangle_intraday():
 
     async with AsyncSessionLocal() as db:
         cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
-    if not cfg or not cfg.access_token_enc:
-        raise _HE(400, "Kite credentials not configured")
+    if not cfg:
+        raise _HE(400, "Broker credentials not configured")
 
-    result = await asyncio.get_running_loop().run_in_executor(
-        None, _run_strangle_intraday, cfg.api_key, _dec(cfg.access_token_enc))
+    # Prefer Upstox Plus (expired contracts → 21-month window); fall back to
+    # Kite (active contracts only → ~5-week window).
+    result = None
+    if cfg.upstox_access_token_enc:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _run_strangle_upstox, _dec(cfg.upstox_access_token_enc))
+        if result.get("error"):
+            result = None
+    if result is None:
+        if not cfg.access_token_enc:
+            raise _HE(400, "No usable broker token (Upstox Plus or Kite)")
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _run_strangle_intraday, cfg.api_key, _dec(cfg.access_token_enc))
     try:
         r = _redis_conn()
         from datetime import datetime as _dtm, timedelta as _tdl2
@@ -1111,3 +1122,191 @@ async def get_strangle_intraday():
     except Exception:
         pass
     return {"trades": 0, "trade_rows": [], "cached": False}
+
+
+# ── Upstox Plus: expired-contract intraday strangle backtest (21 months) ─────
+
+def _run_strangle_upstox(token: str) -> dict:
+    """
+    Same overnight-strangle strategy, but on Upstox Plus expired-instrument
+    30-min candles — real traded prices back to Oct 2024, INCLUDING expired
+    contracts. Two variants: hold-to-next-close, and intraday 2x-credit stop.
+    """
+    import time as _time
+    from datetime import date as _d, timedelta as _tdl, datetime as _dtm
+    from collections import defaultdict
+    import httpx
+
+    LOT = 65
+    H = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    BASE = "https://api.upstox.com/v2"
+    IDX = "NSE_INDEX|Nifty 50"
+
+    def rnd50(x):
+        return round(x / 50) * 50
+
+    def charges(entry_turn, exit_turn):
+        brok = min(20.0, entry_turn * 0.0003) * 2 + min(20.0, exit_turn * 0.0003) * 2
+        return (brok + entry_turn * 0.001 + (entry_turn + exit_turn) * 0.00053
+                + (brok + (entry_turn + exit_turn) * 0.00053) * 0.18 + exit_turn * 0.00003)
+
+    client = httpx.Client(timeout=30, headers=H)
+
+    def get(url, **params):
+        for attempt in range(3):
+            try:
+                r = client.get(url, params=params or None)
+                if r.status_code == 429:
+                    _time.sleep(1.0)
+                    continue
+                return r.json() if r.status_code == 200 else None
+            except Exception:
+                _time.sleep(0.5)
+        return None
+
+    # 1. expired expiries → monthlies (last expiry within each month)
+    j = get(f"{BASE}/expired-instruments/expiries", instrument_key=IDX)
+    expiries = sorted(_d.fromisoformat(x) for x in (j or {}).get("data", []))
+    if not expiries:
+        return {"error": "Upstox expired-instruments unavailable (Plus plan / token?)", "trades": 0, "trade_rows": []}
+    monthlies = sorted({max(e for e in expiries if (e.year, e.month) == (m.year, m.month)) for m in expiries})
+
+    # 2. NIFTY index 30-min candles across the whole window (chunked by ~80 days)
+    start = expiries[0] - _tdl(days=70)
+    idx_candles = []
+    cur = start
+    while cur < _d.today():
+        to = min(cur + _tdl(days=80), _d.today())
+        j = get(f"{BASE}/historical-candle/{IDX}/30minute/{to}/{cur}")
+        idx_candles += (j or {}).get("data", {}).get("candles", [])
+        cur = to + _tdl(days=1)
+    by_day = defaultdict(list)
+    for c in idx_candles:   # [ts, o, h, l, c, v, oi]
+        ts = _dtm.fromisoformat(c[0]).replace(tzinfo=None)
+        by_day[ts.date()].append((ts, float(c[4])))
+    for d in by_day:
+        by_day[d].sort()
+    days = sorted(by_day.keys())
+
+    # 3. contracts per monthly expiry (instrument_key by strike/type) — cached
+    contract_cache: dict = {}
+
+    def contracts(exp: _d):
+        if exp not in contract_cache:
+            j = get(f"{BASE}/expired-instruments/option/contract",
+                    instrument_key=IDX, expiry_date=str(exp))
+            m = {}
+            for row in (j or {}).get("data", []):
+                m[(float(row.get("strike_price", 0)), row.get("instrument_type", ""))] = row["instrument_key"]
+            contract_cache[exp] = m
+        return contract_cache[exp]
+
+    # 4. option candles per contract — cached
+    cand_cache: dict = {}
+
+    def opt_candles(key: str, exp: _d):
+        if key not in cand_cache:
+            frm = exp - _tdl(days=70)
+            j = get(f"{BASE}/expired-instruments/historical-candle/{key}/30minute/{exp}/{frm}")
+            rows = []
+            for c in (j or {}).get("data", {}).get("candles", []):
+                ts = _dtm.fromisoformat(c[0]).replace(tzinfo=None)
+                rows.append((ts, float(c[4])))
+            rows.sort()
+            cand_cache[key] = rows
+        return cand_cache[key]
+
+    def px_at(rows, ts):
+        best = None
+        for t, px in rows:
+            if t <= ts:
+                best = px
+            else:
+                break
+        return best
+
+    trades, skipped = [], 0
+    for i, d in enumerate(days[:-1]):
+        nxt = days[i + 1]
+        ts_in, spot = by_day[d][-1]
+        exp = next((e for e in monthlies if 21 <= (e - d).days <= 60), None)
+        if exp is None:
+            skipped += 1
+            continue
+        cmap = contracts(exp)
+        pk, ck = float(rnd50(spot * 0.972)), float(rnd50(spot * 1.024))
+        kp, kc = cmap.get((pk, "PE")), cmap.get((ck, "CE"))
+        if not kp or not kc:
+            skipped += 1
+            continue
+        pe_rows, ce_rows = opt_candles(kp, exp), opt_candles(kc, exp)
+        ts_out = by_day[nxt][-1][0]
+        pe_in, ce_in = px_at(pe_rows, ts_in), px_at(ce_rows, ts_in)
+        pe_out, ce_out = px_at(pe_rows, ts_out), px_at(ce_rows, ts_out)
+        if None in (pe_in, ce_in, pe_out, ce_out) or pe_in < 2 or ce_in < 2:
+            skipped += 1
+            continue
+        credit, debit = pe_in + ce_in, pe_out + ce_out
+        net_hold = (credit - debit) * LOT - charges(credit * LOT, debit * LOT)
+
+        # 2x-credit stop scanned on next day's 30-min marks
+        stop_debit = None
+        for ts2, _ in by_day[nxt]:
+            p2, c2 = px_at(pe_rows, ts2), px_at(ce_rows, ts2)
+            if p2 is None or c2 is None:
+                continue
+            if p2 + c2 >= 2 * credit:
+                stop_debit = p2 + c2
+                break
+        debit_stop = stop_debit if stop_debit is not None else debit
+        net_stop = (credit - debit_stop) * LOT - charges(credit * LOT, debit_stop * LOT)
+
+        trades.append({
+            "entry_date": str(d), "exit_date": str(nxt), "spot": round(spot, 1),
+            "expiry": str(exp), "pe_strike": int(pk), "ce_strike": int(ck),
+            "pe_in": pe_in, "ce_in": ce_in, "pe_out": pe_out, "ce_out": ce_out,
+            "credit": round(credit, 2), "debit": round(debit, 2),
+            "net": round(net_hold, 2), "net_stop": round(net_stop, 2),
+            "stopped": stop_debit is not None, "win": net_hold > 0,
+        })
+
+    client.close()
+
+    def summarize(key):
+        nets = [t[key] for t in trades]
+        wins = [n for n in nets if n > 0]
+        loss = [n for n in nets if n <= 0]
+        eq = peak = dd = 0.0
+        for n in nets:
+            eq += n
+            peak = max(peak, eq)
+            dd = min(dd, eq - peak)
+        return {
+            "win_rate": round(len(wins) / len(nets) * 100, 1) if nets else 0,
+            "profit_factor": round(sum(wins) / abs(sum(loss)), 2) if loss else (99.0 if wins else 0),
+            "net_pnl": round(sum(nets), 2),
+            "avg_per_trade": round(sum(nets) / len(nets), 2) if nets else 0,
+            "worst": round(min(nets), 2) if nets else 0,
+            "max_drawdown": round(abs(dd), 2),
+        }
+
+    hold, stop = summarize("net"), summarize("net_stop")
+    eq2, curve = 0.0, []
+    for t in trades:
+        eq2 += t["net"]
+        curve.append({"date": t["exit_date"], "equity": round(eq2, 2)})
+
+    return {
+        "source": "upstox_plus_expired_30min",
+        "lot_size": LOT,
+        "window": {"from": str(days[0]) if days else None, "to": str(days[-1]) if days else None},
+        "trades": len(trades), "skipped_days": skipped,
+        **hold,
+        "stop_variant": stop,
+        "stopped_count": sum(1 for t in trades if t["stopped"]),
+        "equity_curve": curve,
+        "trade_rows": trades,
+        "note": (f"REAL Upstox 30-min prices incl. EXPIRED contracts — {len(trades)} trades over "
+                 f"{len(days)} sessions since Oct 2024. Stop variant: exit intraday when combined "
+                 f"premium ≥ 2× credit."),
+    }

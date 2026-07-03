@@ -745,6 +745,17 @@ function StrangleIntradaySection() {
               {showAll ? 'Show last 10' : `Show all ${rows.length} trades`}
             </button>
           )}
+          {data.stop_variant && (
+            <div style={{ marginTop: 10, padding: '8px 12px', background: 'var(--bg)', border: '1px solid var(--border)',
+              borderRadius: 6, fontSize: 11, color: 'var(--txt2)' }}>
+              <b>With 2× credit stop-loss:</b>{' '}
+              win {data.stop_variant.win_rate}% · PF {data.stop_variant.profit_factor} ·
+              net ₹{data.stop_variant.net_pnl?.toLocaleString('en-IN')} ·
+              worst ₹{data.stop_variant.worst?.toLocaleString('en-IN')} ·
+              maxDD ₹{data.stop_variant.max_drawdown?.toLocaleString('en-IN')}
+              <span style={{ color: 'var(--txt3)' }}> — stop triggered on {data.stopped_count} of {data.trades} trades</span>
+            </div>
+          )}
           <div style={{ marginTop: 10, fontSize: 10, color: 'var(--txt3)', lineHeight: 1.6 }}>{data.note}</div>
         </div>
       )}
