@@ -354,12 +354,21 @@ frontend/src/
 
 ---
 
-## Git Workflow
+## Git Workflow (updated 2026-07-03 per user)
 
-Always commit after changes with a descriptive message. Push after any significant feature or bugfix:
+Branch → verify → merge → tag. Rollback must always be one command away.
+
+1. **Feature branch per change-set**: `feat/<name>`, `fix/<name>`, `chore/<name>`
+2. **Verify before merge**: `docker exec alphafo-backend-1 sh -c "cd /app && python -m pytest tests/ -q"` green + `GET /api/v1/system/health` all ok
+3. **Merge with `--no-ff`** into main so each feature is one revertable merge commit; push main
+4. **Cut a release tag** after a verified milestone: `git tag -a v1.x.y -m "..." && git push origin --tags`
+5. **Rollback**: `git checkout v1.x.y && docker restart alphafo-backend-1 alphafo-celery-1 alphafo-celery-beat-1` — instant because containers bind-mount the source (frontend needs a `touch` on changed files for HMR)
+6. NEVER commit `generate_accesstoken.py` / `generate_session.sh` — they contain live API keys (gitignored)
 
 ```bash
-git add -A
-git commit -m "feat: description"
-git push origin main
+git checkout -b feat/my-change
+# ... edit, deploy via restart, verify ...
+git add <files> && git commit -m "feat: description"
+git checkout main && git merge --no-ff feat/my-change && git push origin main
+git tag -a v1.2.0 -m "milestone description" && git push origin --tags
 ```
