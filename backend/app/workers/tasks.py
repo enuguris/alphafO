@@ -1284,6 +1284,11 @@ async def _do_mtm_update():
                 group_buckets[t.trade_group_id].append(t)
 
         for group_id, group_trades in group_buckets.items():
+            # User's own broker positions (manual tracking) are NEVER auto-
+            # closed — the system monitors them, the user manages them.
+            if any((t.leg_role or "") == "manual" for t in group_trades):
+                continue
+
             # Sum net cost (absolute) of the group at entry — this is our risk capital
             net_entry_cost = 0.0
             net_unrealized = 0.0

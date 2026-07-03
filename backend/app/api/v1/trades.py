@@ -616,3 +616,64 @@ async def export_trades_csv(mode: str = "paper", db: AsyncSession = Depends(get_
     buf.seek(0)
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=alphafo_trades_{mode}.csv"})
+
+
+# ── Manual position tracking — mirror the user's OWN broker trades ────────────
+
+from pydantic import BaseModel as _BM
+
+
+class ManualLeg(_BM):
+    underlying: str
+    strike: float
+    option_type: str        # CE | PE
+    action: str             # BUY | SELL
+    expiry_date: str        # ISO
+    entry_price: float
+    lots: int = 1
+
+
+class ManualPosition(_BM):
+    name: str = "Manual Position"
+    legs: list[ManualLeg]
+
+
+@router.post("/manual")
+async def add_manual_position(body: ManualPosition, db: AsyncSession = Depends(get_db)):
+    """
+    Track a position the user placed in their OWN broker account.
+    MONITORING ONLY: marked-to-market by the MTM loop with real prices, but
+    exempt from ALL automated exits (leg_role='manual') and excluded from
+    paper-strategy statistics and the Go-Live evidence. Never places orders.
+    """
+    import uuid
+    from datetime import datetime as _dtm
+    from app.models.trades import TradeMode, TradeStatus
+    from app.core.instruments import get_lot_size
+    from app.core.strategies.composite import _build_symbol
+
+    gid = str(uuid.uuid4())
+    now = _dtm.utcnow()
+    created = []
+    for i, leg in enumerate(body.legs):
+        lot = get_lot_size(leg.underlying.upper())
+        sym = _build_symbol(leg.underlying.upper(), leg.expiry_date, leg.strike, leg.option_type.upper())
+        t = Trade(
+            mode=TradeMode.PAPER, symbol=sym, underlying=leg.underlying.upper(),
+            option_type=leg.option_type.upper(), strike=leg.strike, lot_size=lot,
+            expiry_date=leg.expiry_date,
+            expiry_display=leg.expiry_date,
+            action=leg.action.upper(), quantity=leg.lots * lot,
+            entry_price=leg.entry_price, current_price=leg.entry_price,
+            target_price=0.0, stop_loss=0.0,
+            status=TradeStatus.OPEN, entry_time=now,
+            entry_price_source="manual",
+            trade_group_id=gid, leg_role="manual",
+            notes=(f"STRATEGY:{body.name} (manual)|MANUAL: user's own broker trade, "
+                   f"tracking only — system will never auto-close|leg:{i+1}/{len(body.legs)}"),
+        )
+        db.add(t)
+        created.append(sym)
+    await db.commit()
+    return {"group_id": gid, "legs": created,
+            "note": "Tracked. MTM via real prices; NO automated exits; excluded from paper stats."}

@@ -413,6 +413,17 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             sp, wp = bs(spot, sk, T, RF, iv, "CE"), bs(spot, wk, T, RF, iv, "CE")
             wp = min(wp, sp * 0.70)
             return [("CE","SELL",sk,round(sp,2)),("CE","BUY",wk,round(wp,2))]
+        elif strategy == "OvernightStrangle":
+            # User's live strategy (Jul 2026): sell ~2.8%-OTM strangle on the
+            # monthly (21-35 DTE), harvest one day of decay, exit next close.
+            # Far wings (12 steps) approximate the naked position for the engine.
+            pk = rnd_k(spot * 0.972, step)   # ~2.8% OTM put
+            ck = rnd_k(spot * 1.024, step)   # ~2.4% OTM call (mirrors user's strikes)
+            pw2, cw2 = pk - 12 * step, ck + 12 * step
+            sp_s = bs(spot, pk, T, RF, iv, "PE"); wp_s = min(bs(spot, pw2, T, RF, iv, "PE"), sp_s * 0.30)
+            sc_s = bs(spot, ck, T, RF, iv, "CE"); wc_s = min(bs(spot, cw2, T, RF, iv, "CE"), sc_s * 0.30)
+            return [("PE","SELL",pk,round(sp_s,2)),("PE","BUY",pw2,round(wp_s,2)),
+                    ("CE","SELL",ck,round(sc_s,2)),("CE","BUY",cw2,round(wc_s,2))]
         elif strategy == "BullCondor":
             # Skewed condor, bullish: main credit from near-ATM put spread +
             # extra credit from an OTM call spread. Wins on up AND sideways;
@@ -610,7 +621,7 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
 
         strategies = ["BullPut", "BearCall", "IronCondor",
                       "BullCallDebit", "BearPutDebit", "IronButterfly",
-                      "BullCondor", "BearCondor"]
+                      "BullCondor", "BearCondor", "OvernightStrangle"]
         last_entry = {s: -10 for s in strategies}
         all_trades: dict[str, list] = {s: [] for s in strategies}
 
@@ -625,10 +636,12 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             trend_up = spot > sma
 
             for strategy in strategies:
-                if i - last_entry[strategy] < 7:
+                _is_ons = strategy == "OvernightStrangle"
+                # OvernightStrangle enters EVERY day (user's daily-harvest thesis)
+                if i - last_entry[strategy] < (1 if _is_ons else 7):
                     continue
 
-                expiry = select_expiry(entry_date, min_dte=7)
+                expiry = select_expiry(entry_date, min_dte=(21 if _is_ons else 7))
                 if not expiry:
                     continue
                 dte = (expiry - entry_date).days
@@ -689,7 +702,9 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     # Credit must be 20-80% of width. Below 20% isn't worth the
                     # risk; above 80% is a BS pricing artifact (near-zero max
                     # risk → absurd % returns) — no real market fills there.
-                    if nc < sw * 0.20 or nc > sw * 0.80:
+                    # (OvernightStrangle is exempt: far wings make credit/width
+                    # tiny by construction — that IS the naked-risk profile.)
+                    if not _is_ons and (nc < sw * 0.20 or nc > sw * 0.80):
                         continue
                     max_risk_per_unit = sw - nc
                     capital_used = round(max_risk_per_unit * lot_size, 2)
@@ -715,6 +730,13 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     if sim_iv > 2.0: sim_iv /= 100.0
                     sim_iv    = max(0.08, min(sim_iv, 0.80))
                     sim_dte   = (expiry - sim_date).days
+
+                    # OvernightStrangle: unconditional exit at the NEXT close —
+                    # models the user's book-profit-next-day discipline
+                    if _is_ons:
+                        pnl, exit_leg_prices = reprice_legs(legs, sim_spot, sim_dte, sim_iv)
+                        exit_date, exit_reason = sim_date, "time_exit"
+                        break
 
                     if sim_date >= expiry or sim_dte <= 0:
                         pnl, exit_leg_prices = intrinsic_legs(legs, sim_spot)
