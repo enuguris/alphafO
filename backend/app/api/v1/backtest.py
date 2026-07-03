@@ -222,17 +222,39 @@ async def save_backtest_result(name: str, from_date: str | None = None, to_date:
 
 @router.get("/credit-spreads/data-range")
 async def credit_spread_data_range():
-    """Return the available bhav data date range without running any backtest."""
+    """
+    Available bhav data range. Reading 700+ CSVs takes minutes — MUST run in
+    an executor (was blocking the event loop and freezing the whole app) and
+    is cached in Redis for 6h.
+    """
+    import json as _json
+    import asyncio
+
     try:
+        cached = _redis_conn().get("bhav_data_range")
+        if cached:
+            return _json.loads(cached)
+    except Exception:
+        pass
+
+    def _compute():
         from app.core.backtest.market_data import build_ohlcv_from_bhav
         import pandas as _pd
         df = build_ohlcv_from_bhav("NIFTY", rows=800)
         if df is not None and "timestamp" in df.columns:
             dates = _pd.to_datetime(df["timestamp"]).dt.date
             return {"data_start": str(dates.min()), "data_end": str(dates.max()), "bars": len(df)}
+        return {"data_start": None, "data_end": None, "bars": 0}
+
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, _compute)
+    except Exception:
+        result = {"data_start": None, "data_end": None, "bars": 0}
+    try:
+        _redis_conn().setex("bhav_data_range", 6 * 3600, _json.dumps(result))
     except Exception:
         pass
-    return {"data_start": None, "data_end": None, "bars": 0}
+    return result
 
 
 @router.post("/credit-spreads/run")
@@ -903,7 +925,7 @@ async def list_backtests(limit: int = 20, db: AsyncSession = Depends(get_db)):
     return {"results": [r.__dict__ for r in runs], "count": len(runs)}
 
 
-@router.get("/{run_id}")
+@router.get("/{run_id:int}")   # :int converter so /strangle-intraday isn't swallowed by this route
 async def get_backtest(run_id: int, db: AsyncSession = Depends(get_db)):
     q = select(BacktestRun).where(BacktestRun.id == run_id)
     result = await db.execute(q)
