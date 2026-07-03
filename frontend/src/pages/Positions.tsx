@@ -3,6 +3,7 @@ import { createChart } from 'lightweight-charts'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket } from '../api/client'
 import PayoffChart from '../components/PayoffChart'
+import MarketWatchPanel from '../components/MarketWatchPanel'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1048,6 +1049,9 @@ export default function Positions() {
           ))}
         </div>
       </div>
+
+      {/* Market watch — persistent 15-min snapshots visualized */}
+      {tab === 'open' && <MarketWatchPanel />}
 
       {/* Live P&L bar — open tab only */}
       {tab === 'open' && openTrades.length > 0 && (
