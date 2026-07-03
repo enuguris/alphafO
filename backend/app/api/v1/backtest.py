@@ -410,6 +410,24 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             sp, wp = bs(spot, sk, T, RF, iv, "CE"), bs(spot, wk, T, RF, iv, "CE")
             wp = min(wp, sp * 0.70)
             return [("CE","SELL",sk,round(sp,2)),("CE","BUY",wk,round(wp,2))]
+        elif strategy == "BullCondor":
+            # Skewed condor, bullish: main credit from near-ATM put spread +
+            # extra credit from an OTM call spread. Wins on up AND sideways;
+            # capped loss both directions.
+            ps, pw = atm - offset, atm - offset - 2 * step        # put side (main)
+            cs2, cw2 = atm + 2 * step, atm + 4 * step             # call side (kicker)
+            sp_p = bs(spot, ps, T, RF, iv, "PE"); wp_p = min(bs(spot, pw, T, RF, iv, "PE"), sp_p * 0.70)
+            sc_c = bs(spot, cs2, T, RF, iv, "CE"); wc_c = min(bs(spot, cw2, T, RF, iv, "CE"), sc_c * 0.70)
+            return [("PE","SELL",ps,round(sp_p,2)),("PE","BUY",pw,round(wp_p,2)),
+                    ("CE","SELL",cs2,round(sc_c,2)),("CE","BUY",cw2,round(wc_c,2))]
+        elif strategy == "BearCondor":
+            # Mirror: main credit from near-ATM call spread + OTM put spread kicker
+            cs2, cw2 = atm + offset, atm + offset + 2 * step
+            ps, pw = atm - 2 * step, atm - 4 * step
+            sc_c = bs(spot, cs2, T, RF, iv, "CE"); wc_c = min(bs(spot, cw2, T, RF, iv, "CE"), sc_c * 0.70)
+            sp_p = bs(spot, ps, T, RF, iv, "PE"); wp_p = min(bs(spot, pw, T, RF, iv, "PE"), sp_p * 0.70)
+            return [("CE","SELL",cs2,round(sc_c,2)),("CE","BUY",cw2,round(wc_c,2)),
+                    ("PE","SELL",ps,round(sp_p,2)),("PE","BUY",pw,round(wp_p,2))]
         elif strategy == "BullCallDebit":
             # Buy ATM CE, sell OTM CE 2 steps up — bullish, works when IV cheap
             bk, sk = atm, atm + 2 * step
@@ -588,7 +606,8 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
             return 0.3 if hi == lo else (float(ivs[i]) - lo) / (hi - lo)
 
         strategies = ["BullPut", "BearCall", "IronCondor",
-                      "BullCallDebit", "BearPutDebit", "IronButterfly"]
+                      "BullCallDebit", "BearPutDebit", "IronButterfly",
+                      "BullCondor", "BearCondor"]
         last_entry = {s: -10 for s in strategies}
         all_trades: dict[str, list] = {s: [] for s in strategies}
 
@@ -625,6 +644,10 @@ def _run_credit_spread_backtest(from_date: str | None = None, to_date: str | Non
                     if not want_dn:
                         continue
                 if strategy == "IronCondor" and ivr <= 0.40:
+                    continue
+                if strategy == "BullCondor" and not (trend_up if entry_mode == "trend" else not trend_up):
+                    continue
+                if strategy == "BearCondor" and (trend_up if entry_mode == "trend" else not trend_up):
                     continue
                 if strategy == "BullCallDebit" and (not trend_up or ivr > 0.45):
                     continue
