@@ -136,5 +136,12 @@ celery_app.conf.update(
             "task": "workers.health_scan",
             "schedule": crontab(minute="*/5"),
         },
+        # Market watch — persists a market/book snapshot every 15 min on
+        # trading days so learning survives across assistant sessions.
+        # Read via GET /api/v1/system/market-watch (Redis market_watch:YYYY-MM-DD).
+        "market-watch": {
+            "task": "workers.market_watch_snapshot",
+            "schedule": crontab(minute="*/15", hour="9-15", day_of_week="1-5"),
+        },
     },
 )

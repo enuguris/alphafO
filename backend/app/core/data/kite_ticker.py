@@ -332,6 +332,11 @@ class KiteTickerService:
                 "ts":  str(int(time.time() * 1000)),
             }, maxlen=STREAM_MAXLEN, approximate=True)
 
+        # Heartbeat: proves REAL Kite ticks are flowing (never set by the
+        # synthetic fallback). health-scan flags staleness during market hours
+        # — a dead WebSocket otherwise degrades spot: keys to random-walk
+        # values silently (bit us 2026-07-03 morning).
+        pipe.set("ticker:last_real_tick", str(int(time.time())), ex=600)
         pipe.execute()
 
     # ── Simulated tick fallback ───────────────────────────────────────────
