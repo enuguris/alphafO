@@ -635,6 +635,8 @@ function StrangleIntradaySection() {
   const [err, setErr]       = useState<string | null>(null)
   const [showAll, setShowAll] = useState(false)
   const [sortAsc, setSortAsc] = useState(false)   // false = newest first
+  const [fFrom, setFFrom] = useState('')
+  const [fTo, setFTo] = useState('')
 
   useEffect(() => {
     api.get('/backtest/strangle-intraday').then(r => { if (r.data?.trades) setData(r.data) }).catch(() => {})
@@ -650,9 +652,37 @@ function StrangleIntradaySection() {
     } finally { setRun(false) }
   }
 
-  const rows = [...(data?.trade_rows ?? [])].sort((a: any, b: any) =>
+  // Date-range filter over the cached full run — instant, no re-fetch
+  const allRows = data?.trade_rows ?? []
+  const filtered = allRows.filter((t: any) =>
+    (!fFrom || t.entry_date >= fFrom) && (!fTo || t.entry_date <= fTo))
+  const rows = [...filtered].sort((a: any, b: any) =>
     sortAsc ? a.entry_date.localeCompare(b.entry_date) : b.entry_date.localeCompare(a.entry_date))
   const visible = showAll ? rows : rows.slice(0, 10)
+
+  // Recompute summary stats over the filtered range (hold + stop variants)
+  const stats = (key: 'net' | 'net_stop') => {
+    const nets = filtered.map((t: any) => t[key] ?? t.net)
+    if (!nets.length) return null
+    const wins = nets.filter((n: number) => n > 0)
+    const loss = nets.filter((n: number) => n <= 0)
+    let eq = 0, peak = 0, dd = 0
+    for (const t of [...filtered].sort((a: any, b: any) => a.entry_date.localeCompare(b.entry_date))) {
+      eq += t[key] ?? t.net; peak = Math.max(peak, eq); dd = Math.min(dd, eq - peak)
+    }
+    return {
+      n: nets.length,
+      win: (wins.length / nets.length) * 100,
+      pf: loss.length ? wins.reduce((a: number, b: number) => a + b, 0) / Math.abs(loss.reduce((a: number, b: number) => a + b, 0)) : 99,
+      net: nets.reduce((a: number, b: number) => a + b, 0),
+      avg: nets.reduce((a: number, b: number) => a + b, 0) / nets.length,
+      worst: Math.min(...nets),
+      dd: Math.abs(dd),
+    }
+  }
+  const hold = stats('net')
+  const stopV = stats('net_stop')
+  const rangeActive = !!(fFrom || fTo)
 
   const dteOf = (t: any) => {
     try {
@@ -685,23 +715,48 @@ function StrangleIntradaySection() {
 
       {data?.trades > 0 && (
         <div style={{ padding: '12px 14px' }}>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
-            {[
-              ['Window', `${data.window?.from} → ${data.window?.to}`, 'var(--txt)'],
-              ['Trades', String(data.trades), 'var(--txt)'],
-              ['Win Rate', `${data.win_rate}%`, data.win_rate >= 60 ? 'var(--up)' : 'var(--orange)'],
-              ['Profit Factor', `${data.profit_factor}x`, data.profit_factor >= 1.5 ? 'var(--up)' : 'var(--orange)'],
-              ['Net P&L', `₹${data.net_pnl?.toLocaleString('en-IN')}`, data.net_pnl >= 0 ? 'var(--up)' : 'var(--dn)'],
-              ['Avg / trade', `₹${data.avg_per_trade?.toLocaleString('en-IN')}`, data.avg_per_trade >= 0 ? 'var(--up)' : 'var(--dn)'],
-              ['Worst day', `₹${data.worst?.toLocaleString('en-IN')}`, 'var(--dn)'],
-              ['Max DD', `₹${data.max_drawdown?.toLocaleString('en-IN')}`, 'var(--dn)'],
-            ].map(([l, v, c]) => (
-              <div key={l as string} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 5, padding: '6px 12px' }}>
-                <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{l}</div>
-                <div style={{ fontSize: 13, fontWeight: 700, fontFamily: 'monospace', color: c as string }}>{v}</div>
-              </div>
-            ))}
+          {/* Date-range filter — instant, works on the cached full run */}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Range</span>
+            <input type="date" value={fFrom} min={data.window?.from} max={data.window?.to}
+              onChange={e => setFFrom(e.target.value)}
+              style={{ fontSize: 11, padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }} />
+            <span style={{ fontSize: 11, color: 'var(--txt3)' }}>→</span>
+            <input type="date" value={fTo} min={data.window?.from} max={data.window?.to}
+              onChange={e => setFTo(e.target.value)}
+              style={{ fontSize: 11, padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }} />
+            {rangeActive && (
+              <>
+                <span style={{ fontSize: 11, color: 'var(--txt2)' }}>{filtered.length} of {allRows.length} trades</span>
+                <button onClick={() => { setFFrom(''); setFTo('') }}
+                  style={{ fontSize: 11, color: 'var(--dn)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+                  Clear
+                </button>
+              </>
+            )}
+            <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--txt3)' }}>
+              full data: {data.window?.from} → {data.window?.to}
+            </span>
           </div>
+
+          {hold && (
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+              {[
+                ['Trades', String(hold.n), 'var(--txt)'],
+                ['Win Rate', `${hold.win.toFixed(1)}%`, hold.win >= 60 ? 'var(--up)' : 'var(--orange)'],
+                ['Profit Factor', `${hold.pf.toFixed(2)}x`, hold.pf >= 1.5 ? 'var(--up)' : hold.pf >= 1 ? 'var(--orange)' : 'var(--dn)'],
+                ['Net P&L', `₹${Math.round(hold.net).toLocaleString('en-IN')}`, hold.net >= 0 ? 'var(--up)' : 'var(--dn)'],
+                ['Avg / trade', `₹${Math.round(hold.avg).toLocaleString('en-IN')}`, hold.avg >= 0 ? 'var(--up)' : 'var(--dn)'],
+                ['Worst day', `₹${Math.round(hold.worst).toLocaleString('en-IN')}`, 'var(--dn)'],
+                ['Max DD', `₹${Math.round(hold.dd).toLocaleString('en-IN')}`, 'var(--dn)'],
+              ].map(([l, v, c]) => (
+                <div key={l as string} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 5, padding: '6px 12px' }}>
+                  <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{l}</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, fontFamily: 'monospace', color: c as string }}>{v}</div>
+                </div>
+              ))}
+            </div>
+          )}
 
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
             <thead>
@@ -745,15 +800,15 @@ function StrangleIntradaySection() {
               {showAll ? 'Show last 10' : `Show all ${rows.length} trades`}
             </button>
           )}
-          {data.stop_variant && (
+          {stopV && data.stop_variant && (
             <div style={{ marginTop: 10, padding: '8px 12px', background: 'var(--bg)', border: '1px solid var(--border)',
               borderRadius: 6, fontSize: 11, color: 'var(--txt2)' }}>
-              <b>With 2× credit stop-loss:</b>{' '}
-              win {data.stop_variant.win_rate}% · PF {data.stop_variant.profit_factor} ·
-              net ₹{data.stop_variant.net_pnl?.toLocaleString('en-IN')} ·
-              worst ₹{data.stop_variant.worst?.toLocaleString('en-IN')} ·
-              maxDD ₹{data.stop_variant.max_drawdown?.toLocaleString('en-IN')}
-              <span style={{ color: 'var(--txt3)' }}> — stop triggered on {data.stopped_count} of {data.trades} trades</span>
+              <b>With 2× credit stop-loss{rangeActive ? ' (selected range)' : ''}:</b>{' '}
+              win {stopV.win.toFixed(1)}% · PF {stopV.pf.toFixed(2)} ·
+              net ₹{Math.round(stopV.net).toLocaleString('en-IN')} ·
+              worst ₹{Math.round(stopV.worst).toLocaleString('en-IN')} ·
+              maxDD ₹{Math.round(stopV.dd).toLocaleString('en-IN')}
+              <span style={{ color: 'var(--txt3)' }}> — stop triggered on {filtered.filter((t: any) => t.stopped).length} of {filtered.length} trades</span>
             </div>
           )}
           <div style={{ marginTop: 10, fontSize: 10, color: 'var(--txt3)', lineHeight: 1.6 }}>{data.note}</div>
