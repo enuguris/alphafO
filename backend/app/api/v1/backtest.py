@@ -911,3 +911,181 @@ async def get_backtest(run_id: int, db: AsyncSession = Depends(get_db)):
     if not run:
         raise HTTPException(404, "Backtest run not found")
     return run.__dict__
+
+
+# ── Intraday strangle backtest — REAL Kite 30-min candles ────────────────────
+
+def _run_strangle_intraday(api_key: str, access_token: str) -> dict:
+    """
+    Backtest the user's short-strangle strategy on real 30-minute candles:
+    sell ~2.8%-OTM PE + ~2.4%-OTM CE on the active monthly (21-60 DTE),
+    enter at the day's last candle, exit at the next day's last candle.
+    Window = lifetime of currently-active contracts (expired ones are gone
+    from every API). Every price is a real traded 30-min close.
+    """
+    import time as _time
+    from datetime import date as _d, timedelta as _tdl
+    from collections import defaultdict
+    from kiteconnect import KiteConnect
+
+    LOT = 65
+
+    def rnd50(x):
+        return round(x / 50) * 50
+
+    def charges(entry_turn, exit_turn):
+        brok = min(20.0, entry_turn * 0.0003) * 2 + min(20.0, exit_turn * 0.0003) * 2
+        return (brok + entry_turn * 0.001 + (entry_turn + exit_turn) * 0.00053
+                + (brok + (entry_turn + exit_turn) * 0.00053) * 0.18 + exit_turn * 0.00003)
+
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+
+    # NFO instruments — cache per day in Redis (Kite allows ~1 call/day)
+    import json as _json
+    r = _redis_conn()
+    cache_key = f"nfo_nifty_opts:{_d.today().isoformat()}"
+    raw = r.get(cache_key)
+    if raw:
+        cached = _json.loads(raw)
+        nifty_opts = {tuple(k.split("|")): v for k, v in cached.items()}
+        nifty_opts = {(_d.fromisoformat(a), float(b), c): v for (a, b, c), v in nifty_opts.items()}
+    else:
+        inst = kite.instruments("NFO")
+        nifty_opts = {}
+        for row in inst:
+            if row["name"] == "NIFTY" and row["segment"] == "NFO-OPT":
+                exp = row["expiry"] if isinstance(row["expiry"], _d) else row["expiry"].date()
+                nifty_opts[(exp, float(row["strike"]), row["instrument_type"])] = row["instrument_token"]
+        r.setex(cache_key, 86400,
+                _json.dumps({f"{a.isoformat()}|{b}|{c}": v for (a, b, c), v in nifty_opts.items()}))
+
+    expiries = sorted({k[0] for k in nifty_opts})
+    monthlies = {max(e for e in expiries if (e.year, e.month) == (m.year, m.month)) for m in expiries}
+
+    frm = _d.today() - _tdl(days=70)
+    idx = kite.historical_data(256265, frm, _d.today(), "30minute")
+    by_day = defaultdict(list)
+    for c in idx:
+        by_day[c["date"].date()].append(c)
+    days = sorted(by_day.keys())
+
+    candle_cache: dict = {}
+
+    def opt_candles(token):
+        if token not in candle_cache:
+            candle_cache[token] = kite.historical_data(token, frm, _d.today(), "30minute")
+            _time.sleep(0.34)
+        return candle_cache[token]
+
+    def px_at(cands, ts):
+        best = None
+        for c in cands:
+            if c["date"].replace(tzinfo=None) <= ts:
+                best = c["close"]
+            else:
+                break
+        return best
+
+    trades, skipped = [], 0
+    for i, d in enumerate(days[:-1]):
+        nxt = days[i + 1]
+        entry_c = by_day[d][-1]
+        ts_in = entry_c["date"].replace(tzinfo=None)
+        spot = entry_c["close"]
+        exp = next((e for e in expiries if e in monthlies and 21 <= (e - d).days <= 60), None)
+        if exp is None:
+            skipped += 1
+            continue
+        pk, ck = rnd50(spot * 0.972), rnd50(spot * 1.024)
+        tp, tc = nifty_opts.get((exp, float(pk), "PE")), nifty_opts.get((exp, float(ck), "CE"))
+        if not tp or not tc:
+            skipped += 1
+            continue
+        pe_c, ce_c = opt_candles(tp), opt_candles(tc)
+        ts_out = by_day[nxt][-1]["date"].replace(tzinfo=None)
+        pe_in, ce_in = px_at(pe_c, ts_in), px_at(ce_c, ts_in)
+        pe_out, ce_out = px_at(pe_c, ts_out), px_at(ce_c, ts_out)
+        if None in (pe_in, ce_in, pe_out, ce_out) or pe_in < 2 or ce_in < 2:
+            skipped += 1
+            continue
+        credit, debit = pe_in + ce_in, pe_out + ce_out
+        net = (credit - debit) * LOT - charges(credit * LOT, debit * LOT)
+        trades.append({
+            "entry_date": str(d), "exit_date": str(nxt), "spot": round(spot, 1),
+            "expiry": str(exp), "pe_strike": pk, "ce_strike": ck,
+            "pe_in": pe_in, "ce_in": ce_in, "pe_out": pe_out, "ce_out": ce_out,
+            "credit": round(credit, 2), "debit": round(debit, 2),
+            "net": round(net, 2), "win": net > 0,
+        })
+
+    nets = [t["net"] for t in trades]
+    wins = [n for n in nets if n > 0]
+    loss = [n for n in nets if n <= 0]
+    eq, peak, dd = 0.0, 0.0, 0.0
+    curve = []
+    for t in trades:
+        eq += t["net"]
+        peak = max(peak, eq)
+        dd = min(dd, eq - peak)
+        curve.append({"date": t["exit_date"], "equity": round(eq, 2)})
+
+    return {
+        "source": "kite_30min_real",
+        "lot_size": LOT,
+        "window": {"from": str(days[0]) if days else None, "to": str(days[-1]) if days else None},
+        "trades": len(trades), "skipped_days": skipped,
+        "win_rate": round(len(wins) / len(nets) * 100, 1) if nets else 0,
+        "profit_factor": round(sum(wins) / abs(sum(loss)), 2) if loss else (99.0 if wins else 0),
+        "net_pnl": round(sum(nets), 2),
+        "avg_per_trade": round(sum(nets) / len(nets), 2) if nets else 0,
+        "worst": round(min(nets), 2) if nets else 0,
+        "best": round(max(nets), 2) if nets else 0,
+        "max_drawdown": round(abs(dd), 2),
+        "equity_curve": curve,
+        "trade_rows": trades,
+        "note": ("Real Kite 30-min closes for active contracts only — expired option "
+                 "data is not available from any free API, so the window is limited "
+                 "to the current monthly's lifetime."),
+    }
+
+
+@router.post("/strangle-intraday/run")
+async def run_strangle_intraday():
+    """Run the intraday strangle backtest on real Kite candles (cached 24h)."""
+    import json as _json
+    import asyncio
+    from sqlalchemy import select as _sel
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.core.encryption import decrypt as _dec
+    from fastapi import HTTPException as _HE
+
+    async with AsyncSessionLocal() as db:
+        cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+    if not cfg or not cfg.access_token_enc:
+        raise _HE(400, "Kite credentials not configured")
+
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, _run_strangle_intraday, cfg.api_key, _dec(cfg.access_token_enc))
+    try:
+        r = _redis_conn()
+        from datetime import datetime as _dtm, timedelta as _tdl2
+        result["run_at_ist"] = (_dtm.utcnow() + _tdl2(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M IST")
+        r.setex("strangle_intraday_bt", 86400, _json.dumps(result))
+    except Exception:
+        pass
+    return result
+
+
+@router.get("/strangle-intraday")
+async def get_strangle_intraday():
+    """Return the cached intraday strangle backtest (204-style empty if none)."""
+    import json as _json
+    try:
+        raw = _redis_conn().get("strangle_intraday_bt")
+        if raw:
+            return _json.loads(raw)
+    except Exception:
+        pass
+    return {"trades": 0, "trade_rows": [], "cached": False}
