@@ -2599,3 +2599,94 @@ def market_watch_snapshot():
         _stamp_task_run("workers.market_watch_snapshot")
     except Exception as exc:
         logger.error(f"market-watch snapshot failed: {exc}")
+
+
+# ── Nightly intraday-candle collection (own the data before it expires) ──────
+
+async def _do_collect_option_candles():
+    """
+    Save today's 30-min candles for NIFTY/BANKNIFTY options near the money
+    (±5% strikes, expiries ≤ 45 DTE) to /app/market_data/intraday/.
+    Expired contracts vanish from every API — this builds our own permanent
+    intraday dataset for strategy backtesting (Upstox charges for theirs).
+    """
+    import csv as _csv
+    import time as _time
+    from datetime import date as _d, timedelta as _tdl
+    from pathlib import Path
+    from sqlalchemy import select as _sel
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.core.encryption import decrypt as _dec
+    from kiteconnect import KiteConnect
+
+    async with AsyncSessionLocal() as db:
+        cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+    if not cfg or not cfg.access_token_enc or cfg.token_date != _d.today():
+        logger.warning("collect-candles: no valid Kite token today — skipped")
+        return {"status": "skipped", "reason": "no kite token"}
+
+    kite = KiteConnect(api_key=cfg.api_key)
+    kite.set_access_token(_dec(cfg.access_token_enc))
+
+    import redis as _r
+    from app.config import settings as _st
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+
+    inst = kite.instruments("NFO")   # the one allowed daily call
+    today = _d.today()
+    out_dir = Path("/app/market_data/intraday")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    targets = []
+    for ul, step, pct in (("NIFTY", 50, 0.05), ("BANKNIFTY", 100, 0.05)):
+        spot = float(r.get(f"spot:{ul}") or 0)
+        if spot <= 0:
+            continue
+        lo, hi = spot * (1 - pct), spot * (1 + pct)
+        for row in inst:
+            if row["name"] != ul or row["segment"] != "NFO-OPT":
+                continue
+            exp = row["expiry"] if isinstance(row["expiry"], _d) else row["expiry"].date()
+            if not (0 <= (exp - today).days <= 45):
+                continue
+            if not (lo <= float(row["strike"]) <= hi):
+                continue
+            targets.append((ul, row["tradingsymbol"], row["instrument_token"],
+                            str(exp), float(row["strike"]), row["instrument_type"]))
+
+    logger.info(f"collect-candles: {len(targets)} contracts to fetch")
+    written = 0
+    fname = out_dir / f"candles_{today.isoformat()}.csv"
+    new_file = not fname.exists()
+    with open(fname, "a", newline="") as fh:
+        w = _csv.writer(fh)
+        if new_file:
+            w.writerow(["symbol", "underlying", "expiry", "strike", "type",
+                        "ts", "open", "high", "low", "close", "volume", "oi"])
+        for ul, sym, tok, exp, strike, ot in targets:
+            try:
+                candles = kite.historical_data(tok, today, today, "30minute", oi=True)
+                for c in candles:
+                    w.writerow([sym, ul, exp, strike, ot, c["date"].isoformat(),
+                                c["open"], c["high"], c["low"], c["close"],
+                                c.get("volume", 0), c.get("oi", 0)])
+                written += 1
+            except Exception as e:
+                logger.debug(f"collect-candles {sym}: {e}")
+            _time.sleep(0.35)   # stay under Kite's 3 req/s historical limit
+
+    logger.info(f"collect-candles: wrote {written}/{len(targets)} contracts to {fname.name}")
+    return {"status": "ok", "contracts": written, "file": fname.name}
+
+
+@celery_app.task(name="workers.collect_option_candles")
+def collect_option_candles():
+    """Nightly: archive today's 30-min option candles before contracts expire."""
+    try:
+        result = _run_async(_do_collect_option_candles())
+        _stamp_task_run("workers.collect_option_candles")
+        return result
+    except Exception as exc:
+        logger.error(f"collect-candles failed: {exc}")
+        return {"status": "error", "error": str(exc)}
