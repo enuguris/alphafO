@@ -354,21 +354,20 @@ frontend/src/
 
 ---
 
-## Git Workflow (updated 2026-07-03 per user)
+## Git Workflow (updated 2026-07-03 per user — DAILY BRANCH CADENCE)
 
-Branch → verify → merge → tag. Rollback must always be one command away.
+One feature branch per day; commit every change to it as made (docs updated in
+the same commit); at end of day merge to main and cut a release tag.
 
-1. **Feature branch per change-set**: `feat/<name>`, `fix/<name>`, `chore/<name>`
-2. **Verify before merge**: `docker exec alphafo-backend-1 sh -c "cd /app && python -m pytest tests/ -q"` green + `GET /api/v1/system/health` all ok
-3. **Merge with `--no-ff`** into main so each feature is one revertable merge commit; push main
-4. **Cut a release tag** after a verified milestone: `git tag -a v1.x.y -m "..." && git push origin --tags`
-5. **Rollback**: `git checkout v1.x.y && docker restart alphafo-backend-1 alphafo-celery-1 alphafo-celery-beat-1` — instant because containers bind-mount the source (frontend needs a `touch` on changed files for HMR)
-6. NEVER commit `generate_accesstoken.py` / `generate_session.sh` — they contain live API keys (gitignored)
-
-```bash
-git checkout -b feat/my-change
-# ... edit, deploy via restart, verify ...
-git add <files> && git commit -m "feat: description"
-git checkout main && git merge --no-ff feat/my-change && git push origin main
-git tag -a v1.2.0 -m "milestone description" && git push origin --tags
-```
+1. **Start of day**: `git checkout main && git pull && git checkout -b daily/YYYY-MM-DD`
+2. **During the day**: commit each change to the daily branch immediately, with
+   documentation (CLAUDE.md / relevant docs) updated in the same commit
+3. **End of day**: verify (`pytest tests/` green in backend container +
+   `GET /api/v1/system/health` all ok) → `git checkout main &&
+   git merge --no-ff daily/YYYY-MM-DD && git push origin main`
+4. **Cut the release**: `git tag -a v1.x.y -m "daily release YYYY-MM-DD: <summary>"
+   && git push origin --tags` (bump minor for features, patch for fixes-only days)
+5. **Rollback**: `git checkout v1.x.y && docker restart alphafo-backend-1
+   alphafo-celery-1 alphafo-celery-beat-1` — instant (containers bind-mount the
+   source; frontend needs `touch` on changed files for HMR)
+6. NEVER commit `generate_accesstoken.py` / `generate_session.sh` — live API keys (gitignored)
