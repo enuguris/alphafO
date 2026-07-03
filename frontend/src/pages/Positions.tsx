@@ -4,6 +4,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket } from '../api/client'
 import PayoffChart from '../components/PayoffChart'
 import MarketWatchPanel from '../components/MarketWatchPanel'
+import ManualTradeModal from '../components/ManualTradeModal'
+import { api } from '../api/client'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -724,7 +726,31 @@ function CompositeGroup({ legs, spotPrices, onClose }: { legs: any[]; spotPrices
           <span style={{ fontSize: 10, fontWeight: 400, marginLeft: 4, color: 'var(--txt3)' }}>net</span>
         </td>
         <td style={{ padding: '9px 10px', fontFamily: 'monospace', color: 'var(--txt3)', fontSize: 11 }}>{fmtINR(totalCharges)}</td>
-        <td colSpan={3} />
+        <td colSpan={3}>
+          {isOpen && legs[0]?.leg_role === 'manual' && (
+            <button onClick={async e => {
+              e.stopPropagation()
+              const exits: Record<number, number> = {}
+              for (const l of legs.filter(x => x.status === 'open')) {
+                const v = window.prompt(`Exit price for ${l.symbol} (${l.action}, entry ₹${l.entry_price})?`,
+                  String(l.current_price ?? l.entry_price))
+                if (v == null) return                     // cancelled
+                const px = parseFloat(v)
+                if (isNaN(px) || px < 0) { alert(`Invalid price: ${v}`); return }
+                exits[l.id] = px
+              }
+              try {
+                const r = await api.post(`/trades/manual/${legs[0].trade_group_id}/close`, { exits })
+                alert(`Recorded. Net P&L: ₹${r.data.group_net.toLocaleString('en-IN')}`)
+                window.location.reload()
+              } catch { alert('Failed to record exit') }
+            }}
+              className="tv-btn" style={{ padding: '3px 10px', fontSize: 10, color: 'var(--orange)',
+                border: '1px solid rgba(255,152,0,0.4)' }}>
+              📝 Record Exit
+            </button>
+          )}
+        </td>
       </tr>
       {/* Individual leg rows when expanded */}
       {expanded && legs.map((l: any) => (
@@ -971,6 +997,7 @@ function LivePnlBar({ trades, spotPrices, risk }: { trades: any[]; spotPrices: R
 export default function Positions() {
   const qc = useQueryClient()
   const [tab, setTab]           = useState<'open' | 'history'>('open')
+  const [showManual, setShowManual] = useState(false)
   const [spotPrices, setSpotPrices] = useState<Record<string, number>>({})
   const [lastRefresh, setLastRefresh] = useState<string | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -1085,8 +1112,17 @@ export default function Positions() {
                 : `History (${new Set(closedTrades.map((x: any) => x.trade_group_id ?? x.id)).size})`}
             </button>
           ))}
+          <button onClick={() => setShowManual(true)} className="tv-btn tv-btn-ghost"
+            style={{ fontSize: 11, padding: '4px 12px', color: 'var(--orange)', border: '1px solid rgba(255,152,0,0.35)' }}>
+            ➕ Manual Trade
+          </button>
         </div>
       </div>
+
+      {showManual && (
+        <ManualTradeModal onClose={() => setShowManual(false)}
+          onAdded={() => { qc.invalidateQueries({ queryKey: ['open-trades'] }); qc.invalidateQueries({ queryKey: ['mtm-refresh'] }) }} />
+      )}
 
       {/* Market watch — persistent 15-min snapshots visualized */}
       {tab === 'open' && <MarketWatchPanel />}
