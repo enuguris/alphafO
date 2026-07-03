@@ -811,6 +811,40 @@ function StrangleIntradaySection() {
               <span style={{ color: 'var(--txt3)' }}> — stop triggered on {filtered.filter((t: any) => t.stopped).length} of {filtered.length} trades</span>
             </div>
           )}
+          {data.stop_spectrum && (
+            <div style={{ marginTop: 10, padding: '10px 12px', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt)', marginBottom: 6 }}>
+                Stop-loss spectrum (full 21-month window) — exit when combined premium hits N× credit
+              </div>
+              <table style={{ borderCollapse: 'collapse', fontSize: 11 }}>
+                <thead><tr>{['Stop level', 'Loss cap', 'Net P&L', 'PF', 'Worst day', 'Max DD', 'Triggered'].map(h => (
+                  <th key={h} style={{ padding: '3px 12px 3px 0', textAlign: h === 'Stop level' || h === 'Loss cap' ? 'left' : 'right', color: 'var(--txt3)', fontWeight: 500, fontSize: 10 }}>{h}</th>
+                ))}</tr></thead>
+                <tbody>
+                  <tr style={{ borderTop: '1px solid var(--border2)' }}>
+                    <td style={{ padding: '3px 12px 3px 0', color: 'var(--txt2)' }}>No stop (hold)</td>
+                    <td style={{ padding: '3px 12px 3px 0', color: 'var(--txt3)' }}>—</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', fontWeight: 700, color: 'var(--up)' }}>₹{data.net_pnl?.toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace' }}>{data.profit_factor}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{data.worst?.toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{data.max_drawdown?.toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', color: 'var(--txt3)' }}>—</td>
+                  </tr>
+                  {data.stop_spectrum.map((s: any) => (
+                    <tr key={s.mult} style={{ borderTop: '1px solid var(--border2)' }}>
+                      <td style={{ padding: '3px 12px 3px 0', fontFamily: 'monospace', color: 'var(--txt2)' }}>{s.mult}× credit</td>
+                      <td style={{ padding: '3px 12px 3px 0', color: 'var(--txt3)' }}>{Math.round((parseFloat(s.mult) - 1) * 100)}% of premium</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', fontWeight: 700, color: s.net_pnl >= data.net_pnl ? 'var(--up)' : 'var(--orange)' }}>₹{s.net_pnl?.toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace' }}>{s.profit_factor}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{s.worst?.toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{s.max_drawdown?.toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', color: 'var(--txt3)' }}>{s.triggered}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
           <div style={{ marginTop: 10, fontSize: 10, color: 'var(--txt3)', lineHeight: 1.6 }}>{data.note}</div>
         </div>
       )}

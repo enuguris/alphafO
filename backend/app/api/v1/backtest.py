@@ -1249,25 +1249,32 @@ def _run_strangle_upstox(token: str) -> dict:
         credit, debit = pe_in + ce_in, pe_out + ce_out
         net_hold = (credit - debit) * LOT - charges(credit * LOT, debit * LOT)
 
-        # 2x-credit stop scanned on next day's 30-min marks
-        stop_debit = None
-        for ts2, _ in by_day[nxt]:
-            p2, c2 = px_at(pe_rows, ts2), px_at(ce_rows, ts2)
-            if p2 is None or c2 is None:
-                continue
-            if p2 + c2 >= 2 * credit:
-                stop_debit = p2 + c2
-                break
-        debit_stop = stop_debit if stop_debit is not None else debit
-        net_stop = (credit - debit_stop) * LOT - charges(credit * LOT, debit_stop * LOT)
+        # Stop-loss SPECTRUM: exit intraday when combined premium reaches
+        # mult × credit (loss ≈ (mult−1) × credit). Scanned on 30-min marks.
+        STOP_MULTS = (1.25, 1.5, 2.0, 3.0)
+        stop_nets, stop_flags = {}, {}
+        for mult in STOP_MULTS:
+            stop_debit = None
+            for ts2, _ in by_day[nxt]:
+                p2, c2 = px_at(pe_rows, ts2), px_at(ce_rows, ts2)
+                if p2 is None or c2 is None:
+                    continue
+                if p2 + c2 >= mult * credit:
+                    stop_debit = p2 + c2
+                    break
+            dbt = stop_debit if stop_debit is not None else debit
+            stop_nets[str(mult)] = round((credit - dbt) * LOT - charges(credit * LOT, dbt * LOT), 2)
+            stop_flags[str(mult)] = stop_debit is not None
 
         trades.append({
             "entry_date": str(d), "exit_date": str(nxt), "spot": round(spot, 1),
             "expiry": str(exp), "pe_strike": int(pk), "ce_strike": int(ck),
             "pe_in": pe_in, "ce_in": ce_in, "pe_out": pe_out, "ce_out": ce_out,
             "credit": round(credit, 2), "debit": round(debit, 2),
-            "net": round(net_hold, 2), "net_stop": round(net_stop, 2),
-            "stopped": stop_debit is not None, "win": net_hold > 0,
+            "net": round(net_hold, 2),
+            "net_stop": stop_nets["2.0"], "stopped": stop_flags["2.0"],
+            "stop_nets": stop_nets, "stop_flags": stop_flags,
+            "win": net_hold > 0,
         })
 
     client.close()
@@ -1291,6 +1298,26 @@ def _run_strangle_upstox(token: str) -> dict:
         }
 
     hold, stop = summarize("net"), summarize("net_stop")
+
+    def summarize_mult(mult: str):
+        nets = [t["stop_nets"][mult] for t in trades]
+        wins = [n for n in nets if n > 0]
+        loss = [n for n in nets if n <= 0]
+        eqx = peakx = ddx = 0.0
+        for n in nets:
+            eqx += n
+            peakx = max(peakx, eqx)
+            ddx = min(ddx, eqx - peakx)
+        return {"mult": mult,
+                "win_rate": round(len(wins) / len(nets) * 100, 1) if nets else 0,
+                "profit_factor": round(sum(wins) / abs(sum(loss)), 2) if loss else 99.0,
+                "net_pnl": round(sum(nets), 2),
+                "worst": round(min(nets), 2) if nets else 0,
+                "max_drawdown": round(abs(ddx), 2),
+                "triggered": sum(1 for t in trades if t["stop_flags"][mult])}
+
+    stop_spectrum = [summarize_mult(m) for m in ("1.25", "1.5", "2.0", "3.0")]
+
     eq2, curve = 0.0, []
     for t in trades:
         eq2 += t["net"]
@@ -1303,6 +1330,7 @@ def _run_strangle_upstox(token: str) -> dict:
         "trades": len(trades), "skipped_days": skipped,
         **hold,
         "stop_variant": stop,
+        "stop_spectrum": stop_spectrum,
         "stopped_count": sum(1 for t in trades if t["stopped"]),
         "equity_curve": curve,
         "trade_rows": trades,
