@@ -45,3 +45,15 @@ Thumbs.db
 # Secrets
 credentials.json
 kite_session.json
+
+# AlphaFO local artifacts (added 2026-07-03)
+alphaf0-venv/
+backend/market_data/
+.claude/
+alphafO-toggle.ps1
+backend/backtest_credit_spreads.py
+backend/backfill_bhav.log
+
+# Credential-bearing local scripts — NEVER commit (contain live API keys)
+generate_accesstoken.py
+generate_session.sh
