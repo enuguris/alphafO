@@ -2760,7 +2760,7 @@ def collect_option_candles():
 
 # â”€â”€ Condorize mitigation (adopted 2026-07-04) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-MITIGATION_BUDGET = 1_000_000.0   # Rs10L reserve, separate from deployment heat
+MITIGATION_BUDGET = 200_000.0   # Rs2L reserve carved from the single Rs10L corpus (user 2026-07-04)
 
 
 async def _condorize_group(group_id: str, group_trades: list, db) -> None:
