@@ -58,8 +58,9 @@ def convert(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main():
-    start = date(2024, 7, 8)   # first day after old-format cache ends
-    end   = date.today()
+    start = date(2016, 7, 1)
+    end_cap = date(2021, 6, 29)   # first day after old-format cache ends
+    end   = end_cap
     got = skipped = failed = 0
 
     with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
