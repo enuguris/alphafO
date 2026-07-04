@@ -150,5 +150,12 @@ celery_app.conf.update(
             "task": "workers.collect_option_candles",
             "schedule": crontab(minute="45", hour="15", day_of_week="1-5"),
         },
+        # 0DTE expiry-day ATM straddle experiment (1 lot) — Tuesday 09:45 IST.
+        # Tested on 90 real expiry days: PF 1.26. Intraday only: SL 40% credit,
+        # TP 60%, squared off by eod-close-intraday.
+        "zero-dte-straddle": {
+            "task": "workers.zero_dte_straddle",
+            "schedule": crontab(minute="45", hour="9", day_of_week="2"),
+        },
     },
 )

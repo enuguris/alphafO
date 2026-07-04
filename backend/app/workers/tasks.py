@@ -414,6 +414,15 @@ async def _auto_paper_trade(signals, db):
             except Exception:
                 pass
 
+        # ── Tue-Thu entry rule (adopted 2026-07-04, tested on real data) ──────
+        # 21mo Upstox study: Mon entries PF 0.57, Fri PF 0.66 vs Tue-Thu 1.4-2.3
+        # (weekend gaps bracket the position's most fragile first days).
+        # Also blocks Sat/Sun: broker LTP endpoints serve stale Friday closes
+        # on weekends — a trade "filled" then is priced on a frozen market.
+        if date.today().weekday() not in (1, 2, 3):
+            logger.info(f"Skipping {sig.underlying} entry: Tue-Thu rule (weekday={date.today().weekday()})")
+            continue
+
         premium  = sig.estimated_premium
 
         # ── Entry price: Kite ↔ Upstox round-robin → NSE chain → BS ─────────
@@ -681,6 +690,24 @@ async def _auto_paper_trade(signals, db):
                 _lots = 1
             if _is_condor_exp:
                 _lots = 1   # experiments always run at minimum size
+
+            # ── VIX goldilocks sizing (tested: VIX 13-16 → PF 1.66; outside → <1)
+            # Outside the band we still trade (evidence keeps flowing) but at 1 lot.
+            try:
+                import pandas as _pdv
+                _vix_df = _pdv.read_csv("/app/market_data/india_vix.csv")
+                _vix_now = float(_vix_df["vix"].iloc[-1])
+                if not (13.0 <= _vix_now <= 16.0):
+                    _lots = min(_lots, 1)
+                    logger.info(f"VIX {_vix_now:.1f} outside 13-16 band → sizing capped at 1 lot")
+            except Exception:
+                pass
+
+            # ── BullPut probation (real data: PF 0.66-0.91 across all variants;
+            # BearCall 1.2-1.9). Keep collecting evidence at minimum size only.
+            if "Bull Put" in _strat:
+                _lots = min(_lots, 1)
+
             quantity = _lots * sig.lot_size
             if _lots > 1:
                 logger.info(f"Sizing {sig.underlying} {_strat}: {_lots} lots "
@@ -1343,6 +1370,24 @@ async def _do_mtm_update():
                 for t in group_trades
             )
 
+            # ── CONDORIZE mitigation (adopted 2026-07-04, tested on 144 real
+            # trades: net 3x vs 2x-stop baseline). When a plain 2-leg spread
+            # falls to −1× its credit, sell an opposite-side spread in the same
+            # expiry: the threatened side's fall made the other side's premium
+            # rich; new credit finances recovery, combined TP/SL adapt
+            # automatically since the legs join the same group. Uses the
+            # SEPARATE mitigation budget (₹10L), not the deployment heat cap.
+            _roles = {(t.leg_role or "") for t in group_trades}
+            _is_plain_spread = (len(group_trades) == 2 and
+                                not any(r.startswith(("mitigation", "manual", "zdte")) for r in _roles))
+            if (_is_plain_spread and not _mixed_pricing and net_entry_cost > 0
+                    and net_unrealized <= -net_entry_cost):
+                try:
+                    await _condorize_group(group_id, group_trades, db)
+                    continue   # thresholds recompute from combined legs next cycle
+                except Exception as _ce:
+                    logger.warning(f"condorize failed for {group_id[:8]}: {_ce}")
+
             reason = None
             if net_entry_cost > 0 and net_unrealized >= take_profit_threshold:
                 reason = "group_target"
@@ -1350,6 +1395,15 @@ async def _do_mtm_update():
                 reason = "group_stop"
             elif time_exit_due:
                 reason = "group_time_exit"
+
+            # 0DTE straddle groups: tighter rules — SL at 40% of credit, and
+            # they never survive past the EOD square-off (intraday only).
+            if "zdte" in _roles:
+                reason = None
+                if net_entry_cost > 0 and net_unrealized <= -(net_entry_cost * 0.40):
+                    reason = "zdte_stop"
+                elif net_entry_cost > 0 and net_unrealized >= net_entry_cost * 0.60:
+                    reason = "zdte_target"
 
             if reason and _mixed_pricing:
                 logger.warning(
@@ -1613,7 +1667,13 @@ async def _do_eod_close_intraday():
             # margin-blocked, 7-26 DTE, with their own managed exits (TP/SL/
             # half-DTE). Squaring them off same-day guaranteed a friction loss
             # (~₹400-900/group) and made live holds 3h vs backtest 5-12 days.
+            # EXCEPTION: 0DTE straddles are intraday-only by design — square
+            # them off here. Manual (user's own) positions are never touched.
             if trade.trade_group_id:
+                if (trade.leg_role or "") == "zdte":
+                    exit_px = trade.current_price or trade.entry_price
+                    await _close_trade(trade, exit_px, "zdte_eod", db)
+                    closed += 1
                 continue
 
             sig = sig_map.get(trade.signal_id) if trade.signal_id else None
@@ -2690,3 +2750,237 @@ def collect_option_candles():
     except Exception as exc:
         logger.error(f"collect-candles failed: {exc}")
         return {"status": "error", "error": str(exc)}
+
+
+# â”€â”€ Condorize mitigation (adopted 2026-07-04) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+MITIGATION_BUDGET = 1_000_000.0   # Rs10L reserve, separate from deployment heat
+
+
+async def _condorize_group(group_id: str, group_trades: list, db) -> None:
+    """
+    Defense for a threatened 2-leg spread: sell an opposite-side spread in the
+    same expiry at current ATM (real LTP + slippage). Legs join the same group
+    so the managed exits operate on the combined credit. Margin comes from the
+    mitigation budget (Redis mitigation_deployed), not the heat cap.
+    """
+    import redis as _r
+    from datetime import datetime as _dtm
+    from sqlalchemy import select as _sel
+    from app.config import settings as _st
+    from app.models.kite_config import KiteConfig
+    from app.models.trades import Trade, TradeStatus, TradeMode
+    from app.core.charges import charges_for_entry_only
+    from app.models.portfolio import Portfolio
+
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    used = float(r.get("mitigation_deployed") or 0)
+    if used >= MITIGATION_BUDGET * 0.9:
+        logger.warning(f"condorize skipped for {group_id[:8]}: mitigation budget nearly exhausted ({used:,.0f})")
+        return
+
+    lead = group_trades[0]
+    ul, expiry_iso = lead.underlying, lead.expiry_date
+    qty = lead.quantity or lead.lot_size or 1
+    step = 50 if ul == "NIFTY" else 100
+    threatened_type = next((t.option_type for t in group_trades if t.action == "SELL"), "PE")
+    new_ot = "CE" if threatened_type == "PE" else "PE"
+
+    spot = float(r.get(f"spot:{ul}") or 0)
+    if spot <= 0:
+        return
+    atm = round(spot / step) * step
+    sk = float(atm)
+    wk = sk + 2 * step if new_ot == "CE" else sk - 2 * step
+
+    cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+    prem = {}
+    for strike in (sk, wk):
+        p, src, tok = await _fetch_option_ltp_global(cfg, ul, expiry_iso, strike, new_ot)
+        if not p:
+            logger.warning(f"condorize {group_id[:8]}: no real LTP for {strike}{new_ot} â€” aborting (never mitigate on estimates)")
+            return
+        prem[strike] = (p, src, tok)
+
+    s_p, s_src, s_tok = prem[sk]
+    w_p, w_src, w_tok = prem[wk]
+    # slippage: SELL receives less, BUY pays more
+    s_fill = round(max(0.05, s_p - max(0.25, s_p * 0.005)), 2)
+    w_fill = round(w_p + max(0.25, w_p * 0.005), 2)
+    credit2 = s_fill - w_fill
+    width = 2 * step
+    if not (width * 0.15 <= credit2 <= width * 0.85):
+        logger.info(f"condorize {group_id[:8]}: new-side credit {credit2:.1f} fails sanity vs width {width} â€” skipped")
+        return
+
+    margin2 = (width - credit2) * qty
+    r.incrbyfloat("mitigation_deployed", margin2)
+
+    from app.core.strategies.composite import _build_symbol
+    now = _dtm.utcnow()
+    legs = [(sk, "SELL", s_fill, s_src, s_tok, "mitigation_sell"),
+            (wk, "BUY", w_fill, w_src, w_tok, "mitigation_wing")]
+    cash = 0.0
+    for strike, action, fill, src, tok, role in legs:
+        ch = charges_for_entry_only(fill, qty, action)
+        cash += (fill * qty if action == "SELL" else -(fill * qty)) - ch
+        db.add(Trade(
+            mode=TradeMode.PAPER,
+            symbol=_build_symbol(ul, expiry_iso, strike, new_ot),
+            underlying=ul, option_type=new_ot, strike=strike,
+            lot_size=lead.lot_size, expiry_date=expiry_iso,
+            expiry_display=lead.expiry_display,
+            action=action, direction=lead.direction, quantity=qty,
+            entry_price=fill, current_price=fill,
+            target_price=0.0, stop_loss=0.0,
+            charges_entry=ch, unrealized_pnl=0.0,
+            status=TradeStatus.OPEN, entry_time=now,
+            entry_price_source=src, instrument_token=tok,
+            margin_blocked=round(margin2 / 2, 2),
+            trade_group_id=group_id, leg_role=role,
+            notes=(f"STRATEGY:Condorized (mitigation)|MITIGATION: original {threatened_type}-side "
+                   f"spread hit -1x credit; sold opposite {new_ot} spread to finance recovery. "
+                   f"Tested 2026-07: net 3x vs stop-only baseline."),
+        ))
+    result = await db.execute(_sel(Portfolio).where(Portfolio.mode == "paper"))
+    pf = result.scalar_one_or_none()
+    if pf:
+        pf.capital_current += cash          # credit received (margin tracked in mitigation pool)
+    logger.info(f"CONDORIZED {group_id[:8]}: sold {sk:.0f}{new_ot}/{wk:.0f}{new_ot} "
+                f"credit {credit2:.1f}/unit, mitigation margin {margin2:,.0f} "
+                f"(pool used {used + margin2:,.0f}/{MITIGATION_BUDGET:,.0f})")
+
+
+async def _fetch_option_ltp_global(cfg, ul, expiry_iso, strike, ot):
+    """Standalone real-LTP fetch (Kite then Upstox) usable outside _auto_paper_trade."""
+    from datetime import date as _d2
+    from app.core.encryption import decrypt as _dec
+    if cfg and cfg.access_token_enc and cfg.token_date == _d2.today():
+        try:
+            from kiteconnect import KiteConnect as _KC
+            import calendar as _cal
+            exp = _d2.fromisoformat(str(expiry_iso)[:10])
+            yy = str(exp.year)[2:]
+            last_tue = max(_d2(exp.year, exp.month, dd)
+                           for dd in range(1, _cal.monthrange(exp.year, exp.month)[1] + 1)
+                           if _d2(exp.year, exp.month, dd).weekday() == 1)
+            base = f"{int(strike)}{ot}"
+            mon3 = exp.strftime("%b").upper()
+            sym = (f"{ul}{yy}{mon3}{base}" if exp == last_tue
+                   else f"{ul}{yy}{exp.month}{exp.day:02d}{base}")
+            k = _KC(api_key=cfg.api_key)
+            k.set_access_token(_dec(cfg.access_token_enc))
+            res = k.ltp([f"NFO:{sym}"])
+            for v in res.values():
+                if v.get("last_price", 0) > 0:
+                    return float(v["last_price"]), "kite", v.get("instrument_token")
+        except Exception as e:
+            logger.debug(f"ltp_global kite failed: {e}")
+    if cfg and cfg.upstox_access_token_enc and cfg.upstox_token_date == _d2.today():
+        try:
+            from app.core.data.upstox_ltp import get_ltp as _up
+            p = _up(_dec(cfg.upstox_access_token_enc), ul, str(expiry_iso)[:10], strike, ot)
+            if p and p > 0:
+                return p, "upstox", None
+        except Exception:
+            pass
+    return None, "none", None
+
+
+# â”€â”€ 0DTE expiry-day straddle (experiment, 1 lot) â€” adopted 2026-07-04 â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+async def _do_zero_dte_straddle():
+    """
+    Tuesday 09:45 IST: sell ATM straddle on the expiring NIFTY weekly, 1 lot.
+    Tested (90 real expiry days): 56.7% win, PF 1.26, +40.6k. Intraday only:
+    SL at 40% of credit / TP at 60% (group loop), hard square-off at EOD task.
+    """
+    from datetime import date as _d, datetime as _dtm
+    import uuid
+    import redis as _r
+    from sqlalchemy import select as _sel
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.models.trades import Trade, TradeStatus, TradeMode
+    from app.models.portfolio import Portfolio
+    from app.core.charges import charges_for_entry_only
+    from app.core.instruments import get_lot_size
+    from app.core.options.expiry import available_expiries
+    from app.core.strategies.composite import _build_symbol
+
+    today = _d.today()
+    exps = available_expiries("NIFTY", today)
+    if not exps or exps[0]["dte"] != 0:
+        logger.info("0DTE: today is not a NIFTY expiry day â€” skipped")
+        return {"status": "skipped"}
+
+    expiry_iso = exps[0]["date"]
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    spot = float(r.get("spot:NIFTY") or 0)
+    if spot <= 0 or not r.get("ticker:last_real_tick"):
+        logger.warning("0DTE: no real spot ticks â€” skipped (never trade on synthetic)")
+        return {"status": "skipped", "reason": "no real ticks"}
+    atm = float(round(spot / 50) * 50)
+    lot = get_lot_size("NIFTY")
+
+    async with AsyncSessionLocal() as db:
+        cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+        legs = []
+        for ot in ("CE", "PE"):
+            p, src, tok = await _fetch_option_ltp_global(cfg, "NIFTY", expiry_iso, atm, ot)
+            if not p:
+                logger.warning(f"0DTE: no real LTP for {atm}{ot} â€” aborted")
+                return {"status": "aborted"}
+            fill = round(max(0.05, p - max(0.25, p * 0.005)), 2)
+            legs.append((ot, fill, src, tok))
+
+        gid = str(uuid.uuid4())
+        now = _dtm.utcnow()
+        credit = sum(f for _, f, _, _ in legs)
+        margin = spot * lot * 0.12          # SPAN approx for short straddle
+        cash = 0.0
+        for ot, fill, src, tok in legs:
+            ch = charges_for_entry_only(fill, lot, "SELL")
+            cash += fill * lot - ch
+            db.add(Trade(
+                mode=TradeMode.PAPER,
+                symbol=_build_symbol("NIFTY", expiry_iso, atm, ot),
+                underlying="NIFTY", option_type=ot, strike=atm,
+                lot_size=lot, expiry_date=expiry_iso, expiry_display=expiry_iso,
+                action="SELL", direction="short", quantity=lot,
+                entry_price=fill, current_price=fill,
+                target_price=0.0, stop_loss=0.0,
+                charges_entry=ch, unrealized_pnl=0.0,
+                status=TradeStatus.OPEN, entry_time=now,
+                entry_price_source=src, instrument_token=tok,
+                margin_blocked=round(margin / 2, 2),
+                trade_group_id=gid, leg_role="zdte",
+                notes=("STRATEGY:0DTE Straddle (exp)|Expiry-day ATM straddle sell, 1 lot. "
+                       "Tested 90 real expiry days: PF 1.26. SL 40pct credit / TP 60pct / EOD square-off."),
+            ))
+        pf = (await db.execute(_sel(Portfolio).where(Portfolio.mode == "paper"))).scalar_one_or_none()
+        if pf:
+            pf.capital_deployed += margin
+            pf.capital_current += cash - margin
+        await db.commit()
+        try:
+            from app.core.risk.gate import record_deployed
+            record_deployed(margin)
+        except Exception:
+            pass
+        logger.info(f"0DTE straddle OPENED: {atm} CE+PE credit {credit:.1f}/unit, group {gid[:8]}")
+        return {"status": "opened", "credit": credit}
+
+
+@celery_app.task(name="workers.zero_dte_straddle")
+def zero_dte_straddle():
+    """Expiry-day (Tuesday) 09:45 IST: 0DTE ATM straddle experiment, 1 lot."""
+    try:
+        result = _run_async(_do_zero_dte_straddle())
+        _stamp_task_run("workers.zero_dte_straddle")
+        return result
+    except Exception as exc:
+        logger.error(f"0DTE straddle failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
