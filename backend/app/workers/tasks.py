@@ -708,6 +708,12 @@ async def _auto_paper_trade(signals, db):
             if "Bull Put" in _strat:
                 _lots = min(_lots, 1)
 
+            # ── BANKNIFTY probation (2026-07-04 reality check on 21mo real
+            # Upstox prices: BS model said PF 2.98-5.37, reality PF 0.68 —
+            # BullPut 0.43, BearCall 1.18 marginal). Evidence at 1 lot only.
+            if sig.underlying == "BANKNIFTY":
+                _lots = min(_lots, 1)
+
             quantity = _lots * sig.lot_size
             if _lots > 1:
                 logger.info(f"Sizing {sig.underlying} {_strat}: {_lots} lots "
