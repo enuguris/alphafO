@@ -677,3 +677,53 @@ async def add_manual_position(body: ManualPosition, db: AsyncSession = Depends(g
     await db.commit()
     return {"group_id": gid, "legs": created,
             "note": "Tracked. MTM via real prices; NO automated exits; excluded from paper stats."}
+
+
+class ManualExit(_BM):
+    exits: dict[int, float]     # trade_id -> exit price
+    note: str = ""
+
+
+@router.post("/manual/{group_id}/close")
+async def close_manual_position(group_id: str, body: ManualExit, db: AsyncSession = Depends(get_db)):
+    """
+    Record the user's OWN exit fills for a tracked manual position.
+    Computes P&L with full NSE charges. Does NOT touch the paper portfolio
+    (this money was never the system's) and places no orders.
+    """
+    from datetime import datetime as _dtm
+    from app.models.trades import TradeStatus
+    from app.core.charges import calculate_charges
+
+    result = await db.execute(select(Trade).where(
+        Trade.trade_group_id == group_id, Trade.leg_role == "manual"))
+    legs = result.scalars().all()
+    if not legs:
+        raise HTTPException(404, "Manual position not found")
+
+    now = _dtm.utcnow()
+    closed = []
+    for t in legs:
+        if t.status != TradeStatus.OPEN:
+            continue
+        exit_px = body.exits.get(t.id)
+        if exit_px is None:
+            continue
+        c = calculate_charges(t.entry_price, exit_px, t.quantity, t.action)
+        gross = ((exit_px - t.entry_price) if t.action == "BUY"
+                 else (t.entry_price - exit_px)) * t.quantity
+        net = gross - c.total
+        t.exit_price, t.exit_time = exit_px, now
+        t.status, t.exit_reason = TradeStatus.CLOSED, "manual_user_exit"
+        t.gross_pnl, t.realized_pnl, t.pnl = round(gross, 2), round(net, 2), round(net, 2)
+        t.unrealized_pnl = None
+        t.charges_total = round(c.total, 2)
+        t.charges_brokerage, t.charges_stt = round(c.brokerage, 2), round(c.stt, 2)
+        t.charges_txn, t.charges_gst = round(c.exchange_txn, 2), round(c.gst, 2)
+        t.charges_sebi, t.charges_stamp = round(c.sebi, 2), round(c.stamp_duty, 2)
+        if body.note:
+            t.notes = (t.notes or "") + f"|exit_note:{body.note}"
+        closed.append({"id": t.id, "symbol": t.symbol, "net_pnl": round(net, 2)})
+
+    await db.commit()
+    return {"closed": closed, "group_net": round(sum(x["net_pnl"] for x in closed), 2)}

@@ -143,5 +143,19 @@ celery_app.conf.update(
             "task": "workers.market_watch_snapshot",
             "schedule": crontab(minute="*/15", hour="9-15", day_of_week="1-5"),
         },
+        # Archive today's 30-min option candles at 15:45 IST — expired
+        # contracts vanish from every API; this builds our own intraday
+        # dataset in market_data/intraday/ for future strategy backtests.
+        "collect-option-candles": {
+            "task": "workers.collect_option_candles",
+            "schedule": crontab(minute="45", hour="15", day_of_week="1-5"),
+        },
+        # 0DTE expiry-day ATM straddle experiment (1 lot) — Tuesday 09:45 IST.
+        # Tested on 90 real expiry days: PF 1.26. Intraday only: SL 40% credit,
+        # TP 60%, squared off by eod-close-intraday.
+        "zero-dte-straddle": {
+            "task": "workers.zero_dte_straddle",
+            "schedule": crontab(minute="45", hour="9", day_of_week="2"),
+        },
     },
 )

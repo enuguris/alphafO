@@ -622,6 +622,232 @@ export default function SpreadBacktest() {
           </div>
         </>
       )}
+
+      {/* ── Intraday strangle backtest — REAL Kite 30-min candles ── */}
+      <StrangleIntradaySection />
+    </div>
+  )
+}
+
+function StrangleIntradaySection() {
+  const [data, setData]     = useState<any>(null)
+  const [running, setRun]   = useState(false)
+  const [err, setErr]       = useState<string | null>(null)
+  const [showAll, setShowAll] = useState(false)
+  const [sortAsc, setSortAsc] = useState(false)   // false = newest first
+  const [fFrom, setFFrom] = useState('')
+  const [fTo, setFTo] = useState('')
+
+  useEffect(() => {
+    api.get('/backtest/strangle-intraday').then(r => { if (r.data?.trades) setData(r.data) }).catch(() => {})
+  }, [])
+
+  const run = async () => {
+    setRun(true); setErr(null)
+    try {
+      const r = await api.post('/backtest/strangle-intraday/run', {}, { timeout: 600000 })
+      setData(r.data)
+    } catch (e: any) {
+      setErr(e?.response?.data?.detail ?? 'Run failed (Kite token valid today?)')
+    } finally { setRun(false) }
+  }
+
+  // Date-range filter over the cached full run — instant, no re-fetch
+  const allRows = data?.trade_rows ?? []
+  const filtered = allRows.filter((t: any) =>
+    (!fFrom || t.entry_date >= fFrom) && (!fTo || t.entry_date <= fTo))
+  const rows = [...filtered].sort((a: any, b: any) =>
+    sortAsc ? a.entry_date.localeCompare(b.entry_date) : b.entry_date.localeCompare(a.entry_date))
+  const visible = showAll ? rows : rows.slice(0, 10)
+
+  // Recompute summary stats over the filtered range (hold + stop variants)
+  const stats = (key: 'net' | 'net_stop') => {
+    const nets = filtered.map((t: any) => t[key] ?? t.net)
+    if (!nets.length) return null
+    const wins = nets.filter((n: number) => n > 0)
+    const loss = nets.filter((n: number) => n <= 0)
+    let eq = 0, peak = 0, dd = 0
+    for (const t of [...filtered].sort((a: any, b: any) => a.entry_date.localeCompare(b.entry_date))) {
+      eq += t[key] ?? t.net; peak = Math.max(peak, eq); dd = Math.min(dd, eq - peak)
+    }
+    return {
+      n: nets.length,
+      win: (wins.length / nets.length) * 100,
+      pf: loss.length ? wins.reduce((a: number, b: number) => a + b, 0) / Math.abs(loss.reduce((a: number, b: number) => a + b, 0)) : 99,
+      net: nets.reduce((a: number, b: number) => a + b, 0),
+      avg: nets.reduce((a: number, b: number) => a + b, 0) / nets.length,
+      worst: Math.min(...nets),
+      dd: Math.abs(dd),
+    }
+  }
+  const hold = stats('net')
+  const stopV = stats('net_stop')
+  const rangeActive = !!(fFrom || fTo)
+
+  const dteOf = (t: any) => {
+    try {
+      return Math.round((new Date(t.expiry).getTime() - new Date(t.entry_date).getTime()) / 86400000)
+    } catch { return null }
+  }
+
+  return (
+    <div style={{ marginTop: 24, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--txt)' }}>🌙 Overnight Strangle — REAL Kite 30-min candles</span>
+        <span style={{ fontSize: 10, color: 'var(--txt3)' }}>
+          sell 2.8%-OTM PE + 2.4%-OTM CE on the monthly, exit next close · 1 lot NIFTY
+        </span>
+        {data?.run_at_ist && <span style={{ fontSize: 10, color: 'var(--txt3)' }}>· run {data.run_at_ist}</span>}
+        <button onClick={run} disabled={running} className="tv-btn"
+          style={{ marginLeft: 'auto', padding: '5px 14px', fontSize: 11, fontWeight: 700, opacity: running ? 0.5 : 1 }}>
+          {running ? '⌛ Fetching real candles (~3 min)…' : '▶ Run on real data'}
+        </button>
+      </div>
+
+      {err && <div style={{ padding: '10px 14px', color: 'var(--dn)', fontSize: 11 }}>{err}</div>}
+      {!data && !err && !running && (
+        <div style={{ padding: '14px', fontSize: 11, color: 'var(--txt3)' }}>
+          Not run yet today. Uses real Kite 30-minute option prices for active contracts —
+          window is limited to the current monthly's lifetime (expired option data is not
+          available from any free API).
+        </div>
+      )}
+
+      {data?.trades > 0 && (
+        <div style={{ padding: '12px 14px' }}>
+          {/* Date-range filter — instant, works on the cached full run */}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 10, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Range</span>
+            <input type="date" value={fFrom} min={data.window?.from} max={data.window?.to}
+              onChange={e => setFFrom(e.target.value)}
+              style={{ fontSize: 11, padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }} />
+            <span style={{ fontSize: 11, color: 'var(--txt3)' }}>→</span>
+            <input type="date" value={fTo} min={data.window?.from} max={data.window?.to}
+              onChange={e => setFTo(e.target.value)}
+              style={{ fontSize: 11, padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--txt)' }} />
+            {rangeActive && (
+              <>
+                <span style={{ fontSize: 11, color: 'var(--txt2)' }}>{filtered.length} of {allRows.length} trades</span>
+                <button onClick={() => { setFFrom(''); setFTo('') }}
+                  style={{ fontSize: 11, color: 'var(--dn)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+                  Clear
+                </button>
+              </>
+            )}
+            <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--txt3)' }}>
+              full data: {data.window?.from} → {data.window?.to}
+            </span>
+          </div>
+
+          {hold && (
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+              {[
+                ['Trades', String(hold.n), 'var(--txt)'],
+                ['Win Rate', `${hold.win.toFixed(1)}%`, hold.win >= 60 ? 'var(--up)' : 'var(--orange)'],
+                ['Profit Factor', `${hold.pf.toFixed(2)}x`, hold.pf >= 1.5 ? 'var(--up)' : hold.pf >= 1 ? 'var(--orange)' : 'var(--dn)'],
+                ['Net P&L', `₹${Math.round(hold.net).toLocaleString('en-IN')}`, hold.net >= 0 ? 'var(--up)' : 'var(--dn)'],
+                ['Avg / trade', `₹${Math.round(hold.avg).toLocaleString('en-IN')}`, hold.avg >= 0 ? 'var(--up)' : 'var(--dn)'],
+                ['Worst day', `₹${Math.round(hold.worst).toLocaleString('en-IN')}`, 'var(--dn)'],
+                ['Max DD', `₹${Math.round(hold.dd).toLocaleString('en-IN')}`, 'var(--dn)'],
+              ].map(([l, v, c]) => (
+                <div key={l as string} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 5, padding: '6px 12px' }}>
+                  <div style={{ fontSize: 9, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{l}</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, fontFamily: 'monospace', color: c as string }}>{v}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                <th onClick={() => setSortAsc(a => !a)}
+                  style={{ padding: '4px 8px', textAlign: 'left', color: 'var(--txt2)', fontWeight: 600,
+                    fontSize: 10, cursor: 'pointer', userSelect: 'none' }}
+                  title="Click to toggle sort order">
+                  Entry {sortAsc ? '▲' : '▼'}
+                </th>
+                {['Exit', 'Expiry (DTE)', 'Spot', 'Strikes', 'PE in→out', 'CE in→out', 'Credit→Debit', 'Net P&L'].map(h => (
+                  <th key={h} style={{ padding: '4px 8px', textAlign: ['Exit', 'Expiry (DTE)', 'Strikes'].includes(h) ? 'left' : 'right',
+                    color: 'var(--txt3)', fontWeight: 500, fontSize: 10 }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map((t: any, i: number) => (
+                <tr key={i} style={{ borderBottom: '1px solid var(--border2)' }}>
+                  <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--txt3)' }}>{t.entry_date}</td>
+                  <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--txt3)' }}>{t.exit_date}</td>
+                  <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--orange)' }}>
+                    {t.expiry}{dteOf(t) != null && <span style={{ color: 'var(--txt3)' }}> ({dteOf(t)}d)</span>}
+                  </td>
+                  <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'monospace', color: 'var(--txt2)' }}>{t.spot?.toLocaleString('en-IN')}</td>
+                  <td style={{ padding: '4px 8px', fontFamily: 'monospace', color: 'var(--txt)' }}>{t.pe_strike}P / {t.ce_strike}C</td>
+                  <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'monospace', color: 'var(--txt2)' }}>{t.pe_in} → {t.pe_out}</td>
+                  <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'monospace', color: 'var(--txt2)' }}>{t.ce_in} → {t.ce_out}</td>
+                  <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'monospace', color: 'var(--txt2)' }}>₹{t.credit} → ₹{t.debit}</td>
+                  <td style={{ padding: '4px 8px', textAlign: 'right', fontFamily: 'monospace', fontWeight: 700,
+                    color: t.net >= 0 ? 'var(--up)' : 'var(--dn)' }}>
+                    {t.net >= 0 ? '+' : ''}₹{t.net?.toLocaleString('en-IN')}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {rows.length > 10 && (
+            <button onClick={() => setShowAll(s => !s)}
+              style={{ marginTop: 8, fontSize: 11, color: 'var(--up)', background: 'none', border: 'none', cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+              {showAll ? 'Show last 10' : `Show all ${rows.length} trades`}
+            </button>
+          )}
+          {stopV && data.stop_variant && (
+            <div style={{ marginTop: 10, padding: '8px 12px', background: 'var(--bg)', border: '1px solid var(--border)',
+              borderRadius: 6, fontSize: 11, color: 'var(--txt2)' }}>
+              <b>With 2× credit stop-loss{rangeActive ? ' (selected range)' : ''}:</b>{' '}
+              win {stopV.win.toFixed(1)}% · PF {stopV.pf.toFixed(2)} ·
+              net ₹{Math.round(stopV.net).toLocaleString('en-IN')} ·
+              worst ₹{Math.round(stopV.worst).toLocaleString('en-IN')} ·
+              maxDD ₹{Math.round(stopV.dd).toLocaleString('en-IN')}
+              <span style={{ color: 'var(--txt3)' }}> — stop triggered on {filtered.filter((t: any) => t.stopped).length} of {filtered.length} trades</span>
+            </div>
+          )}
+          {data.stop_spectrum && (
+            <div style={{ marginTop: 10, padding: '10px 12px', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--txt)', marginBottom: 6 }}>
+                Stop-loss spectrum (full 21-month window) — exit when combined premium hits N× credit
+              </div>
+              <table style={{ borderCollapse: 'collapse', fontSize: 11 }}>
+                <thead><tr>{['Stop level', 'Loss cap', 'Net P&L', 'PF', 'Worst day', 'Max DD', 'Triggered'].map(h => (
+                  <th key={h} style={{ padding: '3px 12px 3px 0', textAlign: h === 'Stop level' || h === 'Loss cap' ? 'left' : 'right', color: 'var(--txt3)', fontWeight: 500, fontSize: 10 }}>{h}</th>
+                ))}</tr></thead>
+                <tbody>
+                  <tr style={{ borderTop: '1px solid var(--border2)' }}>
+                    <td style={{ padding: '3px 12px 3px 0', color: 'var(--txt2)' }}>No stop (hold)</td>
+                    <td style={{ padding: '3px 12px 3px 0', color: 'var(--txt3)' }}>—</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', fontWeight: 700, color: 'var(--up)' }}>₹{data.net_pnl?.toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace' }}>{data.profit_factor}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{data.worst?.toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{data.max_drawdown?.toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', color: 'var(--txt3)' }}>—</td>
+                  </tr>
+                  {data.stop_spectrum.map((s: any) => (
+                    <tr key={s.mult} style={{ borderTop: '1px solid var(--border2)' }}>
+                      <td style={{ padding: '3px 12px 3px 0', fontFamily: 'monospace', color: 'var(--txt2)' }}>{s.mult}× credit</td>
+                      <td style={{ padding: '3px 12px 3px 0', color: 'var(--txt3)' }}>{Math.round((parseFloat(s.mult) - 1) * 100)}% of premium</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', fontWeight: 700, color: s.net_pnl >= data.net_pnl ? 'var(--up)' : 'var(--orange)' }}>₹{s.net_pnl?.toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace' }}>{s.profit_factor}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{s.worst?.toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', fontFamily: 'monospace', color: 'var(--dn)' }}>₹{s.max_drawdown?.toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '3px 12px 3px 0', textAlign: 'right', color: 'var(--txt3)' }}>{s.triggered}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div style={{ marginTop: 10, fontSize: 10, color: 'var(--txt3)', lineHeight: 1.6 }}>{data.note}</div>
+        </div>
+      )}
     </div>
   )
 }
