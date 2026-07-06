@@ -290,3 +290,23 @@ async def premarket_readiness_result():
         return json.loads(raw)
     from app.workers.tasks import _do_premarket_readiness
     return await _do_premarket_readiness()
+
+
+@router.get("/eod-digest")
+async def eod_digest(day: str | None = None):
+    """EOD market digest — today's cached copy or any past day from disk."""
+    import json
+    from pathlib import Path
+    import redis as _r
+    from app.config import settings as _st
+    if day:
+        f = Path(f"/app/market_data/daily_snapshots/{day}.json")
+        if f.exists():
+            return json.loads(f.read_text())
+        return {"error": f"no digest for {day}"}
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    raw = r.get("eod_digest:last")
+    if raw:
+        return json.loads(raw)
+    from app.workers.tasks import _do_eod_market_digest
+    return await _do_eod_market_digest() or {"error": "weekend - no digest"}

@@ -3108,3 +3108,104 @@ def premarket_readiness():
         logger.error(f"premarket readiness failed: {exc}")
         return {"status": "ERROR", "error": str(exc)}
 
+
+# ── EOD market digest — durable daily snapshot to disk ────────────────────────
+
+async def _do_eod_market_digest():
+    """
+    15:40 IST: fold the day's 15-min market_watch snapshots + closed trades +
+    VIX into one JSON file at /app/market_data/daily_snapshots/YYYY-MM-DD.json.
+    Redis snapshots expire in 7 days; this file is permanent — it is both the
+    post-close discussion brief (read one small file, zero tokens intraday)
+    and raw material for future analysis.
+    """
+    import json as _json
+    from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import text as _text
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+
+    now_ist = _dt2.now(_tz2.utc) + _td2(hours=5, minutes=30)
+    if now_ist.weekday() >= 5:
+        return None
+    day = now_ist.strftime("%Y-%m-%d")
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+
+    # intraday series from the 15-min snapshots
+    snaps = [_json.loads(x) for x in r.lrange(f"market_watch:{day}", 0, -1)]
+    series = [{"t": s["ts_ist"],
+               "nifty": float(s["nifty"]) if s.get("nifty") else None,
+               "banknifty": float(s["banknifty"]) if s.get("banknifty") else None,
+               "open_pnl": round(sum(s.get("open_groups", {}).values()))}
+              for s in snaps]
+    nvals = [p["nifty"] for p in series if p["nifty"]]
+    bvals = [p["banknifty"] for p in series if p["banknifty"]]
+
+    digest = {
+        "date": day,
+        "generated_ist": now_ist.strftime("%H:%M IST"),
+        "nifty": {"open": nvals[0], "close": nvals[-1], "high": max(nvals), "low": min(nvals),
+                  "chg_pct": round((nvals[-1] / nvals[0] - 1) * 100, 2)} if nvals else None,
+        "banknifty": {"open": bvals[0], "close": bvals[-1], "high": max(bvals), "low": min(bvals),
+                      "chg_pct": round((bvals[-1] / bvals[0] - 1) * 100, 2)} if bvals else None,
+        "series": series,
+        "real_ticks_all_day": all(s.get("real_ticks") for s in snaps) if snaps else False,
+    }
+
+    # VIX close (nightly-updated cache)
+    try:
+        vix = Path("/app/market_data/india_vix.csv").read_text().strip().splitlines()[-1]
+        digest["vix_last"] = float(vix.split(",")[1])
+    except Exception:
+        digest["vix_last"] = None
+
+    async with AsyncSessionLocal() as db:
+        closed = (await db.execute(_text(
+            "SELECT trade_group_id, underlying, string_agg(DISTINCT exit_reason, ','), "
+            "ROUND(SUM(pnl)::numeric,0), min(entry_time), max(exit_time) "
+            "FROM trades WHERE status='CLOSED' AND exit_time >= CURRENT_DATE AND mode='PAPER' "
+            "GROUP BY trade_group_id, underlying"))).all()
+        digest["closed_groups"] = [
+            {"group": (g or "?")[:8], "ul": ul, "exit_reason": reas, "net_pnl": float(p or 0)}
+            for g, ul, reas, p, _e, _x in closed]
+        digest["closed_net"] = round(sum(c["net_pnl"] for c in digest["closed_groups"]))
+        open_rows = (await db.execute(_text(
+            "SELECT trade_group_id, underlying, ROUND(SUM(unrealized_pnl)::numeric,0) "
+            "FROM trades WHERE status='OPEN' AND mode='PAPER' GROUP BY trade_group_id, underlying"))).all()
+        digest["open_groups"] = [{"group": (g or "?")[:8], "ul": ul, "unrealized": float(p or 0)}
+                                 for g, ul, p in open_rows]
+        digest["open_unrealized"] = round(sum(o["unrealized"] for o in digest["open_groups"]))
+        sigs = (await db.execute(_text(
+            "SELECT pattern_name, count(*) FROM signals WHERE created_at >= CURRENT_DATE "
+            "GROUP BY pattern_name"))).all()
+        digest["signals_today"] = {p: int(n) for p, n in sigs}
+
+    try:
+        integ = r.get("trade_integrity:last")
+        digest["integrity_violations"] = len(_json.loads(integ)["violations"]) if integ else None
+    except Exception:
+        digest["integrity_violations"] = None
+
+    out_dir = Path("/app/market_data/daily_snapshots")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{day}.json"
+    out.write_text(_json.dumps(digest, indent=1, default=str))
+    r.setex("eod_digest:last", 86400 * 3, _json.dumps(digest, default=str))
+    logger.info(f"EOD digest written: {out} closed_net={digest['closed_net']} "
+                f"open_unrl={digest['open_unrealized']} snaps={len(series)}")
+    return digest
+
+
+@celery_app.task(name="workers.eod_market_digest")
+def eod_market_digest():
+    """15:40 IST Mon-Fri: durable end-of-day market + book digest to disk."""
+    try:
+        result = _run_async(_do_eod_market_digest())
+        _stamp_task_run("workers.eod_market_digest")
+        return result
+    except Exception as exc:
+        logger.error(f"EOD digest failed: {exc}")
+        return {"status": "ERROR", "error": str(exc)}
+
