@@ -142,6 +142,12 @@ AlphaFO is an NSE F&O paper + live trading system. Backend: FastAPI + SQLAlchemy
 - Contains: pattern name, direction, confidence %, IV%, IV rank, strike/expiry, entry/target/stop prices, signal explanation excerpt, strategy rationale, risk per lot
 - Composite notes include `STRATEGY:{name}|{rationale}|legs:{n}|group:{id[:8]}`
 
+### Anomaly journal (permanent issue record)
+- `anomalies` DB table (`models/anomaly.py`) — every detected issue persisted forever (Redis health state has TTLs and vanishes)
+- Written by health-scan via `_journal_anomalies()`: auto-fixes, integrity violations, ticker staleness, halts, **signal churn** (>20 signals/pattern/day = dedup/data defect), **spot sanity** (spot key >5% from last EOD-digest close = synthetic/stale price)
+- Dedup: same source+kind not re-journaled within 60 min (health-scan runs */5min)
+- `GET /api/v1/system/anomalies?days=7&source=integrity` — newest first; `anomalies_today` also included in the EOD digest for post-close review
+
 ### Health-check scanner
 - `health-scan` Celery task runs every 5 minutes (all day, not restricted to market hours)
 - Checks and auto-fixes four conditions:

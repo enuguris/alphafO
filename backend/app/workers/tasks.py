@@ -2471,6 +2471,53 @@ def health_scan():
         except Exception:
             pass
 
+        # ── 5b. Signal churn spike — >20 signals/pattern/day is a defect
+        # (this is how the 69/day max_pain flood should have been caught)
+        try:
+            churn = _run_async(_signal_churn_today())
+            for pat, n in churn.items():
+                if n > 20:
+                    issues.append(f"signal_churn: {pat} created {n} signals today (>20 = dedup/data defect)")
+        except Exception:
+            pass
+
+        # ── 5c. Spot sanity vs last EOD digest close — catches the synthetic-
+        # drift class of bug (spot keys wandering far from last known real close)
+        try:
+            import json as _sj
+            from pathlib import Path as _P
+            snaps = sorted(_P("/app/market_data/daily_snapshots").glob("*.json"))
+            if snaps:
+                last_digest = _sj.loads(snaps[-1].read_text())
+                for ul in ("nifty", "banknifty"):
+                    ref = (last_digest.get(ul) or {}).get("close")
+                    cur = r.get(f"spot:{ul.upper()}")
+                    if ref and cur and abs(float(cur) / ref - 1) > 0.05:
+                        issues.append(
+                            f"spot_sanity: spot:{ul.upper()}={float(cur):.0f} is "
+                            f">{5}% from last real close {ref:.0f} — possible synthetic/stale price")
+        except Exception:
+            pass
+
+        # ── 5d. Journal everything permanently (Redis state expires; this doesn't)
+        try:
+            entries = []
+            for f in fixes:
+                entries.append({"source": "health_scan", "kind": f.split(":", 1)[0],
+                                "severity": "warn", "detail": {"msg": f}, "auto_fixed": True})
+            for i in issues:
+                kind = i.split(":", 1)[0]
+                src = "integrity" if kind == "integrity" else (
+                    "signal_churn" if kind == "signal_churn" else (
+                        "data_check" if kind in ("spot_sanity", "ticker_stale") else "health_scan"))
+                sev = "critical" if kind in ("integrity", "ticker_stale", "trading_halted", "spot_sanity") else "warn"
+                entries.append({"source": src, "kind": kind, "severity": sev,
+                                "detail": {"msg": i}, "auto_fixed": False})
+            if entries:
+                _run_async(_journal_anomalies(entries))
+        except Exception as _je:
+            logger.error(f"anomaly journal write failed: {_je}")
+
         # ── 6. Summary ────────────────────────────────────────────────────────
         status = "ok" if not issues else "degraded"
         result = {
@@ -2495,6 +2542,45 @@ def health_scan():
     except Exception as exc:
         logger.error(f"health-scan failed: {exc}", exc_info=True)
         return {"status": "error", "error": str(exc)}
+
+
+async def _signal_churn_today() -> dict:
+    """Signals created today per pattern — churn detector input."""
+    from sqlalchemy import text as _text
+    from app.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(_text(
+            "SELECT pattern_name, count(*) FROM signals "
+            "WHERE created_at >= CURRENT_DATE GROUP BY 1"))).all()
+    return {p: int(n) for p, n in rows}
+
+
+async def _journal_anomalies(entries: list[dict]) -> int:
+    """
+    Persist anomalies to the permanent journal (anomalies table).
+    Dedup: skip if an unresolved row with the same source+kind exists in the
+    last 60 minutes — health-scan runs every 5 min and must not spam the
+    journal with the same ongoing condition.
+    """
+    from sqlalchemy import text as _text
+    from app.database import AsyncSessionLocal
+    from app.models.anomaly import Anomaly
+    written = 0
+    async with AsyncSessionLocal() as db:
+        for e in entries:
+            dup = (await db.execute(_text(
+                "SELECT 1 FROM anomalies WHERE source=:s AND kind=:k "
+                "AND resolved=false AND ts > NOW() - INTERVAL '60 minutes' LIMIT 1"
+            ), {"s": e["source"], "k": e["kind"]})).first()
+            if dup:
+                continue
+            db.add(Anomaly(source=e["source"], kind=e["kind"],
+                           severity=e.get("severity", "warn"),
+                           detail=e.get("detail", {}),
+                           auto_fixed=e.get("auto_fixed", False)))
+            written += 1
+        await db.commit()
+    return written
 
 
 async def _verify_trade_integrity() -> list[str]:
@@ -3181,6 +3267,16 @@ async def _do_eod_market_digest():
             "SELECT pattern_name, count(*) FROM signals WHERE created_at >= CURRENT_DATE "
             "GROUP BY pattern_name"))).all()
         digest["signals_today"] = {p: int(n) for p, n in sigs}
+        try:
+            anom = (await db.execute(_text(
+                "SELECT source, kind, severity, auto_fixed, count(*), max(detail->>'msg') "
+                "FROM anomalies WHERE ts >= CURRENT_DATE GROUP BY 1,2,3,4 ORDER BY 3"))).all()
+            digest["anomalies_today"] = [
+                {"source": s, "kind": k, "severity": sev, "auto_fixed": fx,
+                 "count": int(n), "example": ex}
+                for s, k, sev, fx, n, ex in anom]
+        except Exception:
+            digest["anomalies_today"] = []
 
     try:
         integ = r.get("trade_integrity:last")

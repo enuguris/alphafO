@@ -54,8 +54,10 @@ def test_pcr_cache_is_recent():
         last = pd.to_datetime(df["date"]).dt.date.max()
         assert (date.today() - last).days <= 7, f"PCR {sym} stale: last={last}"
         # PCR values must be sane. Post-expiry OI-reset days can genuinely
-        # print very low PCR (e.g. 0.18 on 2026-04-02) — bounds allow those.
-        assert df["pcr"].between(0.1, 4.0).all(), f"PCR {sym} has insane values"
+        # print extremes (0.18 on 2026-04-02, 4.99 on 2018-05-31) — history
+        # gets loose bounds; the last 30 rows (what trading reads) strict ones.
+        assert df["pcr"].between(0.05, 8.0).all(), f"PCR {sym} has insane values"
+        assert df["pcr"].tail(30).between(0.1, 4.0).all(), f"PCR {sym} recent values insane"
 
 
 def test_vix_cache_recent_and_sane():
