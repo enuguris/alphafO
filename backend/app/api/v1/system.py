@@ -276,3 +276,17 @@ async def market_watch(day: str | None = None):
         day = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     raw = r.lrange(f"market_watch:{day}", 0, -1)
     return {"day": day, "snapshots": [json.loads(x) for x in raw], "count": len(raw)}
+
+
+@router.get("/readiness")
+async def premarket_readiness_result():
+    """Latest pre-market readiness result (runs 08:50 IST Mon-Fri; also on demand)."""
+    import json
+    import redis as _r
+    from app.config import settings as _st
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    raw = r.get("premarket_readiness")
+    if raw:
+        return json.loads(raw)
+    from app.workers.tasks import _do_premarket_readiness
+    return await _do_premarket_readiness()

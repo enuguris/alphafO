@@ -157,5 +157,12 @@ celery_app.conf.update(
             "task": "workers.zero_dte_straddle",
             "schedule": crontab(minute="45", hour="9", day_of_week="2"),
         },
+        # Pre-market readiness — 08:50 IST Mon-Fri: broker-token freshness,
+        # DB/Redis, beat liveness, integrity, halts, data freshness. Result at
+        # GET /api/v1/system/readiness. GO / DEGRADED / NO-GO.
+        "premarket-readiness": {
+            "task": "workers.premarket_readiness",
+            "schedule": crontab(minute="50", hour="8", day_of_week="1-5"),
+        },
     },
 )

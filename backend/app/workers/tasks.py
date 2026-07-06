@@ -2990,3 +2990,121 @@ def zero_dte_straddle():
         logger.error(f"0DTE straddle failed: {exc}")
         return {"status": "error", "error": str(exc)}
 
+
+
+# â”€â”€ Pre-market readiness check â€” 08:50 IST Mon-Fri â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+async def _do_premarket_readiness():
+    """
+    Verify everything is GO before the 09:15 open. Each check exists because
+    it actually failed at least once this week. Result cached in Redis
+    (premarket_readiness) and served at GET /api/v1/system/readiness.
+    """
+    import json as _json
+    from datetime import date as _d, datetime as _dtm, timedelta as _tdl, timezone as _tz
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import select as _sel, text as _text
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+
+    checks = []          # (name, ok, detail)
+    today = _d.today()
+
+    def add(name, ok, detail=""):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+    # 1. Redis + DB reachable
+    try:
+        r = _r.from_url(_st.redis_url, decode_responses=True)
+        r.ping()
+        add("redis", True)
+    except Exception as e:
+        add("redis", False, str(e)[:80])
+        r = None
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(_text("SELECT 1"))
+            cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+        add("database", True)
+    except Exception as e:
+        add("database", False, str(e)[:80])
+        cfg = None
+
+    # 2. Broker tokens fresh TODAY (they expire daily â€” bit us twice)
+    kite_ok = bool(cfg and cfg.access_token_enc and cfg.token_date == today)
+    add("kite_token_fresh", kite_ok,
+        "" if kite_ok else "REGENERATE Kite token before open â€” entries fall back to estimates without it")
+    up_ok = bool(cfg and cfg.upstox_access_token_enc and cfg.upstox_token_date == today)
+    add("upstox_token_fresh", up_ok,
+        "" if up_ok else "regenerate Upstox token (backtests + LTP fallback need it)")
+
+    # 3. Spot keys present (ticker seeded) â€” freshness is checked in-hours by heartbeat
+    if r:
+        sn, sb = r.get("spot:NIFTY"), r.get("spot:BANKNIFTY")
+        add("spot_keys", bool(sn and sb), f"NIFTY={sn} BANKNIFTY={sb}")
+
+    # 4. Trading not unexpectedly halted; risk params sane
+    if r:
+        halted = bool(r.get("trading_halted")) or bool(r.get("kill_switch"))
+        add("not_halted", not halted, "trading_halted/kill_switch set!" if halted else "")
+        try:
+            from app.core.risk.gate import get_risk_params
+            rp = get_risk_params()
+            add("risk_params", rp.get("paper_capital", 0) > 0,
+                f"heat {rp.get('max_portfolio_heat')}% cap {rp.get('paper_capital')}")
+        except Exception as e:
+            add("risk_params", False, str(e)[:80])
+
+    # 5. Celery beat alive: key tasks stamped within their expected windows
+    if r:
+        hs = r.get("task_last_run:workers.health_scan")
+        ok_beat = False
+        if hs:
+            try:
+                age = (_dtm.utcnow() - _dtm.fromisoformat(hs)).total_seconds()
+                ok_beat = age < 900
+            except Exception:
+                pass
+        add("celery_beat", ok_beat, f"health_scan last run {hs}" if hs else "no health_scan stamp")
+
+    # 6. Trade integrity clean
+    try:
+        from app.workers.tasks import _verify_trade_integrity
+        v = await _verify_trade_integrity()
+        add("trade_integrity", len(v) == 0, "; ".join(v[:2]) if v else "")
+    except Exception as e:
+        add("trade_integrity", False, str(e)[:80])
+
+    # 7. Data freshness: candle archive collected last session; VIX file recent
+    arch = Path("/app/market_data/intraday")
+    recent = sorted(arch.glob("candles_*.csv"))[-1].name if arch.exists() and list(arch.glob("candles_*.csv")) else None
+    add("candle_archive", recent is not None, f"latest: {recent}")
+    vix = Path("/app/market_data/india_vix.csv")
+    add("vix_cache", vix.exists() and (today - _d.fromtimestamp(vix.stat().st_mtime)).days <= 7,
+        "stale/missing india_vix.csv" if not vix.exists() else "")
+
+    passed = sum(1 for c in checks if c["ok"])
+    status = "GO" if passed == len(checks) else ("DEGRADED" if passed >= len(checks) - 2 else "NO-GO")
+    result = {"status": status, "passed": f"{passed}/{len(checks)}", "checks": checks,
+              "ts_ist": (_dtm.now(_tz.utc) + _tdl(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M IST")}
+    if r:
+        r.setex("premarket_readiness", 86400, _json.dumps(result))
+    log = logger.warning if status != "GO" else logger.info
+    log(f"PRE-MARKET READINESS: {status} ({passed}/{len(checks)}) â€” "
+        + "; ".join(f"{c['check']}:{'OK' if c['ok'] else 'FAIL ' + c['detail']}" for c in checks if not c["ok"]))
+    return result
+
+
+@celery_app.task(name="workers.premarket_readiness")
+def premarket_readiness():
+    """08:50 IST Mon-Fri: verify the system is GO before market open."""
+    try:
+        result = _run_async(_do_premarket_readiness())
+        _stamp_task_run("workers.premarket_readiness")
+        return result
+    except Exception as exc:
+        logger.error(f"premarket readiness failed: {exc}")
+        return {"status": "ERROR", "error": str(exc)}
+
