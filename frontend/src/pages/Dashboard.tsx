@@ -502,7 +502,10 @@ export default function Dashboard() {
 
   // ── WebSocket: live signals ───────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout>
     const connect = () => {
+      if (cancelled) return
       const ws = createSignalSocket(
         (msg) => {
           if (msg.type === 'initial_signals') {
@@ -526,13 +529,16 @@ export default function Dashboard() {
         },
         () => {
           setWsConnected(false)
-          setTimeout(connect, 3000) // reconnect
+          if (!cancelled) {
+            clearTimeout(timer)
+            timer = setTimeout(connect, 3000) // single pending reconnect
+          }
         }
       )
       wsRef.current = ws
     }
     connect()
-    return () => wsRef.current?.close()
+    return () => { cancelled = true; clearTimeout(timer); wsRef.current?.close() }
   }, [])
 
   // ── WebSocket: live prices ────────────────────────────────────────────────

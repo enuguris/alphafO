@@ -77,9 +77,14 @@ const WS_BASE = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.h
 
 export function createSignalSocket(onMessage: (data: any) => void, onError?: () => void) {
   const ws = new WebSocket(`${WS_BASE}/signals`)
+  // A failing socket fires BOTH onerror and onclose — notify only once, or
+  // every reconnect scheduled by the caller doubles the connection count
+  // (1→2→4→…→129 sockets after a few backend restarts).
+  let notified = false
+  const fail = () => { if (!notified) { notified = true; onError?.() } }
   ws.onmessage = e => { try { onMessage(JSON.parse(e.data)) } catch {} }
-  ws.onerror   = () => onError?.()
-  ws.onclose   = () => onError?.()
+  ws.onerror   = fail
+  ws.onclose   = fail
   return ws
 }
 
