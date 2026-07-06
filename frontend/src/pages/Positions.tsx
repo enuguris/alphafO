@@ -985,8 +985,26 @@ function LivePnlBar({ trades, spotPrices, risk }: { trades: any[]; spotPrices: R
         </>
       )}
       <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
-        <div style={{ width: 7, height: 7, borderRadius: '50%', background: liveCount > 0 ? 'var(--up)' : 'var(--txt3)', animation: liveCount > 0 ? 'pulse 1.5s infinite' : 'none' }} />
-        <span style={{ fontSize: 10, color: 'var(--txt3)' }}>{liveCount > 0 ? 'Live prices via WebSocket' : 'Waiting for price feed…'}</span>
+        {(() => {
+          // NSE hours: Mon-Fri 09:15-15:30 IST — computed via IST wall clock
+          const istNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
+          const mins = istNow.getHours() * 60 + istNow.getMinutes()
+          const openNow = istNow.getDay() >= 1 && istNow.getDay() <= 5 && mins >= 555 && mins <= 930
+          if (!openNow) return (
+            <>
+              <div style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--orange)' }} />
+              <span style={{ fontSize: 10, color: 'var(--orange)', fontWeight: 600 }}>
+                MARKET CLOSED — prices frozen at last close
+              </span>
+            </>
+          )
+          return (
+            <>
+              <div style={{ width: 7, height: 7, borderRadius: '50%', background: liveCount > 0 ? 'var(--up)' : 'var(--txt3)', animation: liveCount > 0 ? 'pulse 1.5s infinite' : 'none' }} />
+              <span style={{ fontSize: 10, color: 'var(--txt3)' }}>{liveCount > 0 ? 'Live prices via WebSocket' : 'Waiting for price feed…'}</span>
+            </>
+          )
+        })()}
       </div>
     </div>
   )

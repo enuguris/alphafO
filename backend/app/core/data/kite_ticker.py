@@ -350,8 +350,22 @@ class KiteTickerService:
         }
         logger.info("KiteTickerService: running simulated price ticks")
         while self._running:
+            # Market closed (weekend / outside 09:15-15:30 IST): FREEZE prices.
+            # Random-walking a closed market showed fake "live" moves in the UI
+            # (user caught this 2026-07-05). We still rewrite the last value to
+            # keep the spot: keys' TTL alive for MTM readers.
+            from datetime import datetime as _dtm, timedelta as _tdl, timezone as _tz
+            _now_ist = _dtm.now(_tz.utc) + _tdl(hours=5, minutes=30)
+            _mkt_open = (_now_ist.weekday() < 5 and
+                         (9, 15) <= (_now_ist.hour, _now_ist.minute) <= (15, 30))
             pipe = self._redis.pipeline()
             batch: dict[str, dict] = {}
+            if not _mkt_open:
+                for sym, price_data in self._live_prices.items():
+                    pipe.set(f"spot:{sym}", str(price_data["ltp"]), ex=3600)
+                pipe.execute()
+                await asyncio.sleep(30)
+                continue
             for sym, price_data in self._live_prices.items():
                 ltp  = price_data["ltp"]
                 ltp  = ltp * (1 + random.gauss(0, 0.0003))
