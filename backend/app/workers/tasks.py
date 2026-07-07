@@ -1526,11 +1526,18 @@ async def _close_trade(trade, exit_price: float, reason: str, db):
         f"Trade closed: {trade.symbol} | {reason} | "
         f"gross ₹{gross:.2f} | charges ₹{charges.total:.2f} | net ₹{net_pnl:.2f}"
     )
-    # Update daily risk gate P&L and release deployed capital
+    # Update daily risk gate P&L and release deployed capital.
+    # Release must mirror what was RECORDED at entry: margin-style
+    # (margin_blocked + entry charges) for margin trades, premium value for
+    # legacy rows. Releasing premium against a margin-style entry drifted the
+    # Redis heat counter by lakhs/day (anomaly journal, 2026-07-07).
     try:
         from app.core.risk.gate import record_pnl, record_deployed as _release_deployed
         record_pnl(net_pnl)
-        _release_deployed(-(trade_cost + entry_charges_paid))   # negative = release
+        if trade.margin_blocked is not None:
+            _release_deployed(-(trade.margin_blocked + entry_charges_paid))
+        else:
+            _release_deployed(-(trade_cost + entry_charges_paid))   # legacy premium-value rows
     except Exception:
         pass
 
@@ -1879,16 +1886,25 @@ async def _sync_deployed_from_db() -> None:
         from app.core.risk.gate import record_deployed
 
         async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(func.sum(Trade.entry_price * Trade.quantity)).where(
+            # Margin-style heat, same formula as main.py startup sync and
+            # health-scan resync. The old premium-value formula here
+            # (entry_price × quantity) re-seeded ₹3.5L against a true ₹0.45L
+            # every day at 09:15 — the anomaly journal's first real catch.
+            rows = (await db.execute(
+                select(Trade).where(
                     Trade.status == TradeStatus.OPEN,
                     Trade.mode   == TradeMode.PAPER,
                 )
+            )).scalars().all()
+            deployed = sum(
+                (t.margin_blocked + (t.charges_entry or 0.0))
+                if t.margin_blocked is not None
+                else (t.entry_price or 0) * (t.quantity or 1)
+                for t in rows
             )
-            deployed = result.scalar() or 0.0
         if deployed > 0:
             record_deployed(float(deployed))
-            logger.info(f"Portfolio heat re-seeded from DB: ₹{deployed:,.0f}")
+            logger.info(f"Portfolio heat re-seeded from DB (margin-style): ₹{deployed:,.0f}")
     except Exception as exc:
         logger.warning(f"Could not re-seed portfolio heat from DB: {exc}")
 
