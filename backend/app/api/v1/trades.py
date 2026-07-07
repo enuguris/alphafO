@@ -56,10 +56,22 @@ async def list_trades(mode: str = "live", status: str | None = None,
 
 @router.post("/refresh-mtm")
 async def refresh_mtm():
-    """Run MTM update inline and return all open trades with fresh prices."""
+    """Run MTM update inline and return all open trades with fresh prices.
+
+    Market-hours gate: outside 09:15-15:30 IST (or on weekends) we skip the
+    reprice and return stored values. Without this, the Positions page's 10s
+    polling kept shrinking BS time-to-expiry after the close, so option
+    prices visibly drifted on a closed market (user caught this 2026-07-06;
+    same class as the 2026-07-05 synthetic-tick drift).
+    """
+    from datetime import datetime as _dtm, timedelta as _tdl, timezone as _tz
     from app.workers.tasks import _do_mtm_update
     from app.database import AsyncSessionLocal
-    await _do_mtm_update()
+    _now_ist = _dtm.now(_tz.utc) + _tdl(hours=5, minutes=30)
+    _mkt_open = (_now_ist.weekday() < 5 and
+                 (9, 15) <= (_now_ist.hour, _now_ist.minute) <= (15, 30))
+    if _mkt_open:
+        await _do_mtm_update()
     # Use a fresh session so we see the committed MTM values, not a stale snapshot
     from app.models.trades import TradeStatus
     async with AsyncSessionLocal() as fresh_db:

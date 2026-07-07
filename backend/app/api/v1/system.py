@@ -1,8 +1,8 @@
-"""
+﻿"""
 System health & operational visibility endpoints.
-  GET /system/schedule   — Celery beat schedule + last-run info from Redis
-  GET /system/health     — Component health (DB, Redis, Kite, Celery)
-  POST /system/run-task  — Manually trigger a background task
+  GET /system/schedule   â€” Celery beat schedule + last-run info from Redis
+  GET /system/health     â€” Component health (DB, Redis, Kite, Celery)
+  POST /system/run-task  â€” Manually trigger a background task
 """
 from __future__ import annotations
 
@@ -33,8 +33,8 @@ async def get_schedule():
     schedule = celery_app.conf.beat_schedule or {}
 
     _descriptions = {
-        "scan-priority-15m":      "Scan NIFTY+BANKNIFTY — 15m/1h timeframes",
-        "scan-all-1h":            "Full multi-TF scan — 1h/4h/daily",
+        "scan-priority-15m":      "Scan NIFTY+BANKNIFTY â€” 15m/1h timeframes",
+        "scan-all-1h":            "Full multi-TF scan â€” 1h/4h/daily",
         "scan-eod":               "End-of-day scan at 15:35",
         "scan-premarket":         "Pre-market daily scan at 09:00",
         "mtm-update":             "Reprice open positions (every minute)",
@@ -135,7 +135,7 @@ async def system_health():
         "ok":             kite_ok,
         "api_key_set":    bool(settings.kite_api_key),
         "token_set":      bool(settings.kite_access_token),
-        "detail":         "Connected" if kite_ok else "Credentials missing — using synthetic data",
+        "detail":         "Connected" if kite_ok else "Credentials missing â€” using synthetic data",
     }
 
     # Ticker
@@ -236,7 +236,7 @@ async def run_task(task_name: str):
 
 @router.get("/providers")
 async def data_provider_health():
-    """Round-robin data provider health — success/fail counts, latency, next turn."""
+    """Round-robin data provider health â€” success/fail counts, latency, next turn."""
     from app.core.data.provider_health import get_health
     return get_health()
 
@@ -255,7 +255,7 @@ async def trade_integrity():
     raw = r.get("trade_integrity:last")
     if raw:
         return json.loads(raw)
-    # Not cached — run inline
+    # Not cached â€” run inline
     from app.workers.tasks import _verify_trade_integrity
     violations = await _verify_trade_integrity()
     return {"violations": violations, "checked_at_ist": "inline"}
@@ -276,3 +276,59 @@ async def market_watch(day: str | None = None):
         day = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     raw = r.lrange(f"market_watch:{day}", 0, -1)
     return {"day": day, "snapshots": [json.loads(x) for x in raw], "count": len(raw)}
+
+
+@router.get("/readiness")
+async def premarket_readiness_result():
+    """Latest pre-market readiness result (runs 08:50 IST Mon-Fri; also on demand)."""
+    import json
+    import redis as _r
+    from app.config import settings as _st
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    raw = r.get("premarket_readiness")
+    if raw:
+        return json.loads(raw)
+    from app.workers.tasks import _do_premarket_readiness
+    return await _do_premarket_readiness()
+
+
+@router.get("/eod-digest")
+async def eod_digest(day: str | None = None):
+    """EOD market digest â€” today's cached copy or any past day from disk."""
+    import json
+    from pathlib import Path
+    import redis as _r
+    from app.config import settings as _st
+    if day:
+        f = Path(f"/app/market_data/daily_snapshots/{day}.json")
+        if f.exists():
+            return json.loads(f.read_text())
+        return {"error": f"no digest for {day}"}
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    raw = r.get("eod_digest:last")
+    if raw:
+        return json.loads(raw)
+    from app.workers.tasks import _do_eod_market_digest
+    return await _do_eod_market_digest() or {"error": "weekend - no digest"}
+
+
+@router.get("/anomalies")
+async def anomaly_journal(days: int = 7, source: str | None = None):
+    """Permanent anomaly journal â€” every issue detected, newest first."""
+    from sqlalchemy import text as _text
+    from app.database import AsyncSessionLocal
+    q = ("SELECT id, ts AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata' AS ts_ist, "
+         "source, kind, severity, detail, auto_fixed, resolved FROM anomalies "
+         "WHERE ts >= NOW() - make_interval(days => :d) ")
+    params: dict = {"d": days}
+    if source:
+        q += "AND source = :s "
+        params["s"] = source
+    q += "ORDER BY ts DESC LIMIT 500"
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(_text(q), params)).mappings().all()
+    out = [dict(r) for r in rows]
+    for r in out:
+        r["ts_ist"] = str(r["ts_ist"])
+    return {"count": len(out), "anomalies": out}
+

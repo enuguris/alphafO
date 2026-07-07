@@ -96,6 +96,7 @@ async def _sync_portfolio_heat_from_db() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting AlphaFO v{settings.app_version} — mode: {settings.app_mode}")
+    from app.models.anomaly import Anomaly  # noqa: F401 — register table for create_all
     await init_db()
     await _load_kite_credentials_from_db()
 

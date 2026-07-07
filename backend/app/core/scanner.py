@@ -160,6 +160,14 @@ def synthetic_ohlcv(underlying: str, timeframe: Timeframe = "daily") -> pd.DataF
     iv_arr = np.clip(iv_arr, 10, 45)
     iv_arr[-5:] = iv_arr[-5:] * 1.25   # elevate last 5 bars by 25% above rolling avg
 
+    # Re-anchor the whole series so the LAST close equals the real spot.
+    # The cumulative random walk drifts ±7-14% off base over ~240 bars, and the
+    # fixed per-timeframe seed makes each timeframe settle at a different wrong
+    # price — patterns comparing close to real-world anchors (max pain, chain)
+    # then fire phantom signals in both directions (69 max_pain/day churn).
+    scale = base / close_arr[-1] if close_arr[-1] > 0 else 1.0
+    open_arr, high_arr, low_arr, close_arr = (a * scale for a in (open_arr, high_arr, low_arr, close_arr))
+
     dates = pd.date_range(end=datetime.now(), periods=rows, freq=freq)
     return pd.DataFrame({
         "timestamp": dates,

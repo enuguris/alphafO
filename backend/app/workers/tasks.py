@@ -2434,7 +2434,12 @@ def health_scan():
 
         active_signals = _run_async(_count_active())
 
-        if active_signals == 0:
+        # Only meaningful during market hours — overnight the scanner is
+        # deliberately idle and an empty queue is normal (journal noise otherwise)
+        _hs_now_ist = _dt.now(_tz.utc) + _td(hours=5, minutes=30)
+        _hs_mkt = (_hs_now_ist.weekday() < 5 and
+                   (9, 15) <= (_hs_now_ist.hour, _hs_now_ist.minute) <= (15, 30))
+        if active_signals == 0 and _hs_mkt:
             issues.append("no_active_signals: scanner may be stalled — trigger scan-priority-15m")
 
         # ── 4b. Real-tick heartbeat (market hours only) ───────────────────────
@@ -2471,6 +2476,53 @@ def health_scan():
         except Exception:
             pass
 
+        # ── 5b. Signal churn spike — >20 signals/pattern/day is a defect
+        # (this is how the 69/day max_pain flood should have been caught)
+        try:
+            churn = _run_async(_signal_churn_today())
+            for pat, n in churn.items():
+                if n > 20:
+                    issues.append(f"signal_churn: {pat} created {n} signals today (>20 = dedup/data defect)")
+        except Exception:
+            pass
+
+        # ── 5c. Spot sanity vs last EOD digest close — catches the synthetic-
+        # drift class of bug (spot keys wandering far from last known real close)
+        try:
+            import json as _sj
+            from pathlib import Path as _P
+            snaps = sorted(_P("/app/market_data/daily_snapshots").glob("*.json"))
+            if snaps:
+                last_digest = _sj.loads(snaps[-1].read_text())
+                for ul in ("nifty", "banknifty"):
+                    ref = (last_digest.get(ul) or {}).get("close")
+                    cur = r.get(f"spot:{ul.upper()}")
+                    if ref and cur and abs(float(cur) / ref - 1) > 0.05:
+                        issues.append(
+                            f"spot_sanity: spot:{ul.upper()}={float(cur):.0f} is "
+                            f">{5}% from last real close {ref:.0f} — possible synthetic/stale price")
+        except Exception:
+            pass
+
+        # ── 5d. Journal everything permanently (Redis state expires; this doesn't)
+        try:
+            entries = []
+            for f in fixes:
+                entries.append({"source": "health_scan", "kind": f.split(":", 1)[0],
+                                "severity": "warn", "detail": {"msg": f}, "auto_fixed": True})
+            for i in issues:
+                kind = i.split(":", 1)[0]
+                src = "integrity" if kind == "integrity" else (
+                    "signal_churn" if kind == "signal_churn" else (
+                        "data_check" if kind in ("spot_sanity", "ticker_stale") else "health_scan"))
+                sev = "critical" if kind in ("integrity", "ticker_stale", "trading_halted", "spot_sanity") else "warn"
+                entries.append({"source": src, "kind": kind, "severity": sev,
+                                "detail": {"msg": i}, "auto_fixed": False})
+            if entries:
+                _run_async(_journal_anomalies(entries))
+        except Exception as _je:
+            logger.error(f"anomaly journal write failed: {_je}")
+
         # ── 6. Summary ────────────────────────────────────────────────────────
         status = "ok" if not issues else "degraded"
         result = {
@@ -2495,6 +2547,48 @@ def health_scan():
     except Exception as exc:
         logger.error(f"health-scan failed: {exc}", exc_info=True)
         return {"status": "error", "error": str(exc)}
+
+
+async def _signal_churn_today() -> dict:
+    """Signals created today per pattern — churn detector input."""
+    from sqlalchemy import text as _text
+    from app.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(_text(
+            "SELECT pattern_name, count(*) FROM signals "
+            "WHERE created_at >= CURRENT_DATE GROUP BY 1"))).all()
+    return {p: int(n) for p, n in rows}
+
+
+async def _journal_anomalies(entries: list[dict]) -> int:
+    """
+    Persist anomalies to the permanent journal (anomalies table).
+    Dedup: skip if an unresolved row with the same source+kind exists in the
+    last 60 minutes — health-scan runs every 5 min and must not spam the
+    journal with the same ongoing condition.
+    """
+    from sqlalchemy import text as _text
+    from app.database import AsyncSessionLocal
+    from app.models.anomaly import Anomaly
+    written = 0
+    async with AsyncSessionLocal() as db:
+        for e in entries:
+            # Slow-changing daily conditions journal once per day, not hourly
+            window = ("CURRENT_DATE" if e["source"] in ("signal_churn",)
+                      else "NOW() - INTERVAL '60 minutes'")
+            dup = (await db.execute(_text(
+                "SELECT 1 FROM anomalies WHERE source=:s AND kind=:k "
+                f"AND resolved=false AND ts > {window} LIMIT 1"
+            ), {"s": e["source"], "k": e["kind"]})).first()
+            if dup:
+                continue
+            db.add(Anomaly(source=e["source"], kind=e["kind"],
+                           severity=e.get("severity", "warn"),
+                           detail=e.get("detail", {}),
+                           auto_fixed=e.get("auto_fixed", False)))
+            written += 1
+        await db.commit()
+    return written
 
 
 async def _verify_trade_integrity() -> list[str]:
@@ -2989,4 +3083,233 @@ def zero_dte_straddle():
     except Exception as exc:
         logger.error(f"0DTE straddle failed: {exc}")
         return {"status": "error", "error": str(exc)}
+
+
+
+# â”€â”€ Pre-market readiness check â€” 08:50 IST Mon-Fri â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+async def _do_premarket_readiness():
+    """
+    Verify everything is GO before the 09:15 open. Each check exists because
+    it actually failed at least once this week. Result cached in Redis
+    (premarket_readiness) and served at GET /api/v1/system/readiness.
+    """
+    import json as _json
+    from datetime import date as _d, datetime as _dtm, timedelta as _tdl, timezone as _tz
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import select as _sel, text as _text
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+
+    checks = []          # (name, ok, detail)
+    today = _d.today()
+
+    def add(name, ok, detail=""):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+    # 1. Redis + DB reachable
+    try:
+        r = _r.from_url(_st.redis_url, decode_responses=True)
+        r.ping()
+        add("redis", True)
+    except Exception as e:
+        add("redis", False, str(e)[:80])
+        r = None
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(_text("SELECT 1"))
+            cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+        add("database", True)
+    except Exception as e:
+        add("database", False, str(e)[:80])
+        cfg = None
+
+    # 2. Broker tokens fresh TODAY (they expire daily â€” bit us twice)
+    kite_ok = bool(cfg and cfg.access_token_enc and cfg.token_date == today)
+    add("kite_token_fresh", kite_ok,
+        "" if kite_ok else "REGENERATE Kite token before open â€” entries fall back to estimates without it")
+    up_ok = bool(cfg and cfg.upstox_access_token_enc and cfg.upstox_token_date == today)
+    add("upstox_token_fresh", up_ok,
+        "" if up_ok else "regenerate Upstox token (backtests + LTP fallback need it)")
+
+    # 3. Spot keys present (ticker seeded) â€” freshness is checked in-hours by heartbeat
+    if r:
+        sn, sb = r.get("spot:NIFTY"), r.get("spot:BANKNIFTY")
+        add("spot_keys", bool(sn and sb), f"NIFTY={sn} BANKNIFTY={sb}")
+
+    # 4. Trading not unexpectedly halted; risk params sane
+    if r:
+        halted = bool(r.get("trading_halted")) or bool(r.get("kill_switch"))
+        add("not_halted", not halted, "trading_halted/kill_switch set!" if halted else "")
+        try:
+            from app.core.risk.gate import get_risk_params
+            rp = get_risk_params()
+            add("risk_params", rp.get("paper_capital", 0) > 0,
+                f"heat {rp.get('max_portfolio_heat')}% cap {rp.get('paper_capital')}")
+        except Exception as e:
+            add("risk_params", False, str(e)[:80])
+
+    # 5. Celery beat alive: key tasks stamped within their expected windows
+    if r:
+        hs = r.get("task_last_run:workers.health_scan")
+        ok_beat = False
+        if hs:
+            try:
+                age = (_dtm.utcnow() - _dtm.fromisoformat(hs)).total_seconds()
+                ok_beat = age < 900
+            except Exception:
+                pass
+        add("celery_beat", ok_beat, f"health_scan last run {hs}" if hs else "no health_scan stamp")
+
+    # 6. Trade integrity clean
+    try:
+        from app.workers.tasks import _verify_trade_integrity
+        v = await _verify_trade_integrity()
+        add("trade_integrity", len(v) == 0, "; ".join(v[:2]) if v else "")
+    except Exception as e:
+        add("trade_integrity", False, str(e)[:80])
+
+    # 7. Data freshness: candle archive collected last session; VIX file recent
+    arch = Path("/app/market_data/intraday")
+    recent = sorted(arch.glob("candles_*.csv"))[-1].name if arch.exists() and list(arch.glob("candles_*.csv")) else None
+    add("candle_archive", recent is not None, f"latest: {recent}")
+    vix = Path("/app/market_data/india_vix.csv")
+    add("vix_cache", vix.exists() and (today - _d.fromtimestamp(vix.stat().st_mtime)).days <= 7,
+        "stale/missing india_vix.csv" if not vix.exists() else "")
+
+    passed = sum(1 for c in checks if c["ok"])
+    status = "GO" if passed == len(checks) else ("DEGRADED" if passed >= len(checks) - 2 else "NO-GO")
+    result = {"status": status, "passed": f"{passed}/{len(checks)}", "checks": checks,
+              "ts_ist": (_dtm.now(_tz.utc) + _tdl(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M IST")}
+    if r:
+        r.setex("premarket_readiness", 86400, _json.dumps(result))
+    log = logger.warning if status != "GO" else logger.info
+    log(f"PRE-MARKET READINESS: {status} ({passed}/{len(checks)}) â€” "
+        + "; ".join(f"{c['check']}:{'OK' if c['ok'] else 'FAIL ' + c['detail']}" for c in checks if not c["ok"]))
+    return result
+
+
+@celery_app.task(name="workers.premarket_readiness")
+def premarket_readiness():
+    """08:50 IST Mon-Fri: verify the system is GO before market open."""
+    try:
+        result = _run_async(_do_premarket_readiness())
+        _stamp_task_run("workers.premarket_readiness")
+        return result
+    except Exception as exc:
+        logger.error(f"premarket readiness failed: {exc}")
+        return {"status": "ERROR", "error": str(exc)}
+
+
+# ── EOD market digest — durable daily snapshot to disk ────────────────────────
+
+async def _do_eod_market_digest():
+    """
+    15:40 IST: fold the day's 15-min market_watch snapshots + closed trades +
+    VIX into one JSON file at /app/market_data/daily_snapshots/YYYY-MM-DD.json.
+    Redis snapshots expire in 7 days; this file is permanent — it is both the
+    post-close discussion brief (read one small file, zero tokens intraday)
+    and raw material for future analysis.
+    """
+    import json as _json
+    from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import text as _text
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+
+    now_ist = _dt2.now(_tz2.utc) + _td2(hours=5, minutes=30)
+    if now_ist.weekday() >= 5:
+        return None
+    day = now_ist.strftime("%Y-%m-%d")
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+
+    # intraday series from the 15-min snapshots
+    snaps = [_json.loads(x) for x in r.lrange(f"market_watch:{day}", 0, -1)]
+    series = [{"t": s["ts_ist"],
+               "nifty": float(s["nifty"]) if s.get("nifty") else None,
+               "banknifty": float(s["banknifty"]) if s.get("banknifty") else None,
+               "open_pnl": round(sum(s.get("open_groups", {}).values()))}
+              for s in snaps]
+    nvals = [p["nifty"] for p in series if p["nifty"]]
+    bvals = [p["banknifty"] for p in series if p["banknifty"]]
+
+    digest = {
+        "date": day,
+        "generated_ist": now_ist.strftime("%H:%M IST"),
+        "nifty": {"open": nvals[0], "close": nvals[-1], "high": max(nvals), "low": min(nvals),
+                  "chg_pct": round((nvals[-1] / nvals[0] - 1) * 100, 2)} if nvals else None,
+        "banknifty": {"open": bvals[0], "close": bvals[-1], "high": max(bvals), "low": min(bvals),
+                      "chg_pct": round((bvals[-1] / bvals[0] - 1) * 100, 2)} if bvals else None,
+        "series": series,
+        "real_ticks_all_day": all(s.get("real_ticks") for s in snaps) if snaps else False,
+    }
+
+    # VIX close (nightly-updated cache)
+    try:
+        vix = Path("/app/market_data/india_vix.csv").read_text().strip().splitlines()[-1]
+        digest["vix_last"] = float(vix.split(",")[1])
+    except Exception:
+        digest["vix_last"] = None
+
+    async with AsyncSessionLocal() as db:
+        closed = (await db.execute(_text(
+            "SELECT trade_group_id, underlying, string_agg(DISTINCT exit_reason, ','), "
+            "ROUND(SUM(pnl)::numeric,0), min(entry_time), max(exit_time) "
+            "FROM trades WHERE status='CLOSED' AND exit_time >= CURRENT_DATE AND mode='PAPER' "
+            "GROUP BY trade_group_id, underlying"))).all()
+        digest["closed_groups"] = [
+            {"group": (g or "?")[:8], "ul": ul, "exit_reason": reas, "net_pnl": float(p or 0)}
+            for g, ul, reas, p, _e, _x in closed]
+        digest["closed_net"] = round(sum(c["net_pnl"] for c in digest["closed_groups"]))
+        open_rows = (await db.execute(_text(
+            "SELECT trade_group_id, underlying, ROUND(SUM(unrealized_pnl)::numeric,0) "
+            "FROM trades WHERE status='OPEN' AND mode='PAPER' GROUP BY trade_group_id, underlying"))).all()
+        digest["open_groups"] = [{"group": (g or "?")[:8], "ul": ul, "unrealized": float(p or 0)}
+                                 for g, ul, p in open_rows]
+        digest["open_unrealized"] = round(sum(o["unrealized"] for o in digest["open_groups"]))
+        sigs = (await db.execute(_text(
+            "SELECT pattern_name, count(*) FROM signals WHERE created_at >= CURRENT_DATE "
+            "GROUP BY pattern_name"))).all()
+        digest["signals_today"] = {p: int(n) for p, n in sigs}
+        try:
+            anom = (await db.execute(_text(
+                "SELECT source, kind, severity, auto_fixed, count(*), max(detail->>'msg') "
+                "FROM anomalies WHERE ts >= CURRENT_DATE GROUP BY 1,2,3,4 ORDER BY 3"))).all()
+            digest["anomalies_today"] = [
+                {"source": s, "kind": k, "severity": sev, "auto_fixed": fx,
+                 "count": int(n), "example": ex}
+                for s, k, sev, fx, n, ex in anom]
+        except Exception:
+            digest["anomalies_today"] = []
+
+    try:
+        integ = r.get("trade_integrity:last")
+        digest["integrity_violations"] = len(_json.loads(integ)["violations"]) if integ else None
+    except Exception:
+        digest["integrity_violations"] = None
+
+    out_dir = Path("/app/market_data/daily_snapshots")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{day}.json"
+    out.write_text(_json.dumps(digest, indent=1, default=str))
+    r.setex("eod_digest:last", 86400 * 3, _json.dumps(digest, default=str))
+    logger.info(f"EOD digest written: {out} closed_net={digest['closed_net']} "
+                f"open_unrl={digest['open_unrealized']} snaps={len(series)}")
+    return digest
+
+
+@celery_app.task(name="workers.eod_market_digest")
+def eod_market_digest():
+    """15:40 IST Mon-Fri: durable end-of-day market + book digest to disk."""
+    try:
+        result = _run_async(_do_eod_market_digest())
+        _stamp_task_run("workers.eod_market_digest")
+        return result
+    except Exception as exc:
+        logger.error(f"EOD digest failed: {exc}")
+        return {"status": "ERROR", "error": str(exc)}
 
