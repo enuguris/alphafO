@@ -2434,7 +2434,12 @@ def health_scan():
 
         active_signals = _run_async(_count_active())
 
-        if active_signals == 0:
+        # Only meaningful during market hours — overnight the scanner is
+        # deliberately idle and an empty queue is normal (journal noise otherwise)
+        _hs_now_ist = _dt.now(_tz.utc) + _td(hours=5, minutes=30)
+        _hs_mkt = (_hs_now_ist.weekday() < 5 and
+                   (9, 15) <= (_hs_now_ist.hour, _hs_now_ist.minute) <= (15, 30))
+        if active_signals == 0 and _hs_mkt:
             issues.append("no_active_signals: scanner may be stalled — trigger scan-priority-15m")
 
         # ── 4b. Real-tick heartbeat (market hours only) ───────────────────────
@@ -2568,9 +2573,12 @@ async def _journal_anomalies(entries: list[dict]) -> int:
     written = 0
     async with AsyncSessionLocal() as db:
         for e in entries:
+            # Slow-changing daily conditions journal once per day, not hourly
+            window = ("CURRENT_DATE" if e["source"] in ("signal_churn",)
+                      else "NOW() - INTERVAL '60 minutes'")
             dup = (await db.execute(_text(
                 "SELECT 1 FROM anomalies WHERE source=:s AND kind=:k "
-                "AND resolved=false AND ts > NOW() - INTERVAL '60 minutes' LIMIT 1"
+                f"AND resolved=false AND ts > {window} LIMIT 1"
             ), {"s": e["source"], "k": e["kind"]})).first()
             if dup:
                 continue
