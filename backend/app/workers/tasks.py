@@ -3109,6 +3109,133 @@ def zero_dte_straddle():
         return {"status": "error", "error": str(exc)}
 
 
+# ── Post-fall bear call (experiment, 1 lot) — adopted 2026-07-08 ─────────────
+
+async def _do_postfall_bearcall():
+    """
+    09:45 IST after a >=1.25% down day: sell NIFTY weekly bear call spread,
+    short S+200 / wing S+300, 1 lot. Tested on 27 real post-fall mornings:
+    81% win, PF 1.54, avg +419/trade (vs PF 1.27 on normal days; the same
+    structure is PF 0.72 after big UP days, so it only trades post-fall).
+    Managed by standard group exits (TP 50% credit / SL 2x / half-DTE).
+    """
+    import json as _json
+    import uuid
+    from datetime import date as _d, datetime as _dtm
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import select as _sel
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.models.trades import Trade, TradeStatus, TradeMode
+    from app.models.portfolio import Portfolio
+    from app.core.charges import charges_for_entry_only
+    from app.core.instruments import get_lot_size
+    from app.core.options.expiry import available_expiries
+    from app.core.strategies.composite import _build_symbol
+
+    if not _is_market_hours():
+        return {"status": "skipped", "reason": "outside market hours"}
+
+    # Trigger: previous session fell >= 1.25% (from the EOD digest archive)
+    snaps = sorted(Path("/app/market_data/daily_snapshots").glob("*.json"))[-2:]
+    if len(snaps) < 2:
+        return {"status": "skipped", "reason": "not enough digest history"}
+    d0 = _json.loads(snaps[0].read_text()).get("nifty") or {}
+    d1 = _json.loads(snaps[1].read_text()).get("nifty") or {}
+    if not d0.get("close") or not d1.get("close"):
+        return {"status": "skipped", "reason": "digest missing closes"}
+    prev_ret = d1["close"] / d0["close"] - 1
+    if prev_ret > -0.0125:
+        return {"status": "skipped", "reason": f"no trigger (prev day {prev_ret*100:+.2f}%)"}
+
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    spot = float(r.get("spot:NIFTY") or 0)
+    if spot <= 0 or not r.get("ticker:last_real_tick"):
+        logger.warning("postfall_bc: no real spot ticks — skipped (never trade on synthetic)")
+        return {"status": "skipped", "reason": "no real ticks"}
+
+    exps = available_expiries("NIFTY", _d.today())
+    exp = next((e for e in exps if 2 <= e["dte"] <= 9), None)
+    if not exp:
+        return {"status": "skipped", "reason": "no weekly expiry in 2-9 DTE"}
+    expiry_iso = exp["date"]
+    lot = get_lot_size("NIFTY")
+    k_short = float(round((spot + 200) / 50) * 50)
+    k_wing = k_short + 100.0
+
+    async with AsyncSessionLocal() as db:
+        # one per day
+        existing = (await db.execute(_sel(Trade).where(
+            Trade.status == TradeStatus.OPEN, Trade.leg_role == "postfall_bc_short"))).scalars().first()
+        if existing:
+            return {"status": "skipped", "reason": "already open"}
+        cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+        ps, src_s, tok_s = await _fetch_option_ltp_global(cfg, "NIFTY", expiry_iso, k_short, "CE")
+        pw, src_w, tok_w = await _fetch_option_ltp_global(cfg, "NIFTY", expiry_iso, k_wing, "CE")
+        if not ps or not pw:
+            return {"status": "aborted", "reason": "no real LTP for legs"}
+        fill_s = round(max(0.05, ps - max(0.25, ps * 0.005)), 2)   # sell slippage-adverse
+        fill_w = round(pw + max(0.25, pw * 0.005), 2)              # buy slippage-adverse
+        credit = fill_s - fill_w
+        width = k_wing - k_short
+        if not (0.15 * width <= credit <= 0.85 * width):
+            logger.warning(f"postfall_bc: credit {credit:.1f} outside 15-85% of width {width} — skipped")
+            return {"status": "skipped", "reason": "credit gate"}
+
+        gid = str(uuid.uuid4())
+        now = _dtm.utcnow()
+        margin = (width - credit) * lot
+        cash = 0.0
+        legs = [("SELL", k_short, fill_s, src_s, tok_s, "postfall_bc_short"),
+                ("BUY", k_wing, fill_w, src_w, tok_w, "postfall_bc_wing")]
+        for action, k, fill, src, tok, role in legs:
+            ch = charges_for_entry_only(fill, lot, action)
+            cash += (fill * lot - ch) if action == "SELL" else (-(fill * lot) - ch)
+            db.add(Trade(
+                mode=TradeMode.PAPER,
+                symbol=_build_symbol("NIFTY", expiry_iso, k, "CE"),
+                underlying="NIFTY", option_type="CE", strike=k,
+                lot_size=lot, expiry_date=expiry_iso, expiry_display=expiry_iso,
+                action=action, direction="short" if action == "SELL" else "long",
+                quantity=lot, entry_price=fill, current_price=fill,
+                target_price=0.0, stop_loss=0.0,
+                charges_entry=ch, unrealized_pnl=0.0,
+                status=TradeStatus.OPEN, entry_time=now,
+                entry_price_source=src, instrument_token=tok,
+                margin_blocked=round(margin / 2, 2),
+                trade_group_id=gid, leg_role=role,
+                notes=("STRATEGY:Post-fall Bear Call (exp)|Prev session fell "
+                       f"{prev_ret*100:.2f}%; tested 27 post-fall mornings: 81% win, PF 1.54 "
+                       "(vs 0.72 after up days). Short S+200/wing S+300, TP50/SL2x/half-DTE."),
+            ))
+        pf = (await db.execute(_sel(Portfolio).where(Portfolio.mode == "paper"))).scalar_one_or_none()
+        if pf:
+            pf.capital_deployed += margin
+            pf.capital_current += cash - margin
+        await db.commit()
+        try:
+            from app.core.risk.gate import record_deployed
+            record_deployed(margin)
+        except Exception:
+            pass
+        logger.info(f"postfall_bc OPENED: {k_short}/{k_wing} CE credit {credit:.1f}/unit, group {gid[:8]}")
+        return {"status": "opened", "credit": credit, "short": k_short, "wing": k_wing}
+
+
+@celery_app.task(name="workers.postfall_bearcall")
+def postfall_bearcall():
+    """09:45 IST Mon-Fri: bear call spread the morning after a >=1.25% fall."""
+    try:
+        result = _run_async(_do_postfall_bearcall())
+        _stamp_task_run("workers.postfall_bearcall")
+        return result
+    except Exception as exc:
+        logger.error(f"postfall bearcall failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+
 
 # â”€â”€ Pre-market readiness check â€” 08:50 IST Mon-Fri â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
