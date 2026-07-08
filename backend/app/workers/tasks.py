@@ -2184,7 +2184,12 @@ def generate_briefing():
             from app.models.kite_config import KiteConfig
             async with AsyncSessionLocal() as db:
                 cfg = (await db.execute(select(KiteConfig).limit(1))).scalar_one_or_none()
-                api_key = cfg.anthropic_api_key if cfg else None
+                # Column is anthropic_api_key_enc (encrypted) — the old attribute
+                # name raised AttributeError and the briefing silently never ran
+                api_key = None
+                if cfg and cfg.anthropic_api_key_enc:
+                    from app.core.encryption import decrypt as _dec
+                    api_key = _dec(cfg.anthropic_api_key_enc)
 
             if not api_key:
                 logger.warning("generate_briefing: Anthropic API key not set — skipping")
