@@ -3142,10 +3142,26 @@ async def _do_premarket_readiness():
         add("database", False, str(e)[:80])
         cfg = None
 
-    # 2. Broker tokens fresh TODAY (they expire daily â€” bit us twice)
+    # 2. Broker tokens fresh TODAY (they expire daily â€” bit us twice).
+    # Date check alone is NOT enough: 2026-07-08 a same-morning token was
+    # still rejected by Kite ("Incorrect api_key or access_token").
+    # So validate LIVE with a real API call.
     kite_ok = bool(cfg and cfg.access_token_enc and cfg.token_date == today)
-    add("kite_token_fresh", kite_ok,
-        "" if kite_ok else "REGENERATE Kite token before open â€” entries fall back to estimates without it")
+    kite_detail = "" if kite_ok else "REGENERATE Kite token before open â€” entries fall back to estimates without it"
+    if kite_ok:
+        try:
+            from kiteconnect import KiteConnect
+            from app.core.encryption import decrypt as _dec
+            _kc = KiteConnect(api_key=cfg.api_key)
+            _kc.set_access_token(_dec(cfg.access_token_enc))
+            _q = _kc.quote(["NSE:NIFTY 50"])
+            _ltp = list(_q.values())[0].get("last_price") if _q else None
+            kite_ok = bool(_ltp and _ltp > 0)
+            kite_detail = f"live-validated, NIFTY={_ltp}" if kite_ok else "quote returned no price"
+        except Exception as _ke:
+            kite_ok = False
+            kite_detail = f"token date is today but API REJECTS it â€” regenerate: {str(_ke)[:60]}"
+    add("kite_token_fresh", kite_ok, kite_detail)
     up_ok = bool(cfg and cfg.upstox_access_token_enc and cfg.upstox_token_date == today)
     add("upstox_token_fresh", up_ok,
         "" if up_ok else "regenerate Upstox token (backtests + LTP fallback need it)")
