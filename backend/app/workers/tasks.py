@@ -352,9 +352,12 @@ async def _auto_paper_trade(signals, db):
         required_conf = HIGH_CONF_SYNTHETIC if is_synthetic else HIGH_CONF_REAL
         if sig.confidence_score < required_conf:
             continue
-        # Synthetic signals only during market hours — don't paper-trade fake data overnight
-        if is_synthetic and not market_open:
-            logger.debug(f"Skipping synthetic signal {sig.pattern_name}/{sig.underlying} outside market hours")
+        # HARD market-hours gate for ALL entries (not just synthetic).
+        # The 09:00 pre-market scan and 15:35 EOD scan were auto-executing on
+        # previous-close/frozen prices — no real order could fill at those
+        # prices (user caught a 15:45 IST entry, 2026-07-08).
+        if not market_open:
+            logger.info(f"Skipping entry {sig.pattern_name}/{sig.underlying}: outside market hours (09:20-15:25 IST)")
             continue
         # Age gate: don't execute signals older than 2h (stale strikes at market open)
         if sig.created_at:
