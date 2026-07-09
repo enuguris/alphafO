@@ -156,9 +156,9 @@ def _build_trade_notes(sig, action: str, premium: float, risk, hedge_trade_data)
 
 async def _auto_paper_trade(signals, db):
     """
-    Auto-execute trades for high-confidence signals.
-    - Real-data signals (Kite OHLCV): confidence ≥ 0.72, any market hours
-    - Synthetic-data signals: confidence ≥ 0.82, only during market hours
+    Auto-execute trades for high-confidence signals DURING MARKET HOURS ONLY (09:20–15:25 IST).
+    - Real-data signals (Kite OHLCV): confidence ≥ 0.72
+    - Synthetic-data signals: confidence ≥ 0.82
     One trade per (underlying, pattern_name, direction). Entry charges deducted immediately.
     Hedge leg auto-added for all SELL positions.
     """
@@ -166,6 +166,10 @@ async def _auto_paper_trade(signals, db):
     from app.models.portfolio import Portfolio
     from app.core.charges import charges_for_entry_only
     from sqlalchemy import select
+
+    # Gate: block all auto-execution outside market hours
+    if not _is_market_hours():
+        return []
 
     # Confidence thresholds
     HIGH_CONF_REAL      = 0.72   # real Kite OHLCV data
