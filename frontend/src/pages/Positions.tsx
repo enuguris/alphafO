@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { createChart } from 'lightweight-charts'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket } from '../api/client'
+import { fetchTrades, closeTrade, refreshMtm, fetchTradeChart, createPriceSocket, fetchOIWalls } from '../api/client'
 import PayoffChart from '../components/PayoffChart'
 import MarketWatchPanel from '../components/MarketWatchPanel'
 import ManualTradeModal from '../components/ManualTradeModal'
@@ -77,14 +77,23 @@ function SummaryCard({ label, value, sub, color }: { label: string; value: strin
 
 // ── Embedded candlestick chart (lightweight-charts) ───────────────────────────
 
-function UnderlyingChart({ bars, entryTime, strike, optionType }: {
+function UnderlyingChart({ bars, entryTime, strike, optionType, underlying, expiry, showWalls }: {
   bars: { time: string; open: number; high: number; low: number; close: number }[]
   entryTime?: string | null
   strike?: number | null
   optionType?: string | null
+  underlying?: string | null
+  expiry?: string | null
+  showWalls?: boolean
 }) {
   const chartRef = useRef<HTMLDivElement>(null)
   const [chartErr, setChartErr] = useState<string | null>(null)
+
+  // OI walls — refetched every 60s so the overlay updates as new snapshots land
+  const { data: oiWalls } = useQuery({
+    queryKey: ['oiwalls'], queryFn: fetchOIWalls, refetchInterval: 60000,
+    enabled: !!showWalls,
+  })
 
   useEffect(() => {
     if (!chartRef.current || !bars.length) return
@@ -134,6 +143,29 @@ function UnderlyingChart({ bars, entryTime, strike, optionType }: {
         } as any)
       }
 
+      // OI walls overlay — resistance (red) / support (green) for this expiry.
+      // Picks the expiry matching the trade, else the nearest snapshot expiry.
+      if (showWalls && oiWalls?.expiries?.length) {
+        const exps = oiWalls.expiries
+        const match = (expiry && exps.find((e: any) => e.expiry === expiry)) || exps[0]
+        if (match) {
+          for (const w of match.resistance || []) {
+            series.createPriceLine({
+              price: w.strike, color: 'rgba(239,83,80,0.9)', lineWidth: 1,
+              lineStyle: 3, axisLabelVisible: true,
+              title: `R ${(w.coi / 1e6).toFixed(1)}M`,
+            } as any)
+          }
+          for (const w of match.support || []) {
+            series.createPriceLine({
+              price: w.strike, color: 'rgba(38,166,154,0.9)', lineWidth: 1,
+              lineStyle: 3, axisLabelVisible: true,
+              title: `S ${(w.poi / 1e6).toFixed(1)}M`,
+            } as any)
+          }
+        }
+      }
+
       if (entryTime) {
         const entryTs = Math.floor(new Date(entryTime).getTime() / 1000) + 19800
         const idx = cdata.findIndex(d => d.time >= entryTs)
@@ -152,7 +184,7 @@ function UnderlyingChart({ bars, entryTime, strike, optionType }: {
     } catch (e: any) {
       setChartErr(e?.message || 'Chart error')
     }
-  }, [bars, entryTime, strike, optionType])
+  }, [bars, entryTime, strike, optionType, oiWalls, showWalls, expiry])
 
   if (!bars.length) return (
     <div style={{ height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -173,9 +205,9 @@ function UnderlyingChart({ bars, entryTime, strike, optionType }: {
 
 // ── Signal rationale panel ────────────────────────────────────────────────────
 
-function SignalRationale({ tradeId, symbol, strike, optionType, entryTime, entryPrice }: {
+function SignalRationale({ tradeId, symbol, strike, optionType, entryTime, entryPrice, expiryIso }: {
   tradeId: number; symbol?: string; strike?: number | null; optionType?: string | null
-  entryTime?: string | null; entryPrice?: number | null
+  entryTime?: string | null; entryPrice?: number | null; expiryIso?: string | null
 }) {
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(false)
@@ -285,6 +317,9 @@ function SignalRationale({ tradeId, symbol, strike, optionType, entryTime, entry
               entryPrice={showUnderlying ? undefined : entryPrice}
               strike={showUnderlying ? strike : undefined}
               optionType={optionType}
+              underlying={data.underlying}
+              expiry={data.expiry_date_iso || data.expiry_date || expiryIso}
+              showWalls={showUnderlying && (data.underlying || '').toUpperCase() === 'NIFTY'}
             />
           </div>
         )
@@ -544,7 +579,7 @@ function TradeDetail({ t, currentPrice, pnl, onClose: onCollapse }: {
       <ChargesBreakdown t={t} currentPrice={currentPrice} />
 
       {/* Signal rationale */}
-      <SignalRationale tradeId={t.id} symbol={t.symbol} strike={t.strike} optionType={t.option_type} entryTime={t.entry_time} entryPrice={t.entry_price} />
+      <SignalRationale tradeId={t.id} symbol={t.symbol} strike={t.strike} optionType={t.option_type} entryTime={t.entry_time} entryPrice={t.entry_price} expiryIso={t.expiry_date} />
 
       <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
         <button onClick={onCollapse} className="tv-btn" style={{ fontSize: 11, padding: '3px 12px' }}>Collapse ▲</button>
