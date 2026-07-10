@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api } from '../api/client'
+import { useQuery } from '@tanstack/react-query'
+import { api, fetchOIWalls } from '../api/client'
 
 /**
  * Interactive payoff diagram for a composite trade group.
@@ -24,6 +25,11 @@ export default function PayoffChart({ groupId }: { groupId: string }) {
   const [err, setErr]     = useState<string | null>(null)
   const [hoverI, setHoverI] = useState<number | null>(null)
   const svgRef = useRef<SVGSVGElement>(null)
+
+  // OI walls (NIFTY) — refetched every 60s so the overlay tracks new snapshots
+  const { data: oiWalls } = useQuery({
+    queryKey: ['oiwalls'], queryFn: fetchOIWalls, refetchInterval: 60000,
+  })
 
   useEffect(() => {
     let live = true
@@ -116,6 +122,41 @@ export default function PayoffChart({ groupId }: { groupId: string }) {
           </g>
         ))}
 
+        {/* OI walls — resistance (red) / support (green) vertical lines.
+            Only for NIFTY, only walls within the visible price range. */}
+        {(() => {
+          if ((data.underlying || '').toUpperCase() !== 'NIFTY' || !oiWalls?.expiries?.length) return null
+          const legExp = data.legs?.[0]?.expiry
+          const match = (legExp && oiWalls.expiries.find((e: any) => e.expiry === legExp)) || oiWalls.expiries[0]
+          if (!match) return null
+          const lo = xs[0], hi = xs[xs.length - 1]
+          const inRange = (s: number) => s >= lo && s <= hi
+          const lines: any[] = []
+          for (const w of match.resistance || []) {
+            if (!inRange(w.strike)) continue
+            lines.push(
+              <g key={'r' + w.strike}>
+                <line x1={px(w.strike)} x2={px(w.strike)} y1={PAD.t + 14} y2={H - PAD.b}
+                  stroke="rgba(239,83,80,0.85)" strokeWidth={1} strokeDasharray="2,3" />
+                <text x={px(w.strike)} y={PAD.t + 20} textAnchor="middle" fontSize={8}
+                  fill="rgba(239,83,80,0.95)" fontFamily="monospace">R{(w.coi / 1e6).toFixed(1)}M</text>
+              </g>
+            )
+          }
+          for (const w of match.support || []) {
+            if (!inRange(w.strike)) continue
+            lines.push(
+              <g key={'s' + w.strike}>
+                <line x1={px(w.strike)} x2={px(w.strike)} y1={PAD.t + 14} y2={H - PAD.b}
+                  stroke="rgba(38,166,154,0.85)" strokeWidth={1} strokeDasharray="2,3" />
+                <text x={px(w.strike)} y={PAD.t + 20} textAnchor="middle" fontSize={8}
+                  fill="rgba(38,166,154,0.95)" fontFamily="monospace">S{(w.poi / 1e6).toFixed(1)}M</text>
+              </g>
+            )
+          }
+          return lines
+        })()}
+
         {/* Current spot marker */}
         <line x1={px(data.spot)} x2={px(data.spot)} y1={PAD.t} y2={H - PAD.b} stroke="var(--up)" strokeWidth={1.2} opacity={0.8} />
         <text x={px(data.spot)} y={PAD.t + 9} textAnchor="middle" fontSize={9} fill="var(--up)" fontFamily="monospace" fontWeight={700}>
@@ -172,6 +213,9 @@ export default function PayoffChart({ groupId }: { groupId: string }) {
         <span style={{ color: 'var(--orange)' }}>┊ Breakeven</span>
         <span style={{ color: 'var(--up)' }}>│ Current spot</span>
         <span>▎ Strikes</span>
+        {(data.underlying || '').toUpperCase() === 'NIFTY' && oiWalls?.expiries?.length && (
+          <span><span style={{ color: 'rgba(239,83,80,0.95)' }}>┊R</span> / <span style={{ color: 'rgba(38,166,154,0.95)' }}>┊S</span> OI walls</span>
+        )}
         <span style={{ marginLeft: 'auto', fontStyle: 'italic' }}>{data.note}</span>
       </div>
     </div>
