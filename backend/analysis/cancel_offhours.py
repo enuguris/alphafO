@@ -31,7 +31,7 @@ async def go():
             "('a2677440','b3a7be0b','ce501e59','a1e87848')"))
         # Portfolio reversal: entry did capital_deployed += margin; capital_current += cash - margin
         await db.execute(text(
-            "UPDATE portfolios SET capital_deployed = GREATEST(0, capital_deployed - :m), "
+            "UPDATE portfolio SET capital_deployed = GREATEST(0, capital_deployed - :m), "
             "capital_current = capital_current - :c + :m WHERE mode='paper'"),
             {"m": total_margin, "c": total_cash})
         await db.commit()
