@@ -264,8 +264,72 @@ async def _fetch_ohlcv(underlying: str, timeframe: Timeframe) -> tuple[pd.DataFr
         return df, "real"
 
     except Exception as e:
-        logger.debug(f"[scanner] Kite OHLCV unavailable for {underlying}/{timeframe}: {e} — using synthetic")
-        return synthetic_ohlcv(underlying, timeframe), "synthetic"
+        logger.debug(f"[scanner] Kite OHLCV unavailable for {underlying}/{timeframe}: {e} — trying Upstox")
+
+    # Fallback: Upstox historical candles (real data when Kite is down)
+    try:
+        df = await _fetch_ohlcv_upstox(underlying, timeframe)
+        if df is not None and len(df) >= 30:
+            logger.info(f"[scanner] Using REAL Upstox data for {underlying}/{timeframe}: {len(df)} bars")
+            return df, "real"
+    except Exception as e:
+        logger.debug(f"[scanner] Upstox OHLCV unavailable for {underlying}/{timeframe}: {e} — using synthetic")
+
+    return synthetic_ohlcv(underlying, timeframe), "synthetic"
+
+
+# Upstox v2 historical intervals: 1minute, 30minute, day. Map our timeframes.
+_UPSTOX_INTERVAL: dict[str, str] = {
+    "15m": "30minute", "1h": "30minute", "4h": "day", "daily": "day"
+}
+_UPSTOX_DAYS: dict[str, int] = {
+    "15m": 12, "1h": 30, "4h": 200, "daily": 400
+}
+
+
+async def _fetch_ohlcv_upstox(underlying: str, timeframe: Timeframe):
+    """Fetch real index OHLCV from Upstox; returns a DataFrame or None."""
+    import numpy as np
+    from datetime import date, timedelta
+    from sqlalchemy import select
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.core.encryption import decrypt
+    from app.core.data.upstox_ltp import get_index_ohlcv
+
+    async with AsyncSessionLocal() as db:
+        cfg = (await db.execute(select(KiteConfig).limit(1))).scalar_one_or_none()
+    if not cfg or not cfg.upstox_access_token_enc:
+        return None
+    token = decrypt(cfg.upstox_access_token_enc)
+
+    interval = _UPSTOX_INTERVAL[timeframe]
+    from_date = (date.today() - timedelta(days=_UPSTOX_DAYS[timeframe])).isoformat()
+    to_date = date.today().isoformat()
+
+    import asyncio
+    candles = await asyncio.to_thread(
+        get_index_ohlcv, token, underlying, interval, from_date, to_date
+    )
+    if not candles:
+        return None
+
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+    for c in ("open", "high", "low", "close", "volume", "oi"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+
+    # Resample 30min → 1h / 4h when needed
+    if timeframe in ("1h", "4h") and interval == "30minute":
+        rule = "1h" if timeframe == "1h" else "4h"
+        agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum", "oi": "last"}
+        df = df.set_index("timestamp").resample(rule).agg(agg).dropna().reset_index()
+
+    # Synthetic IV column (index candles carry no IV)
+    rng = np.random.default_rng(abs(hash(underlying)) % (2**31))
+    df["iv"] = np.round(rng.uniform(12, 28, len(df)), 2)
+    return df
 
 
 async def scan_instrument(

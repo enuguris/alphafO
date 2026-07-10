@@ -49,6 +49,36 @@ def _to_upstox_instrument_key(underlying: str, expiry_iso: str, strike: float, o
     return f"{_NFO_PREFIX}|{sym}"
 
 
+def get_index_ohlcv(
+    access_token: str,
+    underlying: str,
+    interval: str,
+    from_date: str,
+    to_date: str,
+    timeout: float = 12.0,
+):
+    """
+    Fetch historical index OHLCV from Upstox v2 historical-candle API.
+    interval: one of "1minute", "30minute", "day", "week", "month".
+    Returns a list of [ts, o, h, l, c, v, oi] candles (oldest→newest) or None.
+    """
+    ikey = _INDEX_KEYS.get(underlying.upper())
+    if not ikey:
+        return None
+    try:
+        resp = httpx.get(
+            f"{UPSTOX_BASE}/v2/historical-candle/{ikey}/{interval}/{to_date}/{from_date}",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        candles = resp.json().get("data", {}).get("candles", [])
+        # Upstox returns newest→oldest; reverse to oldest→newest
+        return list(reversed(candles)) if candles else None
+    except Exception:
+        return None
+
+
 def get_ltp(
     access_token: str,
     underlying: str,
