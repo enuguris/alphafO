@@ -201,6 +201,24 @@ async def get_max_pain(underlying: str):
     }
 
 
+@router.get("/oi-walls")
+async def get_oi_walls():
+    """
+    Latest NIFTY OI-wall snapshot (real support/resistance from OI concentration)
+    across the next 6 expiries. Refreshed twice daily by the snapshot_oi_walls
+    task (am 09:20 / pm 15:25 IST). Returns null if no snapshot has run yet.
+    """
+    import json as _json
+    import redis as _redis
+    from app.config import settings as _cfg
+    try:
+        r = _redis.from_url(_cfg.redis_url, decode_responses=True)
+        raw = r.get("oi_walls:last")
+        return _json.loads(raw) if raw else {"status": "no_snapshot_yet"}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
 @router.get("/events")
 async def get_events(count: int = 5):
     """Get upcoming NSE and global market events."""

@@ -2791,16 +2791,42 @@ def market_watch_snapshot():
 
 # ── NIFTY OI-wall snapshot (real support/resistance from OI concentration) ────
 
-async def _do_snapshot_oi_walls(slot: str, expiry: str = "2026-07-28"):
+N_EXPIRIES = 6  # track the next 6 NIFTY expiry weeks
+
+
+def _walls_from_rows(rows: dict, spot: float, prev_rows: dict | None):
+    """Compute top-3 resistance (call OI) / support (put OI) + diff vs prev_rows."""
+    resistance = [{"strike": k, "coi": rows[k]["coi"]}
+                  for _, k in sorted(((rows[k]["coi"], k) for k in rows if k >= spot),
+                                     reverse=True)[:3]]
+    support = [{"strike": k, "poi": rows[k]["poi"]}
+               for _, k in sorted(((rows[k]["poi"], k) for k in rows if k <= spot),
+                                  reverse=True)[:3]]
+    wall_moves = []
+    if prev_rows:
+        watch = {w["strike"] for w in resistance} | {w["strike"] for w in support}
+        for k in sorted(watch):
+            pcoi = prev_rows.get(str(k), prev_rows.get(k, {})).get("coi", 0)
+            ppoi = prev_rows.get(str(k), prev_rows.get(k, {})).get("poi", 0)
+            dc = (rows[k]["coi"] - pcoi) / 1e6
+            dp = (rows[k]["poi"] - ppoi) / 1e6
+            if abs(dc) > 0.3 or abs(dp) > 0.3:
+                wall_moves.append({"strike": k, "d_call_oi_m": round(dc, 2),
+                                   "d_put_oi_m": round(dp, 2)})
+    return resistance, support, wall_moves
+
+
+async def _do_snapshot_oi_walls(slot: str):
     """
-    Snapshot NIFTY option-chain OI walls to market_data/oi_walls/YYYY-MM-DD_{slot}.json
-    and write a compact summary (top 3 call/put walls + diff vs prior slot) to Redis
-    key `oi_walls:last`. Slot is 'am' (opening call) or 'pm' (closing call).
-    Real support/resistance = strikes with highest call OI (resistance) / put OI
-    (support), unlike the naive ATM+-50 in the briefing. Runs daily for tracking.
+    Snapshot NIFTY option-chain OI walls for the next 6 expiries to
+    market_data/oi_walls/YYYY-MM-DD_{slot}.json and write a summary (per-expiry
+    top 3 call/put walls + diff vs prior slot) to Redis key `oi_walls:last`,
+    served to the UI via GET /api/v1/options/oi-walls. Slot is 'am' (opening
+    call) or 'pm' (closing call). Real support/resistance = strikes with highest
+    call OI (resistance) / put OI (support), unlike the naive ATM+-50 briefing.
     """
     import json as _json
-    from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2
+    from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2, date as _date
     from pathlib import Path
     import redis as _r
     from sqlalchemy import select as _sel
@@ -2821,69 +2847,65 @@ async def _do_snapshot_oi_walls(slot: str, expiry: str = "2026-07-28"):
         return {"status": "skipped", "reason": "no upstox token"}
     token = decrypt(cfg.upstox_access_token_enc)
     h = {"Authorization": f"Bearer {token}"}
-
-    async with httpx.AsyncClient(timeout=30, headers=h) as c:
-        lr = await c.get("https://api.upstox.com/v2/market-quote/ltp",
-                         params={"instrument_key": "NSE_INDEX|Nifty 50"})
-        spot = next(iter(lr.json().get("data", {}).values()), {}).get("last_price")
-        ch = await c.get("https://api.upstox.com/v2/option/chain",
-                         params={"instrument_key": "NSE_INDEX|Nifty 50", "expiry_date": expiry})
-        rows = {}
-        for row in ch.json().get("data", []):
-            k = int(row.get("strike_price"))
-            ce = row.get("call_options", {}).get("market_data", {})
-            pe = row.get("put_options", {}).get("market_data", {})
-            rows[k] = {"coi": int(ce.get("oi", 0)), "poi": int(pe.get("oi", 0)),
-                       "cl": ce.get("ltp", 0), "pl": pe.get("ltp", 0)}
-    if not spot or not rows:
-        return {"status": "skipped", "reason": "no chain data"}
+    IK = "NSE_INDEX|Nifty 50"
 
     out_dir = Path("/app/market_data/oi_walls")
     out_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"day": day, "slot": slot, "spot": spot, "expiry": expiry,
-               "ts_ist": now_ist.strftime("%H:%M IST"), "rows": rows}
-    (out_dir / f"{day}_{slot}.json").write_text(_json.dumps(payload, default=str))
-
-    # top walls
-    resistance = [{"strike": k, "coi": rows[k]["coi"]}
-                  for _, k in sorted(((rows[k]["coi"], k) for k in rows if k >= spot),
-                                     reverse=True)[:3]]
-    support = [{"strike": k, "poi": rows[k]["poi"]}
-               for _, k in sorted(((rows[k]["poi"], k) for k in rows if k <= spot),
-                                  reverse=True)[:3]]
-
-    # diff vs the most recent prior snapshot (any slot, excluding this file)
+    # prior snapshot (any earlier file) for diffing
     prev = None
     for f in sorted(out_dir.glob("*.json"), reverse=True):
         if f.stem != f"{day}_{slot}":
             try:
-                prev = _json.loads(f.read_text())
+                prev = _json.loads(f.read_text()); break
             except Exception:
                 continue
-            break
-    wall_moves = []
-    if prev:
-        pr = prev.get("rows", {})
-        watch = {w["strike"] for w in resistance} | {w["strike"] for w in support}
-        for k in sorted(watch):
-            pcoi = pr.get(str(k), {}).get("coi", 0)
-            ppoi = pr.get(str(k), {}).get("poi", 0)
-            dc = (rows[k]["coi"] - pcoi) / 1e6
-            dp = (rows[k]["poi"] - ppoi) / 1e6
-            if abs(dc) > 0.3 or abs(dp) > 0.3:
-                wall_moves.append({"strike": k, "d_call_oi_m": round(dc, 2),
-                                   "d_put_oi_m": round(dp, 2)})
+    prev_exp = {e["expiry"]: e for e in (prev.get("expiries", []) if prev else [])}
 
-    prev_label = None
-    if prev and prev.get("day"):
-        prev_label = f"{prev['day']}_{prev.get('slot', '?')}"
-    summary = {"day": day, "slot": slot, "ts_ist": payload["ts_ist"], "spot": spot,
-               "expiry": expiry, "resistance": resistance, "support": support,
-               "wall_moves_vs_prev": wall_moves, "prev_slot": prev_label}
+    async with httpx.AsyncClient(timeout=30, headers=h) as c:
+        lr = await c.get("https://api.upstox.com/v2/market-quote/ltp",
+                         params={"instrument_key": IK})
+        spot = next(iter(lr.json().get("data", {}).values()), {}).get("last_price")
+        if not spot:
+            return {"status": "skipped", "reason": "no spot"}
+        cr = await c.get("https://api.upstox.com/v2/option/contract",
+                         params={"instrument_key": IK})
+        all_exp = sorted({x.get("expiry") for x in cr.json().get("data", []) if x.get("expiry")})
+        expiries = [e for e in all_exp if e >= str(_date.today())][:N_EXPIRIES]
+
+        exp_out = []       # full rows for disk
+        exp_summary = []   # compact walls for Redis/UI
+        for expiry in expiries:
+            ch = await c.get("https://api.upstox.com/v2/option/chain",
+                             params={"instrument_key": IK, "expiry_date": expiry})
+            rows = {}
+            for row in ch.json().get("data", []):
+                k = int(row.get("strike_price"))
+                ce = row.get("call_options", {}).get("market_data", {})
+                pe = row.get("put_options", {}).get("market_data", {})
+                rows[k] = {"coi": int(ce.get("oi", 0)), "poi": int(pe.get("oi", 0)),
+                           "cl": ce.get("ltp", 0), "pl": pe.get("ltp", 0)}
+            if not rows:
+                continue
+            prev_rows = prev_exp.get(expiry, {}).get("rows") if prev else None
+            resistance, support, moves = _walls_from_rows(rows, spot, prev_rows)
+            exp_out.append({"expiry": expiry, "rows": rows})
+            exp_summary.append({"expiry": expiry, "resistance": resistance,
+                                "support": support, "wall_moves_vs_prev": moves})
+
+    if not exp_summary:
+        return {"status": "skipped", "reason": "no chain data"}
+
+    ts_ist = now_ist.strftime("%H:%M IST")
+    disk = {"day": day, "slot": slot, "spot": spot, "ts_ist": ts_ist, "expiries": exp_out}
+    (out_dir / f"{day}_{slot}.json").write_text(_json.dumps(disk, default=str))
+
+    prev_label = f"{prev['day']}_{prev.get('slot','?')}" if prev and prev.get("day") else None
+    summary = {"day": day, "slot": slot, "ts_ist": ts_ist, "spot": spot,
+               "underlying": "NIFTY", "prev_slot": prev_label, "expiries": exp_summary}
     r = _r.from_url(_st.redis_url, decode_responses=True)
-    r.setex("oi_walls:last", 86400 * 3, _json.dumps(summary, default=str))
-    logger.info(f"OI walls [{slot}] spot={spot} R={[w['strike'] for w in resistance]} "
-                f"S={[w['strike'] for w in support]} moves={len(wall_moves)}")
+    r.setex("oi_walls:last", 86400 * 4, _json.dumps(summary, default=str))
+    logger.info(f"OI walls [{slot}] spot={spot} expiries={len(exp_summary)} "
+                f"nearest R={[w['strike'] for w in exp_summary[0]['resistance']]}")
     return summary
 
 

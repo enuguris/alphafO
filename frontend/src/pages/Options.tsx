@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchChain, fetchMaxPain, fetchIVRank, fetchRegime, fetchEvents } from '../api/client'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Cell } from 'recharts'
 import IVRankGauge from '../components/IVRankGauge'
+import OIWalls from '../components/OIWalls'
 
 const UNDERLYINGS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
 
@@ -143,7 +144,7 @@ export default function Options() {
 
       {/* ── Tabs ───────────────────────────────────── */}
       <div className="tab-bar">
-        {['Chain', 'Max Pain', 'IV Analysis', 'Greeks'].map(t => (
+        {['Chain', 'Max Pain', 'OI Walls', 'IV Analysis', 'Greeks'].map(t => (
           <button key={t} className={`tab-btn ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>{t}</button>
         ))}
       </div>
@@ -262,6 +263,9 @@ export default function Options() {
             )}
           </div>
         )}
+
+        {/* ── OI Walls ── */}
+        {tab === 'OI Walls' && <OIWalls />}
 
         {/* ── IV Analysis ── */}
         {tab === 'IV Analysis' && (
