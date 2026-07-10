@@ -156,9 +156,9 @@ def _build_trade_notes(sig, action: str, premium: float, risk, hedge_trade_data)
 
 async def _auto_paper_trade(signals, db):
     """
-    Auto-execute trades for high-confidence signals.
-    - Real-data signals (Kite OHLCV): confidence ≥ 0.72, any market hours
-    - Synthetic-data signals: confidence ≥ 0.82, only during market hours
+    Auto-execute trades for high-confidence signals DURING MARKET HOURS ONLY (09:20–15:25 IST).
+    - Real-data signals (Kite OHLCV): confidence ≥ 0.72
+    - Synthetic-data signals: confidence ≥ 0.82
     One trade per (underlying, pattern_name, direction). Entry charges deducted immediately.
     Hedge leg auto-added for all SELL positions.
     """
@@ -166,6 +166,10 @@ async def _auto_paper_trade(signals, db):
     from app.models.portfolio import Portfolio
     from app.core.charges import charges_for_entry_only
     from sqlalchemy import select
+
+    # Gate: block all auto-execution outside market hours
+    if not _is_market_hours():
+        return []
 
     # Confidence thresholds
     HIGH_CONF_REAL      = 0.72   # real Kite OHLCV data
@@ -352,9 +356,12 @@ async def _auto_paper_trade(signals, db):
         required_conf = HIGH_CONF_SYNTHETIC if is_synthetic else HIGH_CONF_REAL
         if sig.confidence_score < required_conf:
             continue
-        # Synthetic signals only during market hours — don't paper-trade fake data overnight
-        if is_synthetic and not market_open:
-            logger.debug(f"Skipping synthetic signal {sig.pattern_name}/{sig.underlying} outside market hours")
+        # HARD market-hours gate for ALL entries (not just synthetic).
+        # The 09:00 pre-market scan and 15:35 EOD scan were auto-executing on
+        # previous-close/frozen prices — no real order could fill at those
+        # prices (user caught a 15:45 IST entry, 2026-07-08).
+        if not market_open:
+            logger.info(f"Skipping entry {sig.pattern_name}/{sig.underlying}: outside market hours (09:20-15:25 IST)")
             continue
         # Age gate: don't execute signals older than 2h (stale strikes at market open)
         if sig.created_at:
@@ -1526,11 +1533,18 @@ async def _close_trade(trade, exit_price: float, reason: str, db):
         f"Trade closed: {trade.symbol} | {reason} | "
         f"gross ₹{gross:.2f} | charges ₹{charges.total:.2f} | net ₹{net_pnl:.2f}"
     )
-    # Update daily risk gate P&L and release deployed capital
+    # Update daily risk gate P&L and release deployed capital.
+    # Release must mirror what was RECORDED at entry: margin-style
+    # (margin_blocked + entry charges) for margin trades, premium value for
+    # legacy rows. Releasing premium against a margin-style entry drifted the
+    # Redis heat counter by lakhs/day (anomaly journal, 2026-07-07).
     try:
         from app.core.risk.gate import record_pnl, record_deployed as _release_deployed
         record_pnl(net_pnl)
-        _release_deployed(-(trade_cost + entry_charges_paid))   # negative = release
+        if trade.margin_blocked is not None:
+            _release_deployed(-(trade.margin_blocked + entry_charges_paid))
+        else:
+            _release_deployed(-(trade_cost + entry_charges_paid))   # legacy premium-value rows
     except Exception:
         pass
 
@@ -1879,16 +1893,25 @@ async def _sync_deployed_from_db() -> None:
         from app.core.risk.gate import record_deployed
 
         async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(func.sum(Trade.entry_price * Trade.quantity)).where(
+            # Margin-style heat, same formula as main.py startup sync and
+            # health-scan resync. The old premium-value formula here
+            # (entry_price × quantity) re-seeded ₹3.5L against a true ₹0.45L
+            # every day at 09:15 — the anomaly journal's first real catch.
+            rows = (await db.execute(
+                select(Trade).where(
                     Trade.status == TradeStatus.OPEN,
                     Trade.mode   == TradeMode.PAPER,
                 )
+            )).scalars().all()
+            deployed = sum(
+                (t.margin_blocked + (t.charges_entry or 0.0))
+                if t.margin_blocked is not None
+                else (t.entry_price or 0) * (t.quantity or 1)
+                for t in rows
             )
-            deployed = result.scalar() or 0.0
         if deployed > 0:
             record_deployed(float(deployed))
-            logger.info(f"Portfolio heat re-seeded from DB: ₹{deployed:,.0f}")
+            logger.info(f"Portfolio heat re-seeded from DB (margin-style): ₹{deployed:,.0f}")
     except Exception as exc:
         logger.warning(f"Could not re-seed portfolio heat from DB: {exc}")
 
@@ -2168,7 +2191,12 @@ def generate_briefing():
             from app.models.kite_config import KiteConfig
             async with AsyncSessionLocal() as db:
                 cfg = (await db.execute(select(KiteConfig).limit(1))).scalar_one_or_none()
-                api_key = cfg.anthropic_api_key if cfg else None
+                # Column is anthropic_api_key_enc (encrypted) — the old attribute
+                # name raised AttributeError and the briefing silently never ran
+                api_key = None
+                if cfg and cfg.anthropic_api_key_enc:
+                    from app.core.encryption import decrypt as _dec
+                    api_key = _dec(cfg.anthropic_api_key_enc)
 
             if not api_key:
                 logger.warning("generate_briefing: Anthropic API key not set — skipping")
@@ -2761,6 +2789,138 @@ def market_watch_snapshot():
         logger.error(f"market-watch snapshot failed: {exc}")
 
 
+# ── NIFTY OI-wall snapshot (real support/resistance from OI concentration) ────
+
+N_EXPIRIES = 6  # track the next 6 NIFTY expiry weeks
+
+
+def _walls_from_rows(rows: dict, spot: float, prev_rows: dict | None):
+    """Compute top-3 resistance (call OI) / support (put OI) + diff vs prev_rows."""
+    resistance = [{"strike": k, "coi": rows[k]["coi"]}
+                  for _, k in sorted(((rows[k]["coi"], k) for k in rows if k >= spot),
+                                     reverse=True)[:3]]
+    support = [{"strike": k, "poi": rows[k]["poi"]}
+               for _, k in sorted(((rows[k]["poi"], k) for k in rows if k <= spot),
+                                  reverse=True)[:3]]
+    wall_moves = []
+    if prev_rows:
+        watch = {w["strike"] for w in resistance} | {w["strike"] for w in support}
+        for k in sorted(watch):
+            pcoi = prev_rows.get(str(k), prev_rows.get(k, {})).get("coi", 0)
+            ppoi = prev_rows.get(str(k), prev_rows.get(k, {})).get("poi", 0)
+            dc = (rows[k]["coi"] - pcoi) / 1e6
+            dp = (rows[k]["poi"] - ppoi) / 1e6
+            if abs(dc) > 0.3 or abs(dp) > 0.3:
+                wall_moves.append({"strike": k, "d_call_oi_m": round(dc, 2),
+                                   "d_put_oi_m": round(dp, 2)})
+    return resistance, support, wall_moves
+
+
+async def _do_snapshot_oi_walls(slot: str):
+    """
+    Snapshot NIFTY option-chain OI walls for the next 6 expiries to
+    market_data/oi_walls/YYYY-MM-DD_{slot}.json and write a summary (per-expiry
+    top 3 call/put walls + diff vs prior slot) to Redis key `oi_walls:last`,
+    served to the UI via GET /api/v1/options/oi-walls. Slot is 'am' (opening
+    call) or 'pm' (closing call). Real support/resistance = strikes with highest
+    call OI (resistance) / put OI (support), unlike the naive ATM+-50 briefing.
+    """
+    import json as _json
+    from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2, date as _date
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import select as _sel
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.core.encryption import decrypt
+    import httpx
+
+    now_ist = _dt2.now(_tz2.utc) + _td2(hours=5, minutes=30)
+    if now_ist.weekday() >= 5:
+        return None
+    day = now_ist.strftime("%Y-%m-%d")
+
+    async with AsyncSessionLocal() as db:
+        cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+    if not cfg or not cfg.upstox_access_token_enc:
+        return {"status": "skipped", "reason": "no upstox token"}
+    token = decrypt(cfg.upstox_access_token_enc)
+    h = {"Authorization": f"Bearer {token}"}
+    IK = "NSE_INDEX|Nifty 50"
+
+    out_dir = Path("/app/market_data/oi_walls")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # prior snapshot (any earlier file) for diffing
+    prev = None
+    for f in sorted(out_dir.glob("*.json"), reverse=True):
+        if f.stem != f"{day}_{slot}":
+            try:
+                prev = _json.loads(f.read_text()); break
+            except Exception:
+                continue
+    prev_exp = {e["expiry"]: e for e in (prev.get("expiries", []) if prev else [])}
+
+    async with httpx.AsyncClient(timeout=30, headers=h) as c:
+        lr = await c.get("https://api.upstox.com/v2/market-quote/ltp",
+                         params={"instrument_key": IK})
+        spot = next(iter(lr.json().get("data", {}).values()), {}).get("last_price")
+        if not spot:
+            return {"status": "skipped", "reason": "no spot"}
+        cr = await c.get("https://api.upstox.com/v2/option/contract",
+                         params={"instrument_key": IK})
+        all_exp = sorted({x.get("expiry") for x in cr.json().get("data", []) if x.get("expiry")})
+        expiries = [e for e in all_exp if e >= str(_date.today())][:N_EXPIRIES]
+
+        exp_out = []       # full rows for disk
+        exp_summary = []   # compact walls for Redis/UI
+        for expiry in expiries:
+            ch = await c.get("https://api.upstox.com/v2/option/chain",
+                             params={"instrument_key": IK, "expiry_date": expiry})
+            rows = {}
+            for row in ch.json().get("data", []):
+                k = int(row.get("strike_price"))
+                ce = row.get("call_options", {}).get("market_data", {})
+                pe = row.get("put_options", {}).get("market_data", {})
+                rows[k] = {"coi": int(ce.get("oi", 0)), "poi": int(pe.get("oi", 0)),
+                           "cl": ce.get("ltp", 0), "pl": pe.get("ltp", 0)}
+            if not rows:
+                continue
+            prev_rows = prev_exp.get(expiry, {}).get("rows") if prev else None
+            resistance, support, moves = _walls_from_rows(rows, spot, prev_rows)
+            exp_out.append({"expiry": expiry, "rows": rows})
+            exp_summary.append({"expiry": expiry, "resistance": resistance,
+                                "support": support, "wall_moves_vs_prev": moves})
+
+    if not exp_summary:
+        return {"status": "skipped", "reason": "no chain data"}
+
+    ts_ist = now_ist.strftime("%H:%M IST")
+    disk = {"day": day, "slot": slot, "spot": spot, "ts_ist": ts_ist, "expiries": exp_out}
+    (out_dir / f"{day}_{slot}.json").write_text(_json.dumps(disk, default=str))
+
+    prev_label = f"{prev['day']}_{prev.get('slot','?')}" if prev and prev.get("day") else None
+    summary = {"day": day, "slot": slot, "ts_ist": ts_ist, "spot": spot,
+               "underlying": "NIFTY", "prev_slot": prev_label, "expiries": exp_summary}
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    r.setex("oi_walls:last", 86400 * 4, _json.dumps(summary, default=str))
+    logger.info(f"OI walls [{slot}] spot={spot} expiries={len(exp_summary)} "
+                f"nearest R={[w['strike'] for w in exp_summary[0]['resistance']]}")
+    return summary
+
+
+@celery_app.task(name="workers.snapshot_oi_walls")
+def snapshot_oi_walls(slot: str = "pm"):
+    """Capture NIFTY OI walls. slot='am' (opening) or 'pm' (closing)."""
+    try:
+        result = _run_async(_do_snapshot_oi_walls(slot))
+        _stamp_task_run("workers.snapshot_oi_walls")
+        return result
+    except Exception as exc:
+        logger.error(f"OI-wall snapshot failed: {exc}")
+        return {"status": "ERROR", "error": str(exc)}
+
+
 # ── Nightly intraday-candle collection (own the data before it expires) ──────
 
 async def _do_collect_option_candles():
@@ -3085,6 +3245,133 @@ def zero_dte_straddle():
         return {"status": "error", "error": str(exc)}
 
 
+# ── Post-fall bear call (experiment, 1 lot) — adopted 2026-07-08 ─────────────
+
+async def _do_postfall_bearcall():
+    """
+    09:45 IST after a >=1.25% down day: sell NIFTY weekly bear call spread,
+    short S+200 / wing S+300, 1 lot. Tested on 27 real post-fall mornings:
+    81% win, PF 1.54, avg +419/trade (vs PF 1.27 on normal days; the same
+    structure is PF 0.72 after big UP days, so it only trades post-fall).
+    Managed by standard group exits (TP 50% credit / SL 2x / half-DTE).
+    """
+    import json as _json
+    import uuid
+    from datetime import date as _d, datetime as _dtm
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import select as _sel
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.models.trades import Trade, TradeStatus, TradeMode
+    from app.models.portfolio import Portfolio
+    from app.core.charges import charges_for_entry_only
+    from app.core.instruments import get_lot_size
+    from app.core.options.expiry import available_expiries
+    from app.core.strategies.composite import _build_symbol
+
+    if not _is_market_hours():
+        return {"status": "skipped", "reason": "outside market hours"}
+
+    # Trigger: previous session fell >= 1.25% (from the EOD digest archive)
+    snaps = sorted(Path("/app/market_data/daily_snapshots").glob("*.json"))[-2:]
+    if len(snaps) < 2:
+        return {"status": "skipped", "reason": "not enough digest history"}
+    d0 = _json.loads(snaps[0].read_text()).get("nifty") or {}
+    d1 = _json.loads(snaps[1].read_text()).get("nifty") or {}
+    if not d0.get("close") or not d1.get("close"):
+        return {"status": "skipped", "reason": "digest missing closes"}
+    prev_ret = d1["close"] / d0["close"] - 1
+    if prev_ret > -0.0125:
+        return {"status": "skipped", "reason": f"no trigger (prev day {prev_ret*100:+.2f}%)"}
+
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    spot = float(r.get("spot:NIFTY") or 0)
+    if spot <= 0 or not r.get("ticker:last_real_tick"):
+        logger.warning("postfall_bc: no real spot ticks — skipped (never trade on synthetic)")
+        return {"status": "skipped", "reason": "no real ticks"}
+
+    exps = available_expiries("NIFTY", _d.today())
+    exp = next((e for e in exps if 2 <= e["dte"] <= 9), None)
+    if not exp:
+        return {"status": "skipped", "reason": "no weekly expiry in 2-9 DTE"}
+    expiry_iso = exp["date"]
+    lot = get_lot_size("NIFTY")
+    k_short = float(round((spot + 200) / 50) * 50)
+    k_wing = k_short + 100.0
+
+    async with AsyncSessionLocal() as db:
+        # one per day
+        existing = (await db.execute(_sel(Trade).where(
+            Trade.status == TradeStatus.OPEN, Trade.leg_role == "postfall_bc_short"))).scalars().first()
+        if existing:
+            return {"status": "skipped", "reason": "already open"}
+        cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+        ps, src_s, tok_s = await _fetch_option_ltp_global(cfg, "NIFTY", expiry_iso, k_short, "CE")
+        pw, src_w, tok_w = await _fetch_option_ltp_global(cfg, "NIFTY", expiry_iso, k_wing, "CE")
+        if not ps or not pw:
+            return {"status": "aborted", "reason": "no real LTP for legs"}
+        fill_s = round(max(0.05, ps - max(0.25, ps * 0.005)), 2)   # sell slippage-adverse
+        fill_w = round(pw + max(0.25, pw * 0.005), 2)              # buy slippage-adverse
+        credit = fill_s - fill_w
+        width = k_wing - k_short
+        if not (0.15 * width <= credit <= 0.85 * width):
+            logger.warning(f"postfall_bc: credit {credit:.1f} outside 15-85% of width {width} — skipped")
+            return {"status": "skipped", "reason": "credit gate"}
+
+        gid = str(uuid.uuid4())
+        now = _dtm.utcnow()
+        margin = (width - credit) * lot
+        cash = 0.0
+        legs = [("SELL", k_short, fill_s, src_s, tok_s, "postfall_bc_short"),
+                ("BUY", k_wing, fill_w, src_w, tok_w, "postfall_bc_wing")]
+        for action, k, fill, src, tok, role in legs:
+            ch = charges_for_entry_only(fill, lot, action)
+            cash += (fill * lot - ch) if action == "SELL" else (-(fill * lot) - ch)
+            db.add(Trade(
+                mode=TradeMode.PAPER,
+                symbol=_build_symbol("NIFTY", expiry_iso, k, "CE"),
+                underlying="NIFTY", option_type="CE", strike=k,
+                lot_size=lot, expiry_date=expiry_iso, expiry_display=expiry_iso,
+                action=action, direction="short" if action == "SELL" else "long",
+                quantity=lot, entry_price=fill, current_price=fill,
+                target_price=0.0, stop_loss=0.0,
+                charges_entry=ch, unrealized_pnl=0.0,
+                status=TradeStatus.OPEN, entry_time=now,
+                entry_price_source=src, instrument_token=tok,
+                margin_blocked=round(margin / 2, 2),
+                trade_group_id=gid, leg_role=role,
+                notes=("STRATEGY:Post-fall Bear Call (exp)|Prev session fell "
+                       f"{prev_ret*100:.2f}%; tested 27 post-fall mornings: 81% win, PF 1.54 "
+                       "(vs 0.72 after up days). Short S+200/wing S+300, TP50/SL2x/half-DTE."),
+            ))
+        pf = (await db.execute(_sel(Portfolio).where(Portfolio.mode == "paper"))).scalar_one_or_none()
+        if pf:
+            pf.capital_deployed += margin
+            pf.capital_current += cash - margin
+        await db.commit()
+        try:
+            from app.core.risk.gate import record_deployed
+            record_deployed(margin)
+        except Exception:
+            pass
+        logger.info(f"postfall_bc OPENED: {k_short}/{k_wing} CE credit {credit:.1f}/unit, group {gid[:8]}")
+        return {"status": "opened", "credit": credit, "short": k_short, "wing": k_wing}
+
+
+@celery_app.task(name="workers.postfall_bearcall")
+def postfall_bearcall():
+    """09:45 IST Mon-Fri: bear call spread the morning after a >=1.25% fall."""
+    try:
+        result = _run_async(_do_postfall_bearcall())
+        _stamp_task_run("workers.postfall_bearcall")
+        return result
+    except Exception as exc:
+        logger.error(f"postfall bearcall failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+
 
 # â”€â”€ Pre-market readiness check â€” 08:50 IST Mon-Fri â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -3126,10 +3413,26 @@ async def _do_premarket_readiness():
         add("database", False, str(e)[:80])
         cfg = None
 
-    # 2. Broker tokens fresh TODAY (they expire daily â€” bit us twice)
+    # 2. Broker tokens fresh TODAY (they expire daily â€” bit us twice).
+    # Date check alone is NOT enough: 2026-07-08 a same-morning token was
+    # still rejected by Kite ("Incorrect api_key or access_token").
+    # So validate LIVE with a real API call.
     kite_ok = bool(cfg and cfg.access_token_enc and cfg.token_date == today)
-    add("kite_token_fresh", kite_ok,
-        "" if kite_ok else "REGENERATE Kite token before open â€” entries fall back to estimates without it")
+    kite_detail = "" if kite_ok else "REGENERATE Kite token before open â€” entries fall back to estimates without it"
+    if kite_ok:
+        try:
+            from kiteconnect import KiteConnect
+            from app.core.encryption import decrypt as _dec
+            _kc = KiteConnect(api_key=cfg.api_key)
+            _kc.set_access_token(_dec(cfg.access_token_enc))
+            _q = _kc.quote(["NSE:NIFTY 50"])
+            _ltp = list(_q.values())[0].get("last_price") if _q else None
+            kite_ok = bool(_ltp and _ltp > 0)
+            kite_detail = f"live-validated, NIFTY={_ltp}" if kite_ok else "quote returned no price"
+        except Exception as _ke:
+            kite_ok = False
+            kite_detail = f"token date is today but API REJECTS it â€” regenerate: {str(_ke)[:60]}"
+    add("kite_token_fresh", kite_ok, kite_detail)
     up_ok = bool(cfg and cfg.upstox_access_token_enc and cfg.upstox_token_date == today)
     add("upstox_token_fresh", up_ok,
         "" if up_ok else "regenerate Upstox token (backtests + LTP fallback need it)")
@@ -3291,6 +3594,13 @@ async def _do_eod_market_digest():
         digest["integrity_violations"] = len(_json.loads(integ)["violations"]) if integ else None
     except Exception:
         digest["integrity_violations"] = None
+
+    # Closing-call OI walls: capture definitive EOD NIFTY walls + intraday change
+    try:
+        digest["oi_walls"] = await _do_snapshot_oi_walls("pm")
+    except Exception as exc:
+        logger.warning(f"EOD OI-wall snapshot skipped: {exc}")
+        digest["oi_walls"] = None
 
     out_dir = Path("/app/market_data/daily_snapshots")
     out_dir.mkdir(parents=True, exist_ok=True)

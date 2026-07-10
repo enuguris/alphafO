@@ -125,6 +125,20 @@ async def lifespan(app: FastAPI):
     # Subscribe option tokens for any already-open paper trades
     await _subscribe_open_trade_tokens()
 
+    # Warm the bhav-OHLCV cache in the background so the first Options-page load
+    # doesn't pay the ~15s bhav parse (regime/chain/iv-rank all reuse it).
+    async def _warm_ohlcv():
+        try:
+            import asyncio as _a
+            from app.api.v1.options import _synthetic_ohlcv
+            for _ul in ("NIFTY", "BANKNIFTY"):
+                await _a.to_thread(_synthetic_ohlcv, _ul)
+            logger.info("OHLCV cache warmed")
+        except Exception as exc:
+            logger.warning(f"OHLCV warm skipped: {exc}")
+    import asyncio as _asyncio
+    _asyncio.create_task(_warm_ohlcv())
+
     yield
     ticker_service.stop()
     logger.info("AlphaFO shutting down")

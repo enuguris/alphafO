@@ -35,18 +35,51 @@ def _spot(underlying: str) -> float:
     return float(BASE_PRICES.get(underlying.upper(), 1500))
 
 
+_OHLCV_CACHE: dict = {}
+_OHLCV_TTL = 600.0  # bhav data changes once daily post-market; 10-min cache is safe
+
+
 def _synthetic_ohlcv(underlying: str, rows: int = 120) -> pd.DataFrame:
     """
     OHLCV for regime detection.
     Prefers real bhav data (FUTIDX closing prices from 253 cached files).
     Falls back to date-seeded synthetic random walk if bhav data insufficient.
+
+    Cached 10 min per (underlying, rows): build_ohlcv_from_bhav re-reads 253 bhav
+    CSVs (+ India VIX merge) each call and is hit by the chain, regime, and
+    iv-rank endpoints — recomputing on every 30s poll made the Options page slow.
     """
+    import time as _time
     import numpy as np
     from datetime import datetime
+    from pathlib import Path as _Path
+    ck = (underlying.upper(), rows)
+    _hit = _OHLCV_CACHE.get(ck)
+    if _hit and (_time.time() - _hit[0]) < _OHLCV_TTL:
+        return _hit[1]
+    # Dated disk cache — build_ohlcv_from_bhav parses 253+ bhav CSVs (~30-40s);
+    # bhav updates once daily, so persist per-day and survive restarts.
+    _cache_dir = _Path("/app/market_data/ohlcv_cache")
+    _day = datetime.today().strftime("%Y%m%d")
+    _cache_f = _cache_dir / f"{underlying.upper()}_{rows}_{_day}.pkl"
+    try:
+        if _cache_f.exists():
+            real_df = pd.read_pickle(_cache_f)
+            if real_df is not None and len(real_df) >= 20:
+                _OHLCV_CACHE[ck] = (_time.time(), real_df)
+                return real_df
+    except Exception:
+        pass
     try:
         from app.core.backtest.market_data import build_ohlcv_from_bhav
         real_df = build_ohlcv_from_bhav(underlying, rows=rows)
         if real_df is not None and len(real_df) >= 20:
+            _OHLCV_CACHE[ck] = (_time.time(), real_df)
+            try:
+                _cache_dir.mkdir(parents=True, exist_ok=True)
+                real_df.to_pickle(_cache_f)
+            except Exception:
+                pass
             return real_df
     except Exception:
         pass
@@ -126,9 +159,30 @@ async def get_iv_rank(underlying: str):
     }
 
 
+_CHAIN_RESP_CACHE: dict = {}
+_CHAIN_RESP_TTL = 45.0
+
+
 @router.get("/chain/{underlying}")
 async def get_chain(underlying: str):
-    """Get options chain with Greeks, IV rank, max pain, and regime in one call."""
+    """Get options chain with Greeks, IV rank, max pain, and regime in one call.
+
+    The heavy work (NSE chain fetch, IV history, bhav-based OHLCV, regime) is
+    synchronous and slow (~20s cold), so: (1) run it in a threadpool so it never
+    blocks the event loop and freezes other requests, and (2) cache the full
+    response for 45s so the Options page's 30s polling doesn't recompute each time.
+    """
+    import asyncio as _asyncio
+    import time as _time
+    hit = _CHAIN_RESP_CACHE.get(underlying.upper())
+    if hit and (_time.time() - hit[0]) < _CHAIN_RESP_TTL:
+        return hit[1]
+    resp = await _asyncio.to_thread(_build_chain_response, underlying)
+    _CHAIN_RESP_CACHE[underlying.upper()] = (_time.time(), resp)
+    return resp
+
+
+def _build_chain_response(underlying: str):
     chain_svc = ChainService()
     chain_df = chain_svc.get_chain(underlying)
     spot = _spot(underlying)
@@ -199,6 +253,24 @@ async def get_max_pain(underlying: str):
         "pe_oi_total": result["pe_oi_total"],
         "nearest_pain_data": pain_data,
     }
+
+
+@router.get("/oi-walls")
+async def get_oi_walls():
+    """
+    Latest NIFTY OI-wall snapshot (real support/resistance from OI concentration)
+    across the next 6 expiries. Refreshed twice daily by the snapshot_oi_walls
+    task (am 09:20 / pm 15:25 IST). Returns null if no snapshot has run yet.
+    """
+    import json as _json
+    import redis as _redis
+    from app.config import settings as _cfg
+    try:
+        r = _redis.from_url(_cfg.redis_url, decode_responses=True)
+        raw = r.get("oi_walls:last")
+        return _json.loads(raw) if raw else {"status": "no_snapshot_yet"}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
 
 
 @router.get("/events")

@@ -27,6 +27,7 @@ export const fetchRegime    = (underlying: string)   => api.get(`/options/regime
 export const fetchIVRank    = (underlying: string)   => api.get(`/options/iv-rank/${underlying}`).then(r => r.data)
 export const fetchChain     = (underlying: string)   => api.get(`/options/chain/${underlying}`).then(r => r.data)
 export const fetchMaxPain   = (underlying: string)   => api.get(`/options/max-pain/${underlying}`).then(r => r.data)
+export const fetchOIWalls   = ()                     => api.get('/options/oi-walls').then(r => r.data)
 export const fetchEvents    = ()                     => api.get('/options/events').then(r => r.data)
 
 // ── Instruments ───────────────────────────────────────────────────────────

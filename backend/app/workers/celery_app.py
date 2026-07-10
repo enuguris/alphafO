@@ -157,6 +157,13 @@ celery_app.conf.update(
             "task": "workers.zero_dte_straddle",
             "schedule": crontab(minute="45", hour="9", day_of_week="2"),
         },
+        # Post-fall bear call — 09:45 IST Mon-Fri, fires only when the prior
+        # session fell >=1.25%. Tested on 27 real post-fall mornings: 81% win,
+        # PF 1.54 (vs 0.72 after big UP days — never sell calls into momentum).
+        "postfall-bearcall": {
+            "task": "workers.postfall_bearcall",
+            "schedule": crontab(minute="46", hour="9", day_of_week="1-5"),
+        },
         # Pre-market readiness — 08:50 IST Mon-Fri: broker-token freshness,
         # DB/Redis, beat liveness, integrity, halts, data freshness. Result at
         # GET /api/v1/system/readiness. GO / DEGRADED / NO-GO.
@@ -170,6 +177,20 @@ celery_app.conf.update(
         "premarket-readiness": {
             "task": "workers.premarket_readiness",
             "schedule": crontab(minute="50", hour="8", day_of_week="1-5"),
+        },
+        # NIFTY OI-wall snapshot — real support/resistance from OI concentration.
+        # AM (09:20 IST) feeds the opening call / pre-market briefing; PM (15:25 IST)
+        # captures the definitive EOD walls and is also folded into the EOD digest.
+        # Tracked daily; saved to market_data/oi_walls/YYYY-MM-DD_{am,pm}.json.
+        "oi-walls-am": {
+            "task": "workers.snapshot_oi_walls",
+            "schedule": crontab(minute="20", hour="9", day_of_week="1-5"),
+            "kwargs": {"slot": "am"},
+        },
+        "oi-walls-pm": {
+            "task": "workers.snapshot_oi_walls",
+            "schedule": crontab(minute="25", hour="15", day_of_week="1-5"),
+            "kwargs": {"slot": "pm"},
         },
     },
 )
