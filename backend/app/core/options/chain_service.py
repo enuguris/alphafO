@@ -14,6 +14,14 @@ STRIKE_STEPS = {
 }
 DEFAULT_STEP = 50
 
+# Module-level short-TTL cache for the NSE chain fetch. The NSE scrape
+# (jugaad-data) is slow and rate-limited (15-25s), and the Options page polls
+# every 30s — without this, every poll re-scrapes and (before the endpoint was
+# moved to a threadpool) froze the whole event loop. 45s TTL keeps data fresh
+# while collapsing repeated polls to a single fetch.
+_CHAIN_CACHE: dict[tuple, tuple] = {}
+_CHAIN_TTL = 45.0
+
 
 class ChainService:
     """Fetch or generate options chain data."""
@@ -26,16 +34,28 @@ class ChainService:
         expiry_iso: ISO date string (e.g. "2026-07-14") — if provided, fetches that specific expiry
                     instead of the nearest one.
         Priority: Kite (real-time) → NSE via jugaad-data (free, real) → synthetic fallback.
+        Cached for 45s per (underlying, expiry) to avoid re-scraping on every poll.
         """
         if kite_adapter is not None:
             try:
                 return self._from_kite(underlying, kite_adapter)
             except Exception:
                 pass
+
+        import time as _time
+        key = (underlying.upper(), expiry_iso)
+        hit = _CHAIN_CACHE.get(key)
+        if hit and (_time.time() - hit[0]) < _CHAIN_TTL:
+            return hit[1]
         try:
-            return self._from_nse(underlying, expiry_iso=expiry_iso)
+            df = self._from_nse(underlying, expiry_iso=expiry_iso)
+            _CHAIN_CACHE[key] = (_time.time(), df)
+            return df
         except Exception:
             pass
+        # Serve a stale cached chain if we have one before falling to synthetic
+        if hit:
+            return hit[1]
         return self._synthetic_chain(underlying)
 
     def _get_live_spot(self, underlying: str) -> float:
