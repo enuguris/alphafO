@@ -92,7 +92,6 @@ function UnderlyingChart({ bars, entryTime, strike, optionType, underlying, expi
   // OI walls — refetched every 60s so the overlay updates as new snapshots land
   const { data: oiWalls } = useQuery({
     queryKey: ['oiwalls'], queryFn: fetchOIWalls, refetchInterval: 60000,
-    enabled: !!showWalls,
   })
 
   useEffect(() => {
