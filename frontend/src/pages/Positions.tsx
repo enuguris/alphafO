@@ -149,7 +149,9 @@ function UnderlyingChart({ bars, entryTime, strike, optionType, underlying, expi
         const exps = oiWalls.expiries
         const match = (expiry && exps.find((e: any) => e.expiry === expiry)) || exps[0]
         if (match) {
+          const wallStrikes: number[] = []
           for (const w of match.resistance || []) {
+            wallStrikes.push(w.strike)
             series.createPriceLine({
               price: w.strike, color: 'rgba(239,83,80,0.9)', lineWidth: 1,
               lineStyle: 3, axisLabelVisible: true,
@@ -157,10 +159,24 @@ function UnderlyingChart({ bars, entryTime, strike, optionType, underlying, expi
             } as any)
           }
           for (const w of match.support || []) {
+            wallStrikes.push(w.strike)
             series.createPriceLine({
               price: w.strike, color: 'rgba(38,166,154,0.9)', lineWidth: 1,
               lineStyle: 3, axisLabelVisible: true,
               title: `S ${(w.poi / 1e6).toFixed(1)}M`,
+            } as any)
+          }
+          // Expand the price scale so wall lines outside the candle range
+          // (e.g. 25,000 / 23,500) aren't clipped off-screen.
+          if (wallStrikes.length) {
+            const lows = cdata.map(d => d.low).concat(wallStrikes)
+            const highs = cdata.map(d => d.high).concat(wallStrikes)
+            const minV = Math.min(...lows), maxV = Math.max(...highs)
+            const pad = (maxV - minV) * 0.03
+            series.applyOptions({
+              autoscaleInfoProvider: () => ({
+                priceRange: { minValue: minV - pad, maxValue: maxV + pad },
+              }),
             } as any)
           }
         }
