@@ -123,7 +123,7 @@ export default function PayoffChart({ groupId }: { groupId: string }) {
         ))}
 
         {/* OI walls — resistance (red) / support (green) vertical lines.
-            Only for NIFTY, only walls within the visible price range. */}
+            Only NIFTY, in-range, top-2 per side, with collision-avoiding labels. */}
         {(() => {
           if ((data.underlying || '').toUpperCase() !== 'NIFTY' || !oiWalls?.expiries?.length) return null
           const legExp = data.legs?.[0]?.expiry
@@ -131,30 +131,30 @@ export default function PayoffChart({ groupId }: { groupId: string }) {
           if (!match) return null
           const lo = xs[0], hi = xs[xs.length - 1]
           const inRange = (s: number) => s >= lo && s <= hi
-          const lines: any[] = []
-          for (const w of match.resistance || []) {
-            if (!inRange(w.strike)) continue
-            lines.push(
-              <g key={'r' + w.strike}>
-                <line x1={px(w.strike)} x2={px(w.strike)} y1={PAD.t + 14} y2={H - PAD.b}
-                  stroke="rgba(239,83,80,0.85)" strokeWidth={1} strokeDasharray="2,3" />
-                <text x={px(w.strike)} y={PAD.t + 20} textAnchor="middle" fontSize={8}
-                  fill="rgba(239,83,80,0.95)" fontFamily="monospace">R{(w.coi / 1e6).toFixed(1)}M</text>
+          // Top-2 biggest walls per side that are in range → fewer, meaningful lines
+          const res = (match.resistance || []).filter((w: any) => inRange(w.strike))
+            .sort((a: any, b: any) => b.coi - a.coi).slice(0, 2)
+            .map((w: any) => ({ price: w.strike, label: `R ${(w.coi / 1e6).toFixed(1)}M`, color: 'rgba(239,83,80,0.9)' }))
+          const sup = (match.support || []).filter((w: any) => inRange(w.strike))
+            .sort((a: any, b: any) => b.poi - a.poi).slice(0, 2)
+            .map((w: any) => ({ price: w.strike, label: `S ${(w.poi / 1e6).toFixed(1)}M`, color: 'rgba(38,166,154,0.9)' }))
+          // Sort by x and assign staggered label rows so labels never overlap
+          const walls = [...res, ...sup].map(w => ({ ...w, x: px(w.price) })).sort((a, b) => a.x - b.x)
+          const rows: number[] = []      // last label x per row
+          const MINGAP = 46
+          return walls.map((w, i) => {
+            let row = 0
+            while (row < rows.length && w.x - rows[row] < MINGAP) row++
+            rows[row] = w.x
+            const ly = PAD.t + 8 + row * 11
+            return (
+              <g key={i}>
+                <line x1={w.x} x2={w.x} y1={ly + 3} y2={H - PAD.b}
+                  stroke={w.color} strokeWidth={1} strokeDasharray="2,3" />
+                <text x={w.x} y={ly} textAnchor="middle" fontSize={8} fill={w.color} fontFamily="monospace">{w.label}</text>
               </g>
             )
-          }
-          for (const w of match.support || []) {
-            if (!inRange(w.strike)) continue
-            lines.push(
-              <g key={'s' + w.strike}>
-                <line x1={px(w.strike)} x2={px(w.strike)} y1={PAD.t + 14} y2={H - PAD.b}
-                  stroke="rgba(38,166,154,0.85)" strokeWidth={1} strokeDasharray="2,3" />
-                <text x={px(w.strike)} y={PAD.t + 20} textAnchor="middle" fontSize={8}
-                  fill="rgba(38,166,154,0.95)" fontFamily="monospace">S{(w.poi / 1e6).toFixed(1)}M</text>
-              </g>
-            )
-          }
-          return lines
+          })
         })()}
 
         {/* Current spot marker */}
