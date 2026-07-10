@@ -462,7 +462,26 @@ def build_ohlcv_from_bhav(underlying: str, rows: int = 120) -> Optional[pd.DataF
     bhav_dir = CACHE_DIR / "bhav"
     records: list[dict] = []
 
-    for csv_f in sorted(bhav_dir.glob("fo*.csv")):
+    # Only parse the most recent files. There are 2400+ bhav files (~3MB each,
+    # backfilled to 2019); reading all of them costs 30-40s per call. We only
+    # need `rows` trading days, so date-sort by the filename (foDDMMMYYYY.csv)
+    # and keep a generous tail. Files that don't parse fall back to name sort.
+    from datetime import datetime as _dtp
+    all_files = list(bhav_dir.glob("fo*.csv"))
+
+    def _fdate(p):
+        try:
+            return _dtp.strptime(p.stem, "fo%d%b%Y")
+        except Exception:
+            return _dtp.min
+
+    # Each bhav file yields one near-month FUTIDX row (one trading day), so we
+    # need ~rows files plus a small margin for holidays/missing symbols.
+    all_files.sort(key=_fdate)
+    _keep = rows + 30
+    recent_files = all_files[-_keep:] if len(all_files) > _keep else all_files
+
+    for csv_f in recent_files:
         try:
             df_b = pd.read_csv(csv_f, low_memory=False)
             # Filter to near-month FUTIDX for this symbol
