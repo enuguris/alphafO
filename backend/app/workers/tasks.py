@@ -2789,6 +2789,116 @@ def market_watch_snapshot():
         logger.error(f"market-watch snapshot failed: {exc}")
 
 
+# ── NIFTY OI-wall snapshot (real support/resistance from OI concentration) ────
+
+async def _do_snapshot_oi_walls(slot: str, expiry: str = "2026-07-28"):
+    """
+    Snapshot NIFTY option-chain OI walls to market_data/oi_walls/YYYY-MM-DD_{slot}.json
+    and write a compact summary (top 3 call/put walls + diff vs prior slot) to Redis
+    key `oi_walls:last`. Slot is 'am' (opening call) or 'pm' (closing call).
+    Real support/resistance = strikes with highest call OI (resistance) / put OI
+    (support), unlike the naive ATM+-50 in the briefing. Runs daily for tracking.
+    """
+    import json as _json
+    from datetime import datetime as _dt2, timedelta as _td2, timezone as _tz2
+    from pathlib import Path
+    import redis as _r
+    from sqlalchemy import select as _sel
+    from app.config import settings as _st
+    from app.database import AsyncSessionLocal
+    from app.models.kite_config import KiteConfig
+    from app.core.encryption import decrypt
+    import httpx
+
+    now_ist = _dt2.now(_tz2.utc) + _td2(hours=5, minutes=30)
+    if now_ist.weekday() >= 5:
+        return None
+    day = now_ist.strftime("%Y-%m-%d")
+
+    async with AsyncSessionLocal() as db:
+        cfg = (await db.execute(_sel(KiteConfig).limit(1))).scalar_one_or_none()
+    if not cfg or not cfg.upstox_access_token_enc:
+        return {"status": "skipped", "reason": "no upstox token"}
+    token = decrypt(cfg.upstox_access_token_enc)
+    h = {"Authorization": f"Bearer {token}"}
+
+    async with httpx.AsyncClient(timeout=30, headers=h) as c:
+        lr = await c.get("https://api.upstox.com/v2/market-quote/ltp",
+                         params={"instrument_key": "NSE_INDEX|Nifty 50"})
+        spot = next(iter(lr.json().get("data", {}).values()), {}).get("last_price")
+        ch = await c.get("https://api.upstox.com/v2/option/chain",
+                         params={"instrument_key": "NSE_INDEX|Nifty 50", "expiry_date": expiry})
+        rows = {}
+        for row in ch.json().get("data", []):
+            k = int(row.get("strike_price"))
+            ce = row.get("call_options", {}).get("market_data", {})
+            pe = row.get("put_options", {}).get("market_data", {})
+            rows[k] = {"coi": int(ce.get("oi", 0)), "poi": int(pe.get("oi", 0)),
+                       "cl": ce.get("ltp", 0), "pl": pe.get("ltp", 0)}
+    if not spot or not rows:
+        return {"status": "skipped", "reason": "no chain data"}
+
+    out_dir = Path("/app/market_data/oi_walls")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"day": day, "slot": slot, "spot": spot, "expiry": expiry,
+               "ts_ist": now_ist.strftime("%H:%M IST"), "rows": rows}
+    (out_dir / f"{day}_{slot}.json").write_text(_json.dumps(payload, default=str))
+
+    # top walls
+    resistance = [{"strike": k, "coi": rows[k]["coi"]}
+                  for _, k in sorted(((rows[k]["coi"], k) for k in rows if k >= spot),
+                                     reverse=True)[:3]]
+    support = [{"strike": k, "poi": rows[k]["poi"]}
+               for _, k in sorted(((rows[k]["poi"], k) for k in rows if k <= spot),
+                                  reverse=True)[:3]]
+
+    # diff vs the most recent prior snapshot (any slot, excluding this file)
+    prev = None
+    for f in sorted(out_dir.glob("*.json"), reverse=True):
+        if f.stem != f"{day}_{slot}":
+            try:
+                prev = _json.loads(f.read_text())
+            except Exception:
+                continue
+            break
+    wall_moves = []
+    if prev:
+        pr = prev.get("rows", {})
+        watch = {w["strike"] for w in resistance} | {w["strike"] for w in support}
+        for k in sorted(watch):
+            pcoi = pr.get(str(k), {}).get("coi", 0)
+            ppoi = pr.get(str(k), {}).get("poi", 0)
+            dc = (rows[k]["coi"] - pcoi) / 1e6
+            dp = (rows[k]["poi"] - ppoi) / 1e6
+            if abs(dc) > 0.3 or abs(dp) > 0.3:
+                wall_moves.append({"strike": k, "d_call_oi_m": round(dc, 2),
+                                   "d_put_oi_m": round(dp, 2)})
+
+    prev_label = None
+    if prev and prev.get("day"):
+        prev_label = f"{prev['day']}_{prev.get('slot', '?')}"
+    summary = {"day": day, "slot": slot, "ts_ist": payload["ts_ist"], "spot": spot,
+               "expiry": expiry, "resistance": resistance, "support": support,
+               "wall_moves_vs_prev": wall_moves, "prev_slot": prev_label}
+    r = _r.from_url(_st.redis_url, decode_responses=True)
+    r.setex("oi_walls:last", 86400 * 3, _json.dumps(summary, default=str))
+    logger.info(f"OI walls [{slot}] spot={spot} R={[w['strike'] for w in resistance]} "
+                f"S={[w['strike'] for w in support]} moves={len(wall_moves)}")
+    return summary
+
+
+@celery_app.task(name="workers.snapshot_oi_walls")
+def snapshot_oi_walls(slot: str = "pm"):
+    """Capture NIFTY OI walls. slot='am' (opening) or 'pm' (closing)."""
+    try:
+        result = _run_async(_do_snapshot_oi_walls(slot))
+        _stamp_task_run("workers.snapshot_oi_walls")
+        return result
+    except Exception as exc:
+        logger.error(f"OI-wall snapshot failed: {exc}")
+        return {"status": "ERROR", "error": str(exc)}
+
+
 # ── Nightly intraday-candle collection (own the data before it expires) ──────
 
 async def _do_collect_option_candles():
@@ -3462,6 +3572,13 @@ async def _do_eod_market_digest():
         digest["integrity_violations"] = len(_json.loads(integ)["violations"]) if integ else None
     except Exception:
         digest["integrity_violations"] = None
+
+    # Closing-call OI walls: capture definitive EOD NIFTY walls + intraday change
+    try:
+        digest["oi_walls"] = await _do_snapshot_oi_walls("pm")
+    except Exception as exc:
+        logger.warning(f"EOD OI-wall snapshot skipped: {exc}")
+        digest["oi_walls"] = None
 
     out_dir = Path("/app/market_data/daily_snapshots")
     out_dir.mkdir(parents=True, exist_ok=True)

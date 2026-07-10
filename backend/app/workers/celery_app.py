@@ -178,5 +178,19 @@ celery_app.conf.update(
             "task": "workers.premarket_readiness",
             "schedule": crontab(minute="50", hour="8", day_of_week="1-5"),
         },
+        # NIFTY OI-wall snapshot — real support/resistance from OI concentration.
+        # AM (09:20 IST) feeds the opening call / pre-market briefing; PM (15:25 IST)
+        # captures the definitive EOD walls and is also folded into the EOD digest.
+        # Tracked daily; saved to market_data/oi_walls/YYYY-MM-DD_{am,pm}.json.
+        "oi-walls-am": {
+            "task": "workers.snapshot_oi_walls",
+            "schedule": crontab(minute="20", hour="9", day_of_week="1-5"),
+            "kwargs": {"slot": "am"},
+        },
+        "oi-walls-pm": {
+            "task": "workers.snapshot_oi_walls",
+            "schedule": crontab(minute="25", hour="15", day_of_week="1-5"),
+            "kwargs": {"slot": "pm"},
+        },
     },
 )

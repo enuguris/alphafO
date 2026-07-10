@@ -297,6 +297,18 @@ async def pre_market_briefing(db: AsyncSession = Depends(get_db)):
 
     briefing["key_levels"] = key_levels
 
+    # ── 7b. Real support/resistance from NIFTY OI walls (opening call) ─────────
+    # Populated by the snapshot_oi_walls task (am/pm). Unlike key_levels (ATM+-50),
+    # these are the strikes where option OI concentrates — genuine defended levels.
+    try:
+        import redis as _redis
+        from app.config import settings as _cfg
+        _r = _redis.from_url(_cfg.redis_url, decode_responses=True)
+        _walls = _r.get("oi_walls:last")
+        briefing["oi_walls"] = __import__("json").loads(_walls) if _walls else None
+    except Exception:
+        briefing["oi_walls"] = None
+
     # ── 8. Market session context ─────────────────────────────────────────────
     from datetime import timezone, timedelta as _td
     IST = timezone(_td(hours=5, minutes=30))
